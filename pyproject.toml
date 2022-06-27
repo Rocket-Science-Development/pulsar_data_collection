@@ -16,6 +16,7 @@ pytest = "^7.1.2"
 matplotlib = "^3.5.2"
 scikit-learn = "^1.1.1"
 jupyter = "^1.0.0"
+fastapi = "^0.78.0"
 
 [tool.black]
 line-length = 120

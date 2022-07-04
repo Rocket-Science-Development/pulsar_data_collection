@@ -9,8 +9,20 @@ from fastapi import FastAPI
 from pydantic import BaseModel
 
 app = FastAPI()
+rows = []
 
 model = pkl.load(open("kidney_disease.pkl", "rb"))
+# with open("test_data.csv", 'r') as file:
+#     csvreader = csv.reader(file)
+#     header=next(csvreader)
+#     for row in csvreader:
+#         print(row)
+#         row_string = ','.join(row)
+#         print(row_string)
+#         rows.append(row)
+
+# print(header)
+# print(rows)
 
 list_of_usernames = list()
 
@@ -54,11 +66,17 @@ def predict(data: RequestBody):
 
     if data.type == "csv":
         csvStringIO = StringIO(data.content)
-        to_predict = pd.read_csv(csvStringIO, sep=",", header=None)
+        with open("test_data.csv", "r") as file:
+            csvreader = csv.reader(file)
+            header = next(csvreader)
+            for row in csvreader:
+                row_string = ",".join(row)
+                # rows.append(row)
+                to_predict = pd.read_csv(row_string, sep=",", header=None)
+                prediction = model.predict(to_predict)
+                print(prediction.tolist())
 
     if data.type == "json":
         pass
 
-    prediction = model.predict(to_predict)
-
-    return prediction
+    return prediction.tolist()

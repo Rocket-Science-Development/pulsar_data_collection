@@ -10,6 +10,7 @@ from pydantic import BaseModel
 
 app = FastAPI()
 rows = []
+predictions = []
 
 model = pkl.load(open("kidney_disease.pkl", "rb"))
 # with open("test_data.csv", 'r') as file:
@@ -65,18 +66,19 @@ def delete_data(user_name: str):
 def predict(data: RequestBody):
 
     if data.type == "csv":
-        csvStringIO = StringIO(data.content)
-        with open("test_data.csv", "r") as file:
+
+        with open("test_4jul_data.csv", "r") as file:
             csvreader = csv.reader(file)
             header = next(csvreader)
             for row in csvreader:
                 row_string = ",".join(row)
                 # rows.append(row)
-                to_predict = pd.read_csv(row_string, sep=",", header=None)
+                csvStringIO = StringIO(row_string)
+                to_predict = pd.read_csv(csvStringIO, sep=",", header=None)
                 prediction = model.predict(to_predict)
-                print(prediction.tolist())
+                predictions.append(prediction.tolist())
 
     if data.type == "json":
         pass
 
-    return prediction.tolist()
+    return predictions

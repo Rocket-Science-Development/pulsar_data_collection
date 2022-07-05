@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
 import csv
+import logging
 import pickle as pkl
 from io import StringIO
 
@@ -9,8 +10,8 @@ from fastapi import FastAPI
 from pydantic import BaseModel
 
 app = FastAPI()
-rows = []
-predictions = []
+
+logging.basicConfig(filename="file.log", level=logging.DEBUG, format="%(asctime)s:%(levelname)s:%(name)s:%(message)s")
 
 model = pkl.load(open("kidney_disease.pkl", "rb"))
 # with open("test_data.csv", 'r') as file:
@@ -66,19 +67,14 @@ def delete_data(user_name: str):
 def predict(data: RequestBody):
 
     if data.type == "csv":
-
-        with open("test_4jul_data.csv", "r") as file:
-            csvreader = csv.reader(file)
-            header = next(csvreader)
-            for row in csvreader:
-                row_string = ",".join(row)
-                # rows.append(row)
-                csvStringIO = StringIO(row_string)
-                to_predict = pd.read_csv(csvStringIO, sep=",", header=None)
-                prediction = model.predict(to_predict)
-                predictions.append(prediction.tolist())
+        data_points = data.content
+        csvStringIO = StringIO(data_points)
+        logging.info(csvStringIO)
+        to_predict = pd.read_csv(csvStringIO, sep=",", header=None)
+        prediction = model.predict(to_predict)
 
     if data.type == "json":
         pass
 
-    return predictions
+    return prediction.tolist()
+    # return data.content

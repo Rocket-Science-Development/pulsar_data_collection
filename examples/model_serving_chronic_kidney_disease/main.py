@@ -3,6 +3,7 @@ import csv
 import pickle as pkl
 from io import StringIO
 
+import byteplay as bp
 import pandas as pd
 import uvicorn
 from fastapi import FastAPI
@@ -11,6 +12,7 @@ from pydantic import BaseModel
 app = FastAPI()
 rows = []
 predictions = []
+data_list = []
 
 model = pkl.load(open("kidney_disease.pkl", "rb"))
 # with open("test_data.csv", 'r') as file:
@@ -63,22 +65,32 @@ def delete_data(user_name: str):
 
 # Endpoint to receive data for making prediction
 @app.post("/predict")
+# Endpoint to receive data for making prediction
+@app.post("/predict")
 def predict(data: RequestBody):
 
     if data.type == "csv":
-
-        with open("test_4jul_data.csv", "r") as file:
-            csvreader = csv.reader(file)
-            header = next(csvreader)
-            for row in csvreader:
-                row_string = ",".join(row)
-                # rows.append(row)
-                csvStringIO = StringIO(row_string)
-                to_predict = pd.read_csv(csvStringIO, sep=",", header=None)
-                prediction = model.predict(to_predict)
-                predictions.append(prediction.tolist())
+        data_points = data.content
+        data_list = data_points.splitlines()
+        print(data_list)
+        csvStringIO = StringIO(data_points)
+        # logging.info(csvStringIO)
+        to_predict = pd.read_csv(csvStringIO, sep=",", header=None)
 
     if data.type == "json":
         pass
 
+    # make predictions on the input dataset
+    prediction = model.predict(to_predict)
+
+    predictions = prediction.tolist()
+    print(predictions)
+
+    data_tuples = list(zip(data_list, predictions))
+    print(data_tuples)
+
+    df = pd.DataFrame(data_tuples, columns=["Input", "Output"])
+    print(df)
+
     return predictions
+    # return data.content

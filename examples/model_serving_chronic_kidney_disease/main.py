@@ -35,8 +35,8 @@ def predict(data: RequestBody):
 
     if data.type == "csv":
         data_points = data.content
-        data_list = data_points.splitlines()
-        print(data_list)
+        # data_list = data_points.splitlines()
+        # print(data_list)
         csvStringIO = StringIO(data_points)
         logging.info(csvStringIO)
         to_predict = pd.read_csv(csvStringIO, sep=",", header=None)
@@ -59,4 +59,3 @@ def predict(data: RequestBody):
 
     return predictions
     # return data.content
-    return prediction.tolist()

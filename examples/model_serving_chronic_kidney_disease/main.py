@@ -2,9 +2,9 @@
 import csv
 import logging
 import pickle as pkl
+import sqlite3 as db
 from io import StringIO
 
-import byteplay as bp
 import pandas as pd
 import uvicorn
 from fastapi import FastAPI
@@ -27,20 +27,22 @@ class RequestBody(BaseModel):
     content: str
 
 
-# Endpoint to receive data for making prediction
-@app.post("/predict")
+@app.get("/")
+def hello_world():
+    return {"Hello": "World"}
+
+
 # Endpoint to receive data for making prediction
 @app.post("/predict")
 def predict(data: RequestBody):
 
     if data.type == "csv":
         data_points = data.content
-        # data_list = data_points.splitlines()
+        data_list = data_points.splitlines()
         # print(data_list)
         csvStringIO = StringIO(data_points)
         logging.info(csvStringIO)
         to_predict = pd.read_csv(csvStringIO, sep=",", header=None)
-        prediction = model.predict(to_predict)
 
     if data.type == "json":
         pass
@@ -56,6 +58,37 @@ def predict(data: RequestBody):
 
     df = pd.DataFrame(data_tuples, columns=["Input", "Output"])
     print(df)
+
+    try:
+        conn = db.connect("SQLite_Python.db")
+        cursor = conn.cursor()
+        print("Database created and Successfully Connected to SQLite")
+
+        # cursor.execute("SELECT * FROM mpm_data_ing;")
+
+        df.to_sql("df", conn, if_exists="replace")
+
+        # print(cursor.fetchall())
+
+        # cursor.execute(
+        #     """
+        #     CREATE TABLE IF NOT EXISTS mpm_data_ing as
+        #     SELECT * FROM df
+        #     """
+        # )
+
+        df.to_sql(name="mpm_10jul", con=conn, if_exists="append")
+
+        cursor.execute("SELECT * FROM mpm_10jul;")
+        print(cursor.fetchall())
+
+    except db.Error as error:
+        print("Error while connecting to sqlite", error)
+    finally:
+        if cursor:
+            cursor.close()
+            conn.close()
+            print("The SQLite connection is closed")
 
     return predictions
     # return data.content

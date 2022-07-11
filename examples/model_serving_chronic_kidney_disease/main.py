@@ -59,6 +59,16 @@ def predict(data: RequestBody):
     df = pd.DataFrame(data_tuples, columns=["Input", "Output"])
     print(df)
 
+    def wrapper_func(*args, **kwargs):
+        sqlupdate(df)
+        return wrapper_func
+
+    return predictions
+    # return data.content
+
+
+@predict
+def sqlupdate(df):
     try:
         conn = db.connect("SQLite_Python.db")
         cursor = conn.cursor()
@@ -90,5 +100,4 @@ def predict(data: RequestBody):
             conn.close()
             print("The SQLite connection is closed")
 
-    return predictions
-    # return data.content
+    return

@@ -19,10 +19,11 @@ repos:
     rev: 22.3.0
     hooks:
     -   id: black
-# -   repo: local
-#     hooks:
-#     -   id: export-req
-#         name: export requirements
-#         language: system
-#         entry: poetry export --without-hashes -o requirements.txt
-#         files: ^(pyproject.toml|poetry.lock)$
+-   repo: local
+    hooks:
+    -   id: export-req
+        name: export requirements
+        language: system
+        pass_filenames: false
+        entry: poetry export -f requirements.txt -o requirements.txt --without-hashes
+        files: ^(pyproject.toml|poetry.lock)$

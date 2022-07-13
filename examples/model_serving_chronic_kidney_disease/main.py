@@ -10,14 +10,8 @@ import uvicorn
 from fastapi import FastAPI
 from pydantic import BaseModel
 
-logging.basicConfig(
-    level=logging.DEBUG, format="%(asctime)s:%(levelname)s:%(name)s:%(message)s"
-)
+logging.basicConfig(level=logging.DEBUG, format="%(asctime)s:%(levelname)s:%(name)s:%(message)s")
 app = FastAPI()
-rows = []
-predictions = []
-data_list = []
-
 
 model = pkl.load(open("kidney_disease.pkl", "rb"))
 
@@ -59,45 +53,4 @@ def predict(data: RequestBody):
     df = pd.DataFrame(data_tuples, columns=["Input", "Output"])
     print(df)
 
-    def wrapper_func(*args, **kwargs):
-        sqlupdate(df)
-        return wrapper_func
-
     return predictions
-    # return data.content
-
-
-@predict
-def sqlupdate(df):
-    try:
-        conn = db.connect("SQLite_Python.db")
-        cursor = conn.cursor()
-        print("Database created and Successfully Connected to SQLite")
-
-        # cursor.execute("SELECT * FROM mpm_data_ing;")
-
-        df.to_sql("df", conn, if_exists="replace")
-
-        # print(cursor.fetchall())
-
-        # cursor.execute(
-        #     """
-        #     CREATE TABLE IF NOT EXISTS mpm_data_ing as
-        #     SELECT * FROM df
-        #     """
-        # )
-
-        df.to_sql(name="mpm_10jul", con=conn, if_exists="append")
-
-        cursor.execute("SELECT * FROM mpm_10jul;")
-        print(cursor.fetchall())
-
-    except db.Error as error:
-        print("Error while connecting to sqlite", error)
-    finally:
-        if cursor:
-            cursor.close()
-            conn.close()
-            print("The SQLite connection is closed")
-
-    return

@@ -59,16 +59,13 @@ def predict(data: RequestBody):
     df = pd.DataFrame(data_tuples, columns=["Input", "Output"])
     print(df)
 
-    def wrapper_func(*args, **kwargs):
-        sqlupdate(df)
-        return wrapper_func
+    sql_insertion(df)
 
     return predictions
     # return data.content
 
 
-@predict
-def sqlupdate(df):
+def sql_insertion(df):
     try:
         conn = db.connect("SQLite_Python.db")
         cursor = conn.cursor()
@@ -87,10 +84,12 @@ def sqlupdate(df):
         #     """
         # )
 
-        df.to_sql(name="mpm_10jul", con=conn, if_exists="append")
+        df.to_sql(name="mpm_10jul", con=conn, if_exists="append", index=False)
 
-        cursor.execute("SELECT * FROM mpm_10jul;")
-        print(cursor.fetchall())
+        df = pd.read_sql_query("SELECT * from mpm_10jul", conn)
+        print(df)
+        # cursor.execute("SELECT * FROM mpm_10jul;")
+        # print(cursor.fetchall())
 
     except db.Error as error:
         print("Error while connecting to sqlite", error)
@@ -100,4 +99,4 @@ def sqlupdate(df):
             conn.close()
             print("The SQLite connection is closed")
 
-    return
+    return df

@@ -32,24 +32,21 @@ def predict(data: RequestBody):
 
     if data.type == "csv":
         pass
-    csvStringIO = StringIO(data_points)
-    logging.info(csvStringIO)
-    to_predict = pd.read_csv(csvStringIO, sep=",")
+        csvStringIO = StringIO(data.content)
+        logging.info(csvStringIO)
+        to_predict = pd.read_csv(csvStringIO, sep=",", header=0)
 
     if data.type == "json":
         pass
 
     prediction = model.predict(to_predict)
 
+    pred_df = pd.DataFrame(prediction, columns=["class"])
+    data_with_prediction = pd.concat([to_predict, pred_df], axis=1)
+
+    sql_insertion(data_with_prediction)
+
     prediction_as_list = prediction.tolist()
-
-    columns_names_list = to_predict.columns
-    columns_names_list.append("Target")
-
-    data_with_prediction = pd.concat([to_predict, prediction], axis=1, names=features_names_list)
-
-    sql_insertion(df)
-
     return prediction_as_list
 
 
@@ -57,7 +54,7 @@ def sql_insertion(df):
     try:
         conn = db.connect("SQLite_Python.db")
         cursor = conn.cursor()
-        print("Database created and Successfully Connected to SQLite")
+        logging.info("Database created and Successfully Connected to SQLite")
 
         # cursor.execute("SELECT * FROM mpm_data_ing;")
 
@@ -75,16 +72,16 @@ def sql_insertion(df):
         df.to_sql(name="mpm_13jul", con=conn, if_exists="append", index=False)
 
         df = pd.read_sql_query("SELECT * from mpm_13jul", conn)
-        print(df)
+        logging.info(df)
         # cursor.execute("SELECT * FROM mpm_10jul;")
         # print(cursor.fetchall())
 
     except db.Error as error:
-        print("Error while connecting to sqlite", error)
+        logging.error("Error while connecting to sqlite", error)
     finally:
         if cursor:
             cursor.close()
             conn.close()
-            print("The SQLite connection is closed")
+            logging.info("The SQLite connection is closed")
 
     return df

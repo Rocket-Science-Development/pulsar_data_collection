@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 import csv
 import logging
 import pickle as pkl
@@ -10,7 +11,7 @@ from fastapi import FastAPI
 from pydantic import BaseModel
 
 
-def sqlupdate(df):
+def sql_insertion(df):
     try:
         conn = db.connect("SQLite_Python.db")
         cursor = conn.cursor()
@@ -29,10 +30,12 @@ def sqlupdate(df):
         #     """
         # )
 
-        df.to_sql(name="mpm_10jul", con=conn, if_exists="append")
+        df.to_sql(name="mpm_13jul", con=conn, if_exists="append", index=False)
 
-        cursor.execute("SELECT * FROM mpm_10jul;")
-        print(cursor.fetchall())
+        df = pd.read_sql_query("SELECT * from mpm_13jul", conn)
+        print(df)
+        # cursor.execute("SELECT * FROM mpm_10jul;")
+        # print(cursor.fetchall())
 
     except db.Error as error:
         print("Error while connecting to sqlite", error)
@@ -42,4 +45,4 @@ def sqlupdate(df):
             conn.close()
             print("The SQLite connection is closed")
 
-    return
+    return df

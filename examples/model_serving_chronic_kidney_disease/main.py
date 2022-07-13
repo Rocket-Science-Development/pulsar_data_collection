@@ -31,26 +31,60 @@ def hello_world():
 def predict(data: RequestBody):
 
     if data.type == "csv":
-        data_points = data.content
-        data_list = data_points.splitlines()
-        # print(data_list)
-        csvStringIO = StringIO(data_points)
-        logging.info(csvStringIO)
-        to_predict = pd.read_csv(csvStringIO, sep=",", header=None)
+        pass
+    csvStringIO = StringIO(data_points)
+    logging.info(csvStringIO)
+    to_predict = pd.read_csv(csvStringIO, sep=",")
 
     if data.type == "json":
         pass
 
-    # make predictions on the input dataset
     prediction = model.predict(to_predict)
 
-    predictions = prediction.tolist()
-    print(predictions)
+    prediction_as_list = prediction.tolist()
 
-    data_tuples = list(zip(data_list, predictions))
-    print(data_tuples)
+    columns_names_list = to_predict.columns
+    columns_names_list.append("Target")
 
-    df = pd.DataFrame(data_tuples, columns=["Input", "Output"])
-    print(df)
+    data_with_prediction = pd.concat([to_predict, prediction], axis=1, names=features_names_list)
 
-    return predictions
+    sql_insertion(df)
+
+    return prediction_as_list
+
+
+def sql_insertion(df):
+    try:
+        conn = db.connect("SQLite_Python.db")
+        cursor = conn.cursor()
+        print("Database created and Successfully Connected to SQLite")
+
+        # cursor.execute("SELECT * FROM mpm_data_ing;")
+
+        df.to_sql("df", conn, if_exists="replace")
+
+        # print(cursor.fetchall())
+
+        # cursor.execute(
+        #     """
+        #     CREATE TABLE IF NOT EXISTS mpm_data_ing as
+        #     SELECT * FROM df
+        #     """
+        # )
+
+        df.to_sql(name="mpm_13jul", con=conn, if_exists="append", index=False)
+
+        df = pd.read_sql_query("SELECT * from mpm_13jul", conn)
+        print(df)
+        # cursor.execute("SELECT * FROM mpm_10jul;")
+        # print(cursor.fetchall())
+
+    except db.Error as error:
+        print("Error while connecting to sqlite", error)
+    finally:
+        if cursor:
+            cursor.close()
+            conn.close()
+            print("The SQLite connection is closed")
+
+    return df

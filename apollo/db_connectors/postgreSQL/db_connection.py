@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 import csv
 import logging
 import pickle as pkl

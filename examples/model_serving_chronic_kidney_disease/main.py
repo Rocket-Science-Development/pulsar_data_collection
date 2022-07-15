@@ -10,7 +10,9 @@ import uvicorn
 from fastapi import FastAPI
 from pydantic import BaseModel
 
-logging.basicConfig(level=logging.DEBUG, format="%(asctime)s:%(levelname)s:%(name)s:%(message)s")
+logging.basicConfig(
+    level=logging.DEBUG, format="%(asctime)s:%(levelname)s:%(name)s:%(message)s"
+)
 app = FastAPI()
 
 model = pkl.load(open("kidney_disease.pkl", "rb"))
@@ -44,13 +46,15 @@ def predict(data: RequestBody):
     pred_df = pd.DataFrame(prediction, columns=["class"])
     data_with_prediction = pd.concat([to_predict, pred_df], axis=1)
 
+    print(data_with_prediction)
+
     sql_insertion(data_with_prediction)
 
     prediction_as_list = prediction.tolist()
     return prediction_as_list
 
 
-def sql_insertion(df):
+def sql_insertion(data_with_prediction):
     try:
         conn = db.connect("SQLite_Python.db")
         cursor = conn.cursor()
@@ -58,7 +62,7 @@ def sql_insertion(df):
 
         # cursor.execute("SELECT * FROM mpm_data_ing;")
 
-        df.to_sql("df", conn, if_exists="replace")
+        data_with_prediction.to_sql("data_with_prediction", conn, if_exists="replace")
 
         # print(cursor.fetchall())
 
@@ -69,10 +73,12 @@ def sql_insertion(df):
         #     """
         # )
 
-        df.to_sql(name="mpm_13jul", con=conn, if_exists="append", index=False)
+        data_with_prediction.to_sql(
+            name="mpm_15jul", con=conn, if_exists="append", index=False
+        )
 
-        df = pd.read_sql_query("SELECT * from mpm_13jul", conn)
-        logging.info(df)
+        data_with_prediction = pd.read_sql_query("SELECT * from mpm_15jul", conn)
+        logging.info(data_with_prediction)
         # cursor.execute("SELECT * FROM mpm_10jul;")
         # print(cursor.fetchall())
 
@@ -84,4 +90,4 @@ def sql_insertion(df):
             conn.close()
             logging.info("The SQLite connection is closed")
 
-    return df
+    return data_with_prediction

@@ -46,7 +46,7 @@ def predict(data: RequestBody):
     pred_df = pd.DataFrame(prediction, columns=["class"])
     data_with_prediction = pd.concat([to_predict, pred_df], axis=1)
 
-    print(data_with_prediction)
+    # print(data_with_prediction)
 
     sql_insertion(data_with_prediction)
 
@@ -54,7 +54,7 @@ def predict(data: RequestBody):
     return prediction_as_list
 
 
-def sql_insertion(data_with_prediction):
+def sql_insertion(df):
     try:
         conn = db.connect("SQLite_Python.db")
         cursor = conn.cursor()
@@ -62,7 +62,7 @@ def sql_insertion(data_with_prediction):
 
         # cursor.execute("SELECT * FROM mpm_data_ing;")
 
-        data_with_prediction.to_sql("data_with_prediction", conn, if_exists="replace")
+        df.to_sql("df", conn, if_exists="replace")
 
         # print(cursor.fetchall())
 
@@ -73,12 +73,10 @@ def sql_insertion(data_with_prediction):
         #     """
         # )
 
-        data_with_prediction.to_sql(
-            name="mpm_15jul", con=conn, if_exists="append", index=False
-        )
+        df.to_sql(name="mpm_15jul", con=conn, if_exists="append", index=False)
 
-        data_with_prediction = pd.read_sql_query("SELECT * from mpm_15jul", conn)
-        logging.info(data_with_prediction)
+        df = pd.read_sql_query("SELECT * from mpm_15jul", conn)
+        logging.info(df)
         # cursor.execute("SELECT * FROM mpm_10jul;")
         # print(cursor.fetchall())
 
@@ -90,4 +88,4 @@ def sql_insertion(data_with_prediction):
             conn.close()
             logging.info("The SQLite connection is closed")
 
-    return data_with_prediction
+    return df

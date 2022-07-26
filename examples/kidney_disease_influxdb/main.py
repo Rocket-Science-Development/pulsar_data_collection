@@ -1,6 +1,4 @@
 # -*- coding: utf-8 -*-
-
-
 import logging
 import pickle as pkl
 from io import StringIO

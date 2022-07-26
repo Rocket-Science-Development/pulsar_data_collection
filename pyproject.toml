@@ -1,5 +1,5 @@
 [tool.poetry]
-name = "data-collection-sdk"
+name = "pulsar-data-collection"
 version = "0.1.0"
 description = "sdk enabling data collection from model serving code for our MPM solution"
 authors = ["Your Name <you@example.com>"]
@@ -8,6 +8,8 @@ authors = ["Your Name <you@example.com>"]
 python = "^3.9"
 pandas = "^1.4.2"
 pysqlite3 = "^0.4.7"
+SQLAlchemy = "^1.4.39"
+influxdb-client = "^1.30.0"
 
 [tool.poetry.dev-dependencies]
 black = "^22.3.0"

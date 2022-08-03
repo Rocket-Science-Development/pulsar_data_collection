@@ -42,7 +42,10 @@ class DataFrameCreate:
     def __init__(self):
         pass
 
-    # Function to convert prediction output to Pandas dataframe to be inserted in DB
+    """
+    Function to convert prediction output to Pandas dataframe to be inserted in DB
+    """
+
     def dataframe_create(self, dataframe: DataFrame):
         # Creating dataframe with the output prediction
         pred_df = pd.DataFrame(dataframe.prediction, columns=["class"])

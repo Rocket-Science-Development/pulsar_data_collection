@@ -1,18 +1,25 @@
 # -*- coding: utf-8 -*-
 import logging
 import pickle as pkl
+import sys
 from io import StringIO
 
 import pandas as pd
 import uvicorn
-from chronoc_kidney_disease_project.ml.data.sqllite_func import Databasecon
-from chronoc_kidney_disease_project.ml.model.dataframe_create import Dframe
 from fastapi import FastAPI
 from pydantic import BaseModel
 
-logging.basicConfig(
-    level=logging.DEBUG, format="%(asctime)s:%(levelname)s:%(name)s:%(message)s"
+sys.path.append("../../")
+
+from pulsar_data_collection.data_capture.data_capture import DataFrame as DFrame
+from pulsar_data_collection.data_capture.data_capture import (
+    DataFrameCreate as DFrameCreate,
 )
+from pulsar_data_collection.db_connectors.influxdb.db_connection import (
+    StorageEngine as InfluxStorage,
+)
+
+logging.basicConfig(level=logging.DEBUG, format="%(asctime)s:%(levelname)s:%(name)s:%(message)s")
 app = FastAPI()
 
 model = pkl.load(open("kidney_disease.pkl", "rb"))
@@ -43,9 +50,11 @@ def predict(data: RequestBody):
 
     prediction = model.predict(to_predict)
 
-    data_with_prediction = Dframe().dataframe_create(prediction, to_predict)
+    dframe = DFrame(prediction=prediction, to_predict=to_predict)
+    # struc_dframe = DFrame(**dframe)
+    data_with_prediction = DFrameCreate().dataframe_create(dframe)
 
-    Databasecon().sql_insertion(data_with_prediction)
+    InfluxStorage().sql_insertion(data_with_prediction)
 
     prediction_as_list = prediction.tolist()
     return prediction_as_list

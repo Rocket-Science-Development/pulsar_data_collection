@@ -19,6 +19,11 @@ class StorageEngine:
         pass
 
     def sql_insertion(self, df: pd.DataFrame):
+
+        """
+        Function to push Pandas Dataframe into SQLite DB.
+        """
+
         try:
             conn = db.connect("SQLite_Python.db")
             cursor = conn.cursor()

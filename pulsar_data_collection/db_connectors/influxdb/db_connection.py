@@ -1,42 +1,46 @@
 # -*- coding: utf-8 -*-
-import influxdb_client as ifdb
+# import influxdb_client as ifdb
+from datetime import datetime
+
+import pandas as pd
+from influxdb import DataFrameClient
+from influxdb import InfluxDBClient as ifdb
+
+# Setup database
+# client = ifdb('localhost', 8086, 'admin', 'pass123', 'test2Aug')
+# client.create_database('test2Aug')
+# client.get_list_database()
+# client.switch_database('test2Aug')
+
+dbhost = "localhost"
+dbport = 8086
+dbuser = "admin"
+dbpasswd = "pass123"
+dbname = "testDB"
+protocol = "line"
 
 
 class StorageEngine:
-    def __init__(self, login_url):
+    def __init__(self):
         pass
 
+    def sql_insertion(self, df: pd.DataFrame):
 
-# def sqlupdate(df):
-#     try:
-#         conn = db.connect("SQLite_Python.db")
-#         cursor = conn.cursor()
-#         print("Database created and Successfully Connected to SQLite")
+        """
+        Function to push Pandas Dataframe into Influx DB.
+        """
 
-#         # cursor.execute("SELECT * FROM mpm_data_ing;")
+        # Set 'TimeStamp' field as index of dataframe
+        df.set_index("Timestamp", inplace=True)
 
-#         df.to_sql("df", conn, if_exists="replace")
+        print(df.head())
 
-#         # print(cursor.fetchall())
+        client = DataFrameClient(dbhost, dbport, dbuser, dbpasswd, dbname)
 
-#         # cursor.execute(
-#         #     """
-#         #     CREATE TABLE IF NOT EXISTS mpm_data_ing as
-#         #     SELECT * FROM df
-#         #     """
-#         # )
+        client.create_database(dbname)
+        client.get_list_database()
+        client.switch_database(dbname)
 
-#         df.to_sql(name="mpm_10jul", con=conn, if_exists="append")
+        client.write_points(df, "test2Aug", protocol=protocol, time_precision="u")
 
-#         cursor.execute("SELECT * FROM mpm_10jul;")
-#         print(cursor.fetchall())
-
-#     except db.Error as error:
-#         print("Error while connecting to sqlite", error)
-#     finally:
-#         if cursor:
-#             cursor.close()
-#             conn.close()
-#             print("The SQLite connection is closed")
-
-#     return
+        return df

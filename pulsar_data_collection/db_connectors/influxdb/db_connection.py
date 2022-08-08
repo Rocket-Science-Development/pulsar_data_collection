@@ -41,6 +41,6 @@ class StorageEngine:
         client.get_list_database()
         client.switch_database(dbname)
 
-        client.write_points(df, "test2Aug", protocol=protocol, time_precision="u")
+        client.write_points(df, "test5Aug", protocol=protocol, time_precision="u")
 
         return df

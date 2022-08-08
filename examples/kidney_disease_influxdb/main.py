@@ -7,16 +7,14 @@ from io import StringIO
 import pandas as pd
 import uvicorn
 from fastapi import FastAPI
+from numpy import ndarray
 from pydantic import BaseModel
 
 sys.path.append("../../")
-
-from pulsar_data_collection.data_capture.data_capture import DataFrame as DFrame
+import pulsar_data_collection.data_capture.data_capture as data_capture
+from pulsar_data_collection.data_capture.data_capture import DatabaseLogin as DBLogin
 from pulsar_data_collection.data_capture.data_capture import (
-    DataFrameCreate as DFrameCreate,
-)
-from pulsar_data_collection.db_connectors.influxdb.db_connection import (
-    StorageEngine as InfluxStorage,
+    DataWithPrediction as DatPredict,
 )
 
 logging.basicConfig(level=logging.DEBUG, format="%(asctime)s:%(levelname)s:%(name)s:%(message)s")
@@ -50,11 +48,22 @@ def predict(data: RequestBody):
 
     prediction = model.predict(to_predict)
 
-    dframe = DFrame(prediction=prediction, to_predict=to_predict)
-    # struc_dframe = DFrame(**dframe)
-    data_with_prediction = DFrameCreate().dataframe_create(dframe)
+    dat_predict = DatPredict(prediction=prediction, data_points=to_predict)
 
-    InfluxStorage().sql_insertion(data_with_prediction)
+    dat_capture = data_capture.DataCapture(
+        storage_engine="influxdb",
+        org_id="RS101",
+        project_id="MPM",
+        environment_id="FluxDB",
+    )
+
+    dat_capture.collect(dat_predict)
+
+    # dframe = DFrame(prediction=prediction, to_predict=to_predict)
+    # struc_dframe = DFrame(**dframe)
+    # data_with_prediction = DFrameCreate().dataframe_create(dframe)
+
+    # InfluxStorage().sql_insertion(data_with_prediction)
 
     prediction_as_list = prediction.tolist()
     return prediction_as_list

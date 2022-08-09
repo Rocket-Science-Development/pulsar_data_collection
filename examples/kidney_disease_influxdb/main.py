@@ -12,10 +12,7 @@ from pydantic import BaseModel
 
 sys.path.append("../../")
 import pulsar_data_collection.data_capture.data_capture as data_capture
-from pulsar_data_collection.data_capture.data_capture import DatabaseLogin as DBLogin
-from pulsar_data_collection.data_capture.data_capture import (
-    DataWithPrediction as DatPredict,
-)
+
 
 logging.basicConfig(level=logging.DEBUG, format="%(asctime)s:%(levelname)s:%(name)s:%(message)s")
 app = FastAPI()
@@ -48,7 +45,7 @@ def predict(data: RequestBody):
 
     prediction = model.predict(to_predict)
 
-    dat_predict = DatPredict(prediction=prediction, data_points=to_predict)
+    dat_predict = data_capture.DataWithPrediction(prediction=prediction, data_points=to_predict)
 
     dat_capture = data_capture.DataCapture(
         storage_engine="influxdb",

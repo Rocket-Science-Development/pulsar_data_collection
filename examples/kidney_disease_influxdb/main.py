@@ -11,7 +11,7 @@ from numpy import ndarray
 from pydantic import BaseModel
 
 sys.path.append("../../")
-import pulsar_data_collection.data_capture.data_capture as data_capture
+import pulsar_data_collection.data_capture.data_capture as Data_Capture
 
 
 logging.basicConfig(level=logging.DEBUG, format="%(asctime)s:%(levelname)s:%(name)s:%(message)s")
@@ -45,9 +45,9 @@ def predict(data: RequestBody):
 
     prediction = model.predict(to_predict)
 
-    dat_predict = data_capture.DataWithPrediction(prediction=prediction, data_points=to_predict)
+    dat_predict = Data_Capture.DataWithPrediction(prediction=prediction, data_points=to_predict)
 
-    dat_capture = data_capture.DataCapture(
+    dat_capture = Data_Capture.DataCapture(
         storage_engine="influxdb",
         org_id="RS101",
         project_id="MPM",

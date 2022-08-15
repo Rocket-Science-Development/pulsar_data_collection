@@ -1,17 +1,12 @@
-import importlib
-import sys
-from datetime import datetime, timedelta
+from datetime import datetime
 from typing import List, Optional
 
 import numpy as np
 import pandas as pd
-from fastapi import HTTPException, status
-from pydantic import BaseModel, Field
-from pydantic.dataclasses import dataclass
+from pydantic import BaseModel
 
-sys.path.append("../")
-import pulsar_data_collection.data_capture.exceptions as e
-from pulsar_data_collection.db_connectors.influxdb.db_connection import StorageEngine
+from ..db_connectors.influxdb.db_connection import StorageEngine
+from .exceptions import StorageEngineDoesntExist as e
 
 # TODO : aadd validators for both models
 
@@ -39,9 +34,11 @@ class DataWithPrediction(BaseModel):
 class DataCaptureParameters(BaseModel):
     storage_engine: str = "influxdb"
     login_url: Optional[DatabaseLogin]
-    org_id: str
-    project_id: str
-    environment_id: str
+    model_id: str
+    model_version: str
+    data_id: str
+    y_name: Optional[str]
+    pred_name: Optional[str]
     other_labels: Optional[List[str]] = None
 
 
@@ -51,7 +48,8 @@ class DataCapture(DataCaptureParameters):
         super().__init__(*args, **kwargs)
 
         if self.storage_engine:
-            print(importlib.import_module("..self.storage_engine", "pulsar_data_collection.db_connectors"))
+            # print(importlib.import_module("self.storage_engine", "pulsar_data_collection.db_connectors"))
+            pass
 
         else:
             raise e.StorageEngineDoesntExist(
@@ -71,9 +69,14 @@ class DataCapture(DataCaptureParameters):
         data_with_prediction = pd.concat([data.data_points, pred], axis=1)
 
         data_with_prediction.loc[:, "Timestamp"] = data.timestamp
-        data_with_prediction.loc[:, "org_id"] = self.org_id
-        data_with_prediction.loc[:, "project_id"] = self.project_id
-        data_with_prediction.loc[:, "environment_id"] = self.environment_id
+        data_with_prediction.loc[:, "model_id"] = self.model_id
+        data_with_prediction.loc[:, "model_version"] = self.model_version
+        data_with_prediction.loc[:, "data_id"] = self.data_id
+
+        if self.y_name:
+            data_with_prediction.loc[:, "y_name"] = self.y_name
+        if self.pred_name:
+            data_with_prediction.loc[:, "pred_name"] = self.pred_name
 
         # for label in data.other_labels:
         #     data_with_prediction.loc[:, f"{label}"] = label

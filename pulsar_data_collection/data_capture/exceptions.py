@@ -1,5 +1,8 @@
-class StorageEngineDoesntExist(Exception):
-    """Custom error that is raised when the DB conenctor doesn't exist"""
+class CustomExceptionWithMessage(Exception):
+    """
+    Custom error that is raised in DataCapture submodule
+    with FieldValue and Custom Message passed as input
+    """
 
     def __init__(self, value: str, message: str) -> None:
         self.value = value

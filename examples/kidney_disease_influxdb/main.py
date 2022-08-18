@@ -53,6 +53,7 @@ def predict(data: RequestBody):
         data_id="FluxDB",
         y_name="ABC",
         pred_name="ABC",
+        operation_type="INS",
     )
 
     dat_capture.collect(dat_predict)

@@ -20,7 +20,7 @@ LONG_DESC_TYPE = 'text/markdown'
 
 
 INSTALL_REQUIRES = [
-	#TODO: update it
+	"pydantic",
 ]
 
 

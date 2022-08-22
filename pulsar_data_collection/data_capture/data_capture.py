@@ -14,11 +14,11 @@ from .exceptions import CustomExceptionWithMessage as e
 
 
 class DatabaseLogin(BaseModel):
-    dbhost: str = "localhost"
-    dbport: int
-    dbuser: str
-    dbpassword: str
-    dbname: str
+    db_host: str
+    db_port: int
+    db_user: str
+    db_password: str
+    db_name: str
     protocol: str
     measurement: str
 
@@ -35,7 +35,7 @@ class DataWithPrediction(BaseModel):
 
 class DataCaptureParameters(BaseModel):
     storage_engine: str
-    login_url: Optional[List[DatabaseLogin]]
+    login_url: Optional[DatabaseLogin]
     model_id: str = Field(...)
     model_version: str = Field(...)
     data_id: str = Field(...)
@@ -53,7 +53,8 @@ class DataCaptureParameters(BaseModel):
 
     @validator("storage_engine")
     def valid_import(cls, value):
-        if value == "":
+        # Only influxdb is working storage engine rn
+        if not value == "influxdb":
             raise e(
                 value=value,
                 message=f"{value} Storage Engine doesn't exist",
@@ -98,17 +99,17 @@ class DataCapture(DataCaptureParameters):
         #     data_with_prediction.loc[:, f"{label}"] = label
 
         if self.operation_type in ("INS"):
-            DataFactory.sql_ingestion(self.storage_engine, data_with_prediction)
+            DataFactory.sql_ingestion(self.storage_engine, data_with_prediction, self.login_url)
 
         return
 
 
 class DataFactory:
     @staticmethod
-    def sql_ingestion(storage_engine: str, dataframe: pd.DataFrame):
+    def sql_ingestion(storage_engine: str, dataframe: pd.DataFrame, database_login: DatabaseLogin=None):
         """Function to import DB connection based on storage engine and call sql_insertion"""
 
-        if storage_engine in ("influxdb"):
+        if storage_engine in ("influxdb",):
             from ..db_connectors.influxdb.db_connection import StorageEngine
         else:
             raise e(
@@ -116,7 +117,12 @@ class DataFactory:
                 message=f"{storage_engine} is an Invalid Storage Engine",
             )
 
-        StorageEngine().sql_insertion(df=dataframe)
+        if database_login:
+            StorageEngine().sql_insertion(df=dataframe, db_host=database_login.db_host,
+                                          db_name=database_login.db_name, db_password=database_login.db_password,
+                                          protocol=database_login.protocol, db_port=database_login.db_port, db_user=database_login.db_user)
+        else:
+            StorageEngine().sql_insertion(df=dataframe)
 
     @staticmethod
     def imp_module(storage_engine: str):

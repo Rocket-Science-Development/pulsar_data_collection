@@ -4,6 +4,6 @@ services:
     ports:
       - "8000:8000"
     links:
-      - sqlite3
+      - influx
   influx:
     image: influxdb:2.3.0-alpine

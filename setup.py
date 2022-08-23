@@ -23,7 +23,8 @@ INSTALL_REQUIRES = [
 	"pydantic",
 	"pandas",
 	"numpy",
-	"influxdb-client"
+	"influxdb-client",
+	"influxdb"
 ]
 
 

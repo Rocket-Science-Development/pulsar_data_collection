@@ -20,7 +20,7 @@ class DatabaseLogin(BaseModel):
     db_password: str
     db_name: str
     protocol: str
-    measurement: str
+    measurement: Optional[str]
 
 
 class DataWithPrediction(BaseModel):

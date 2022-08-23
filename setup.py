@@ -22,7 +22,8 @@ LONG_DESC_TYPE = 'text/markdown'
 INSTALL_REQUIRES = [
 	"pydantic",
 	"pandas",
-	"numpy"
+	"numpy",
+	"influxdb-client"
 ]
 
 

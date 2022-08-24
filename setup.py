@@ -24,7 +24,6 @@ INSTALL_REQUIRES = [
 	"pandas",
 	"numpy",
 	"influxdb-client",
-	"influxdb"
 ]
 
 

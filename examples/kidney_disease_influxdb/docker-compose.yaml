@@ -6,4 +6,17 @@ services:
     links:
       - influx
   influx:
-    image: influxdb:2.3.0-alpine
+    build:
+      context: ./docker/influxdb
+    hostname: influx
+    ports:
+      - 8086:8086
+    volumes:
+      - influxdb-storage:/var/lib/influxdb
+    environment:
+      - INFLUXDB_ADMIN_ENABLED=true
+      - INFLUXDB_DB=testDB
+      - INFLUXDB_USER=admin
+      - INFLUXDB_PASSWORD=pass123
+volumes:
+  influxdb-storage:

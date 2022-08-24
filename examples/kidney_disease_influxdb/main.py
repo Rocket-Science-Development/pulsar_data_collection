@@ -11,7 +11,7 @@ from numpy import ndarray
 from pydantic import BaseModel
 
 sys.path.append("../../")
-from pulsar_data_collection.data_capture import DataCapture, DataWithPrediction
+from pulsar_data_collection.data_capture import DataCapture, DataWithPrediction, DatabaseLogin
 
 logging.basicConfig(level=logging.DEBUG, format="%(asctime)s:%(levelname)s:%(name)s:%(message)s")
 app = FastAPI()
@@ -44,6 +44,9 @@ def predict(data: RequestBody):
 
     prediction = model.predict(to_predict)
 
+    database_login = DatabaseLogin(db_host="influx", db_port=8086, db_user="admin", db_password="pass123",
+                                   db_name="testDB", protocol="line", measurement="something")
+
     dat_predict = DataWithPrediction(prediction=prediction, data_points=to_predict)
 
     dat_capture = DataCapture(
@@ -54,6 +57,7 @@ def predict(data: RequestBody):
         y_name="ABC",
         pred_name="ABC",
         operation_type="INS",
+        login_url=database_login
     )
 
     dat_capture.collect(dat_predict)

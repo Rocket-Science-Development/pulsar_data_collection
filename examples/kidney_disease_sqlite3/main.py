@@ -4,14 +4,18 @@ import pickle as pkl
 from io import StringIO
 
 import pandas as pd
-import uvicorn
+
+# import uvicorn
 from fastapi import FastAPI
 from pydantic import BaseModel
+
+# import ...pulsar_data_collection
 
 logging.basicConfig(level=logging.DEBUG, format="%(asctime)s:%(levelname)s:%(name)s:%(message)s")
 app = FastAPI()
 
 model = pkl.load(open("kidney_disease.pkl", "rb"))
+
 
 # Class to define the request body and the type hints of each attribute
 class RequestBody(BaseModel):
@@ -39,9 +43,9 @@ def predict(data: RequestBody):
 
     prediction = model.predict(to_predict)
 
-    data_with_prediction = dataframe_create(prediction, to_predict)
+    # data_with_prediction = dataframe_create(prediction, to_predict)
 
-    sql_insertion(data_with_prediction)
+    # sql_insertion(data_with_prediction)
 
     prediction_as_list = prediction.tolist()
     return prediction_as_list
@@ -54,43 +58,43 @@ def dataframe_create(prediction, to_predict: pd.DataFrame):
     # Concat the input and output predicton dataframes on y-axis (columns)
     df = pd.concat([to_predict, pred_df], axis=1)
     # Adding current timestamp as a new column to existing Dataframe
-    df.loc[:, "Timestamp"] = datetime.datetime.now()
+    # df.loc[:, "Timestamp"] = datetime.datetime.now()
 
     return df
 
 
-def sql_insertion(df):
-    try:
-        conn = db.connect("SQLite_Python.db")
-        cursor = conn.cursor()
-        logging.info("Database created and Successfully Connected to SQLite")
+# def sql_insertion(df):
+#     try:
+#         conn = db.connect("SQLite_Python.db")
+#         cursor = conn.cursor()
+#         logging.info("Database created and Successfully Connected to SQLite")
 
-        # cursor.execute("SELECT * FROM mpm_data_ing;")
+#         # cursor.execute("SELECT * FROM mpm_data_ing;")
 
-        df.to_sql("df", conn, if_exists="replace")
+#         df.to_sql("df", conn, if_exists="replace")
 
-        # print(cursor.fetchall())
+#         # print(cursor.fetchall())
 
-        # cursor.execute(
-        #     """
-        #     CREATE TABLE IF NOT EXISTS mpm_data_ing as
-        #     SELECT * FROM df
-        #     """
-        # )
+#         # cursor.execute(
+#         #     """
+#         #     CREATE TABLE IF NOT EXISTS mpm_data_ing as
+#         #     SELECT * FROM df
+#         #     """
+#         # )
 
-        df.to_sql(name="mpm_19jul", con=conn, if_exists="append", index=False)
+#         df.to_sql(name="mpm_19jul", con=conn, if_exists="append", index=False)
 
-        df = pd.read_sql_query("SELECT * from mpm_19jul", conn)
-        logging.info(df)
-        # cursor.execute("SELECT * FROM mpm_10jul;")
-        # print(cursor.fetchall())
+#         df = pd.read_sql_query("SELECT * from mpm_19jul", conn)
+#         logging.info(df)
+#         # cursor.execute("SELECT * FROM mpm_10jul;")
+#         # print(cursor.fetchall())
 
-    except db.Error as error:
-        logging.error("Error while connecting to sqlite", error)
-    finally:
-        if cursor:
-            cursor.close()
-            conn.close()
-            logging.info("The SQLite connection is closed")
+#     except db.Error as error:
+#         logging.error("Error while connecting to sqlite", error)
+#     finally:
+#         if cursor:
+#             cursor.close()
+#             conn.close()
+#             logging.info("The SQLite connection is closed")
 
-    return df
+#     return df

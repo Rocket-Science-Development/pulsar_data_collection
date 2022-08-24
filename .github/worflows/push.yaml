@@ -57,3 +57,7 @@ jobs:
             run: |
               poetry run python -m isort --check pulsar_data_collection/
               poetry run python -m black --check pulsar_data_collection/
+
+          - name: Lint code
+            run: |
+              poetry run python -m flake8 pulsar_data_collection/

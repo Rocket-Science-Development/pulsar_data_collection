@@ -1,12 +1,18 @@
 certifi==2022.6.15; python_version >= "3.6"
+flake8-pyproject==1.1.0.post0; python_version >= "3.6"
+flake8==5.0.4; python_full_version >= "3.6.1"
 greenlet==1.1.2; python_version >= "3" and python_full_version < "3.0.0" and (platform_machine == "aarch64" or platform_machine == "ppc64le" or platform_machine == "x86_64" or platform_machine == "amd64" or platform_machine == "AMD64" or platform_machine == "win32" or platform_machine == "WIN32") and (python_version >= "2.7" and python_full_version < "3.0.0" or python_full_version >= "3.6.0") or python_version >= "3" and (platform_machine == "aarch64" or platform_machine == "ppc64le" or platform_machine == "x86_64" or platform_machine == "amd64" or platform_machine == "AMD64" or platform_machine == "win32" or platform_machine == "WIN32") and (python_version >= "2.7" and python_full_version < "3.0.0" or python_full_version >= "3.6.0") and python_full_version >= "3.5.0"
 influxdb-client==1.30.0; python_version >= "3.6"
+mccabe==0.7.0; python_version >= "3.6" and python_full_version >= "3.6.1"
 numpy==1.23.1
 pandas==1.4.3; python_version >= "3.8"
+pycodestyle==2.9.1; python_version >= "3.6" and python_full_version >= "3.6.1"
+pyflakes==2.5.0; python_version >= "3.6" and python_full_version >= "3.6.1"
 pysqlite3==0.4.7
 python-dateutil==2.8.2; python_version >= "3.8" and python_full_version < "3.0.0" or python_full_version >= "3.3.0" and python_version >= "3.8"
 pytz==2022.1; python_version >= "3.8"
 rx==3.2.0; python_full_version >= "3.6.0" and python_version >= "3.6"
 six==1.16.0; python_version >= "3.8" and python_full_version < "3.0.0" or python_full_version >= "3.3.0" and python_version >= "3.8"
 sqlalchemy==1.4.39; (python_version >= "2.7" and python_full_version < "3.0.0") or (python_full_version >= "3.6.0")
+tomli==2.0.1; python_version < "3.11" and python_version >= "3.7"
 urllib3==1.26.10; python_version >= "3.6" and python_full_version < "3.0.0" or python_full_version >= "3.6.0" and python_version < "4" and python_version >= "3.6"

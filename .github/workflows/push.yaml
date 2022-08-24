@@ -11,7 +11,7 @@ on:
       - main
 env:
   PYTHON_VERSION: 3.9
-  POETRY_VERSION: 1.1.14
+  POETRY_VERSION: 1.1.15
 
 jobs:
   continuous-integratiion:

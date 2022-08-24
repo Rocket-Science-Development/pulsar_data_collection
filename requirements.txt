@@ -11,3 +11,4 @@ six==1.16.0; python_version >= "3.8" and python_full_version < "3.0.0" or python
 sqlalchemy==1.4.39; (python_version >= "2.7" and python_full_version < "3.0.0") or (python_full_version >= "3.6.0")
 urllib3==1.26.10; python_version >= "3.6" and python_full_version < "3.0.0" or python_full_version >= "3.6.0" and python_version < "4" and python_version >= "3.6"
 pydantic==1.9.2;
+influxdb==5.3.1

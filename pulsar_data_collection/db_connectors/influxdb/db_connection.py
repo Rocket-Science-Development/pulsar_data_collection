@@ -34,10 +34,10 @@ class StorageEngine:
         print(df.head())
 
         client = DataFrameClient(db_host, db_port, db_user, db_password, db_name)
-
-        client.create_database(db_name)
-        client.get_list_database()
-        client.switch_database(db_name)
+        print(db_host, db_port, db_user, db_password, db_name)
+        # client.create_database(db_name)
+        # client.get_list_database()
+        # client.switch_database(db_name)
 
         client.write_points(df, "test5Aug", protocol=protocol, time_precision="u")
 

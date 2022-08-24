@@ -14,9 +14,7 @@ services:
     volumes:
       - influxdb-storage:/var/lib/influxdb
     environment:
-      - INFLUXDB_ADMIN_ENABLED=true
-      - INFLUXDB_DB=testDB
-      - INFLUXDB_USER=admin
-      - INFLUXDB_PASSWORD=pass123
+      - INFLUXDB_USER=${DB_USER}
+      - INFLUXDB_PASSWORD=${DB_PASSWORD}
 volumes:
   influxdb-storage:

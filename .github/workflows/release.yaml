@@ -56,9 +56,11 @@ jobs:
 
       - name: Build and publish
         run: |
-          export CODEARTIFACT_TOKEN=$(aws codeartifact get-authorization-token \
-          --domain example --query authorizationToken --output text)
-          export POETRY_HTTP_BASIC_ARTIFACT_USERNAME=aws
-          export POETRY_HTTP_BASIC_ARTIFACT_PASSWORD=$CODEARTIFACT_TOKEN
+          export POETRY_HTTP_BASIC_PULSAR_DATA_COLLECTION_REPOSITORY_USERNAME=aws
+          export POETRY_HTTP_BASIC_PULSAR_DATA_COLLECTION_REPOSITORY_PASSWORD=$(aws codeartifact get-authorization-token \
+              --domain pulsar-model-performance-management --query authorizationToken --output text --region us-east-1)
+
           poetry build
-          poetry publish --repository pulsar-data-collection-repostory
+          poetry publish --repository pulsar_data_collection_repository
+
+

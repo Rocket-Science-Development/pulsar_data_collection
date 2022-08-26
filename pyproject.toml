@@ -55,7 +55,7 @@ max-line-length = 120
 count = true
 
 [[tool.poetry.source]]
-name = "pulsar-data-collection-repostory"
+name = "pulsar_data_collection_repository"
 url = "https://pulsar-model-performance-management-212028562834.d.codeartifact.us-east-1.amazonaws.com/pypi/pulsar-data-collection/simple/"
 secondary = true
 

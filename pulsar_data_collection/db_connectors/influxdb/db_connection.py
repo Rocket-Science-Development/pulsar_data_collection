@@ -20,9 +20,7 @@ class StorageEngine:
     def __init__(self):
         pass
 
-    def sql_insertion(self, df: pd.DataFrame, db_host: str=DB_HOST, db_port: str=DB_PORT,
-                      db_user: str=DB_USER, db_password: str=DB_PASSWORD, db_name: str=DB_NAME, protocol: str=DB_PROTOCOL,
-                      measurment: str=DB_MEASURMENT):
+    def sql_insertion(self, df: pd.DataFrame, database_login=None):
 
         """
         Function to push Pandas Dataframe into Influx DB.
@@ -33,12 +31,12 @@ class StorageEngine:
 
         print(df.head())
 
-        client = DataFrameClient(db_host, db_port, db_user, db_password, db_name)
+        client = DataFrameClient(database_login.db_host, database_login.db_port, database_login.db_user, database_login.db_password, database_login.db_name)
 
-        client.create_database(db_name)
+        client.create_database(database_login.db_name)
         client.get_list_database()
-        client.switch_database(db_name)
+        client.switch_database(database_login.db_name)
 
-        client.write_points(df, "test5Aug", protocol=protocol, time_precision="u")
+        client.write_points(df, "test5Aug", protocol=database_login.protocol, time_precision="u")
 
         return df

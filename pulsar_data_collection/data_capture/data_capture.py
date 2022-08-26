@@ -7,16 +7,18 @@ import numpy as np
 import pandas as pd
 from pydantic import BaseModel, Field, validator
 
+from ..db_connectors.influxdb.config import DB_HOST, DB_PORT, DB_USER, DB_PASSWORD, DB_NAME, DB_PROTOCOL
+
 from .exceptions import CustomExceptionWithMessage as e
 
 
 class DatabaseLogin(BaseModel):
-    db_host: str
-    db_port: int
-    db_user: str
-    db_password: str
-    db_name: str
-    protocol: str
+    db_host: str = DB_HOST
+    db_port: int = DB_PORT
+    db_user: str = DB_USER
+    db_password: str = DB_PASSWORD
+    db_name: str = DB_NAME
+    protocol: str = DB_PROTOCOL
     measurement: Optional[str]
 
 
@@ -92,8 +94,8 @@ class DataCapture(DataCaptureParameters):
         if self.pred_name:
             data_with_prediction.loc[:, "pred_name"] = self.pred_name
 
-        # for label in data.other_labels:
-        #     data_with_prediction.loc[:, f"{label}"] = label
+        if not self.login_url:
+            self.login_url = DatabaseLogin()
 
         if self.operation_type in ("INS"):
             DataFactory.sql_ingestion(self.storage_engine, data_with_prediction, self.login_url)
@@ -103,26 +105,40 @@ class DataCapture(DataCaptureParameters):
 
 class DataFactory:
     @staticmethod
-    def sql_ingestion(storage_engine: str, dataframe: pd.DataFrame, database_login: DatabaseLogin=None):
-        """Function to import DB connection based on storage engine and call sql_insertion"""
-
+    def get_storage_engine(cls, storage_engine: str):
+        """ Returns storage current storage engine"""
         if storage_engine in ("influxdb",):
             from ..db_connectors.influxdb.db_connection import StorageEngine
+            return StorageEngine
         else:
             raise e(
                 value=storage_engine,
                 message=f"{storage_engine} is an Invalid Storage Engine",
             )
 
-        if database_login:
-            StorageEngine().sql_insertion(df=dataframe, db_host=database_login.db_host,
-                                          db_name=database_login.db_name, db_password=database_login.db_password,
-                                          protocol=database_login.protocol, db_port=database_login.db_port, db_user=database_login.db_user)
-        else:
-            StorageEngine().sql_insertion(df=dataframe)
+    @staticmethod
+    def sql_ingestion(cls, storage_engine: str, dataframe: pd.DataFrame, database_login: DatabaseLogin):
+        """Function to import DB connection based on storage engine and call sql_insertion
+        """
+
+        sengine = cls.get_storage_engine(storage_engine)
+
+        sengine().sql_insertion(df=dataframe, database_login=database_login)
+
 
     @staticmethod
-    def imp_module(storage_engine: str):
+    def sql_digestion(cls, storage_engine: str, database_login: DatabaseLogin=None):
+        """ Function to export DB connection based on storage engine and call sql_digestion
+        """
+
+        sengine = cls.get_storage_engine(storage_engine)
+        if database_login:
+            sengine().sql_insertion(database_login=database_login)
+        else:
+            sengine().sql_insertion()
+
+    @staticmethod
+    def imp_module(cls, storage_engine: str):
         """Function to import different DB connections based on StorageEngine passed in input."""
 
         module = importlib.import_module(storage_engine)

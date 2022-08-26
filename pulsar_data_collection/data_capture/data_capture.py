@@ -7,10 +7,7 @@ import numpy as np
 import pandas as pd
 from pydantic import BaseModel, Field, validator
 
-# from ..db_connectors.influxdb.db_connection import StorageEngine
 from .exceptions import CustomExceptionWithMessage as e
-
-# TODO : aadd validators for both models
 
 
 class DatabaseLogin(BaseModel):

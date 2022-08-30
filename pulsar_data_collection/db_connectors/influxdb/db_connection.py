@@ -1,7 +1,4 @@
 # -*- coding: utf-8 -*-
-# import influxdb_client as ifdb
-from datetime import datetime
-
 import pandas as pd
 from influxdb import DataFrameClient
 from influxdb import InfluxDBClient as ifdb

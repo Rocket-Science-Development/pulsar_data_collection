@@ -31,11 +31,28 @@ class TestDataIngestionInfluxDB:
             data_id="FluxDB",
             y_name="ABC",
             pred_name="ABC",
-            operation_type="INS",
+            operation_type="INSERT",
             login_url=database_login
         )
 
-        dat_capture.collect(dat_predict)
+        dat_capture.push(dat_predict)
+
+
+    def test_data_digestion(self):
+        database_login = DatabaseLogin(db_host="localhost", db_port=8086, db_user="admin", db_password="pass123",
+                                       db_name="testDB", protocol="line", measurement="something")
+
+        dat_capture = DataCapture(
+            storage_engine="influxdb",
+            model_id="RS101",
+            model_version="1.0",
+            data_id="FluxDB",
+            y_name="ABC",
+            pred_name="ABC",
+            operation_type="RETRIEVE",
+            login_url=database_login
+        )
+
 
 
 

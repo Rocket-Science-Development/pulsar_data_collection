@@ -52,9 +52,9 @@ class DataCaptureParameters(BaseModel):
     operation_type: str = Field(...)
     storage_engine: str
     login_url: Optional[DatabaseLogin]
-    model_id: str = Field(...)
-    model_version: str = Field(...)
-    data_id: str = Field(...)
+    model_id: str = ""
+    model_version: str = ""
+    data_id: str = ""
     y_name: Optional[str]
     pred_name: Optional[str]
     other_labels: Optional[List[str]] = None

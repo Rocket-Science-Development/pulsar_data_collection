@@ -44,11 +44,6 @@ class TestDataIngestionInfluxDB:
 
         dat_capture = DataCapture(
             storage_engine="influxdb",
-            model_id="RS101",
-            model_version="1.0",
-            data_id="FluxDB",
-            y_name="ABC",
-            pred_name="ABC",
             operation_type="RETRIEVE",
             login_url=database_login
         )

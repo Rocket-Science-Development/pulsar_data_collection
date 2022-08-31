@@ -1,4 +1,5 @@
 import importlib
+import logging
 import sys
 from datetime import datetime
 from typing import List, Optional
@@ -11,6 +12,8 @@ from ..db_connectors.influxdb.config import DB_HOST, DB_PORT, DB_USER, DB_PASSWO
 
 from .exceptions import CustomExceptionWithMessage as e
 
+
+logger = logging.getLogger()
 
 DATABASE_OPERATION_TYPE_INSERT = "INSERT"
 DATABASE_OPERATION_TYPE_DELETE = "DELETE"
@@ -49,9 +52,9 @@ class DataCaptureParameters(BaseModel):
     operation_type: str = Field(...)
     storage_engine: str
     login_url: Optional[DatabaseLogin]
-    model_id: Optional[str] = Field(...)
-    model_version: Optional[str] = Field(...)
-    data_id: Optional[str] = Field(...)
+    model_id: Optional[str]
+    model_version: Optional[str]
+    data_id: Optional[str]
     y_name: Optional[str]
     pred_name: Optional[str]
     other_labels: Optional[List[str]] = None
@@ -123,7 +126,7 @@ class DataCapture(DataCaptureParameters):
             data_with_prediction.loc[:, "pred_name"] = self.pred_name
 
         DataFactory.sql_ingestion(self.storage_engine, data_with_prediction, self.login_url)
-
+        logger.info("Data was successfully ingested into the db")
         return
 
     def collect(self):

@@ -56,11 +56,11 @@ def predict(data: RequestBody):
         data_id="FluxDB",
         y_name="ABC",
         pred_name="ABC",
-        operation_type="INS",
+        operation_type="INSERT",
         login_url=database_login
     )
 
-    dat_capture.collect(dat_predict)
+    dat_capture.push(dat_predict)
 
     # dframe = DFrame(prediction=prediction, to_predict=to_predict)
     # struc_dframe = DFrame(**dframe)

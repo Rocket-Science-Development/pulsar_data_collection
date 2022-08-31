@@ -52,9 +52,9 @@ class DataCaptureParameters(BaseModel):
     operation_type: str = Field(...)
     storage_engine: str
     login_url: Optional[DatabaseLogin]
-    model_id: Optional[str]
-    model_version: Optional[str]
-    data_id: Optional[str]
+    model_id: str = Field(...)
+    model_version: str = Field(...)
+    data_id: str = Field(...)
     y_name: Optional[str]
     pred_name: Optional[str]
     other_labels: Optional[List[str]] = None
@@ -65,13 +65,16 @@ class DataCaptureParameters(BaseModel):
         if values.get("operation_type") == DATABASE_OPERATION_TYPE_INSERT:
             if value not in ("RS101", "RS102"):
                 raise ValueError("Model ID can only be RS101 or RS102.")
-        return value
+            return value
+        return ""
 
     @validator("model_version", "data_id")
     def check_model_version(cls, value, values):
-        if values.get("operation_type") == DATABASE_OPERATION_TYPE_INSERT and not value:
-            raise ValueError("Some required parameters were missed. Fields model_id, model_version, and data_id are required for Insert operation.")
-        return value
+        if values.get("operation_type") == DATABASE_OPERATION_TYPE_INSERT:
+            if not value:
+                raise ValueError("Some required parameters were missed. Fields model_id, model_version, and data_id are required for Insert operation.")
+            return value
+        return ""
 
     @validator("storage_engine")
     def valid_import(cls, value):

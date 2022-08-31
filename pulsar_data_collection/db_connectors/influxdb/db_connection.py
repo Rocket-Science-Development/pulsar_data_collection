@@ -33,6 +33,6 @@ class StorageEngine:
 
         client.switch_database(database_login.db_name)
 
-        df = client.query(f"select * from {database_login.db_name}")
+        df = client.query(f"select * from {database_login.db_name}", chunked=True)
 
         return df

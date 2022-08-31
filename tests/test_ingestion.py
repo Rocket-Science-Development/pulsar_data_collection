@@ -48,8 +48,7 @@ class TestDataIngestionInfluxDB:
             login_url=database_login
         )
 
-        dat_capture.collect()
-
+        data = dat_capture.collect()
 
 
 

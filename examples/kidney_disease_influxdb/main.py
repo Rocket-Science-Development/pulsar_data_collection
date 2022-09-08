@@ -11,7 +11,11 @@ from numpy import ndarray
 from pydantic import BaseModel
 
 sys.path.append("../../")
-import pulsar_data_collection.data_capture.data_capture as Data_Capture
+from pulsar_data_collection.data_capture import (
+    DatabaseLogin,
+    DataCapture,
+    DataWithPrediction,
+)
 
 logging.basicConfig(level=logging.DEBUG, format="%(asctime)s:%(levelname)s:%(name)s:%(message)s")
 app = FastAPI()
@@ -44,25 +48,29 @@ def predict(data: RequestBody):
 
     prediction = model.predict(to_predict)
 
-    dat_predict = Data_Capture.DataWithPrediction(prediction=prediction, data_points=to_predict)
+    database_login = DatabaseLogin(
+        db_host="influx",
+        db_port=8086,
+        db_user="admin",
+        db_password="pass123",
+        db_name="testDB",
+        protocol="line",
+        measurement="something",
+    )
 
-    dat_capture = Data_Capture.DataCapture(
+    dat_predict = DataWithPrediction(prediction=prediction, data_points=to_predict)
+
+    dat_capture = DataCapture(
         storage_engine="influxdb",
         model_id="RS101",
         model_version="1.0",
         data_id="FluxDB",
-        y_name="ABC",
-        pred_name="ABC",
-        operation_type="INS",
+        y_name="y_pred",
+        pred_name="clf_target",
+        operation_type="INSERT",
+        login_url=database_login,
     )
 
-    dat_capture.collect(dat_predict)
-
-    # dframe = DFrame(prediction=prediction, to_predict=to_predict)
-    # struc_dframe = DFrame(**dframe)
-    # data_with_prediction = DFrameCreate().dataframe_create(dframe)
-
-    # InfluxStorage().sql_insertion(data_with_prediction)
-
+    dat_capture.push(dat_predict)
     prediction_as_list = prediction.tolist()
     return prediction_as_list

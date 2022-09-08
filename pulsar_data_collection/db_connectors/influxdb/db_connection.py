@@ -1,27 +1,14 @@
 # -*- coding: utf-8 -*-
+# import influxdb_client as ifdb
 import pandas as pd
 from influxdb import DataFrameClient
-from influxdb import InfluxDBClient as ifdb
-
-# Setup database
-# client = ifdb('localhost', 8086, 'admin', 'pass123', 'test2Aug')
-# client.create_database('test2Aug')
-# client.get_list_database()
-# client.switch_database('test2Aug')
-
-dbhost = "localhost"
-dbport = 8086
-dbuser = "admin"
-dbpasswd = "pass123"
-dbname = "testDB"
-protocol = "line"
 
 
 class StorageEngine:
     def __init__(self):
         pass
 
-    def sql_insertion(self, df: pd.DataFrame):
+    def sql_insertion(self, df: pd.DataFrame, database_login=None):
 
         """
         Function to push Pandas Dataframe into Influx DB.
@@ -30,14 +17,35 @@ class StorageEngine:
         # Set 'TimeStamp' field as index of dataframe
         df.set_index("Timestamp", inplace=True)
 
-        print(df.head())
+        client = DataFrameClient(
+            database_login.db_host,
+            database_login.db_port,
+            database_login.db_user,
+            database_login.db_password,
+            database_login.db_name,
+        )
 
-        client = DataFrameClient(dbhost, dbport, dbuser, dbpasswd, dbname)
-
-        client.create_database(dbname)
+        client.create_database(database_login.db_name)
         client.get_list_database()
-        client.switch_database(dbname)
+        client.switch_database(database_login.db_name)
 
-        client.write_points(df, "test5Aug", protocol=protocol, time_precision="u")
+        client.write_points(
+            df, database_login.db_name, protocol=database_login.protocol, time_precision="u", tag_columns=("age", "id")
+        )
+
+        return df
+
+    def sql_digestion(self, database_login):
+        client = DataFrameClient(
+            database_login.db_host,
+            database_login.db_port,
+            database_login.db_user,
+            database_login.db_password,
+            database_login.db_name,
+        )
+
+        client.switch_database(database_login.db_name)
+
+        df = client.query(f"select * from {database_login.db_name}", chunked=True)
 
         return df

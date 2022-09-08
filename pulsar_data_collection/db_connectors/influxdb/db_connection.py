@@ -23,7 +23,7 @@ class StorageEngine:
         client.get_list_database()
         client.switch_database(database_login.db_name)
 
-        client.write_points(df, database_login.db_name, protocol=database_login.protocol, time_precision="u")
+        client.write_points(df, database_login.db_name, protocol=database_login.protocol, time_precision="u", tag_columns=("age", "id"))
 
         return df
 

@@ -123,7 +123,11 @@ class DataCapture(DataCaptureParameters):
         if not self.operation_type in (DATABASE_OPERATION_TYPE_INSERT,):
             raise Exception(f"Method is only allowed for operation type {DATABASE_OPERATION_TYPE_INSERT}")
 
-        pred = pd.DataFrame(data.prediction, columns=["target"])
+        if self.y_name:
+            pred = pd.DataFrame(data.prediction, columns=[self.y_name])
+        else:
+            pred = pd.DataFrame(data.prediction, columns=["target"])
+
         data_with_prediction = pd.concat([data.data_points, pred], axis=1)
 
         data_with_prediction.loc[:, "Timestamp"] = data.timestamp
@@ -131,8 +135,6 @@ class DataCapture(DataCaptureParameters):
         data_with_prediction.loc[:, "model_version"] = self.model_version
         data_with_prediction.loc[:, "data_id"] = self.data_id
 
-        if self.y_name:
-            data_with_prediction.loc[:, self.y_name] = self.y_name
         if self.pred_name:
             data_with_prediction.loc[:, self.pred_name] = self.pred_name
 

@@ -30,7 +30,7 @@ class StorageEngine:
         client.switch_database(database_login.db_name)
 
         client.write_points(
-            df, database_login.db_name, protocol=database_login.protocol, time_precision="u", tag_columns=("uuid")
+            df, database_login.db_name, protocol=database_login.protocol, time_precision="u", tag_columns=("uuid",)
         )
 
         return df

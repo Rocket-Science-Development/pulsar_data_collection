@@ -11,7 +11,7 @@ from numpy import ndarray
 from pydantic import BaseModel
 
 sys.path.append("../../")
-from pulsar_data_collection.data_capture import (
+from pulsar_data_collection.data_capture.data_capture import (
     DatabaseLogin,
     DataCapture,
     DataWithPrediction,

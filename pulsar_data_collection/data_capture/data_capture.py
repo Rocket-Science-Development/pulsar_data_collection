@@ -1,6 +1,7 @@
 import importlib
 import logging
 import sys
+import uuid
 from datetime import datetime
 from typing import List, Optional
 
@@ -134,6 +135,8 @@ class DataCapture(DataCaptureParameters):
             data_with_prediction.loc[:, self.y_name] = self.y_name
         if self.pred_name:
             data_with_prediction.loc[:, self.pred_name] = self.pred_name
+
+        data_with_prediction["uuid"] = [uuid.uuid4() for _ in range(len(data_with_prediction.index))]
 
         DataFactory.sql_ingestion(self.storage_engine, data_with_prediction, self.login_url)
         logger.info("Data was successfully ingested into the db")

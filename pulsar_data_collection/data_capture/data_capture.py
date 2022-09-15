@@ -12,6 +12,9 @@ from pydantic import BaseModel, Field, validator
 from ..db_connectors.influxdb.config import (
     DB_HOST,
     DB_NAME,
+    DB_PERIOD_MEASURMENT,
+    DB_METRICS_MEASURMENT,
+    DB_PREDICTION_MEASURMENT,
     DB_PASSWORD,
     DB_PORT,
     DB_PROTOCOL,
@@ -21,16 +24,12 @@ from .exceptions import CustomExceptionWithMessage as e
 
 logger = logging.getLogger()
 
-DATABASE_OPERATION_TYPE_INSERT = "INSERT"
-DATABASE_OPERATION_TYPE_DELETE = "DELETE"
-DATABASE_OPERATION_TYPE_UPDATE = "UPDATE"
-DATABASE_OPERATION_TYPE_RETRIEVE = "RETRIEVE"
+DATABASE_OPERATION_TYPE_INSERT_PREDICTION = "INSERT_PREDICTION"
+DATABASE_OPERATION_TYPE_METRICS = "METRICS"
 
 DATABASE_OPERATION_TYPES = (
-    DATABASE_OPERATION_TYPE_INSERT,
-    DATABASE_OPERATION_TYPE_DELETE,
-    DATABASE_OPERATION_TYPE_UPDATE,
-    DATABASE_OPERATION_TYPE_RETRIEVE,
+    DATABASE_OPERATION_TYPE_INSERT_PREDICTION,
+    DATABASE_OPERATION_TYPE_METRICS
 )
 
 
@@ -39,9 +38,7 @@ class DatabaseLogin(BaseModel):
     db_port: int = DB_PORT
     db_user: str = DB_USER
     db_password: str = DB_PASSWORD
-    db_name: str = DB_NAME
     protocol: str = DB_PROTOCOL
-    measurement: Optional[str]
 
 
 class DataWithPrediction(BaseModel):
@@ -68,7 +65,7 @@ class DataCaptureParameters(BaseModel):
     # Adding a sample validator for checking the value of model_id.
     @validator("model_id")
     def check_model_id(cls, value, values):
-        if values.get("operation_type") == DATABASE_OPERATION_TYPE_INSERT:
+        if values.get("operation_type") == DATABASE_OPERATION_TYPE_INSERT_PREDICTION:
             if value not in ("RS101", "RS102"):
                 raise ValueError("Model ID can only be RS101 or RS102.")
             return value
@@ -76,7 +73,7 @@ class DataCaptureParameters(BaseModel):
 
     @validator("model_version", "data_id")
     def check_model_version(cls, value, values):
-        if values.get("operation_type") == DATABASE_OPERATION_TYPE_INSERT:
+        if values.get("operation_type") == DATABASE_OPERATION_TYPE_INSERT_PREDICTION:
             if not value:
                 raise ValueError(
                     "Some required parameters were missed. Fields model_id, model_version, and data_id are required for Insert operation."
@@ -120,9 +117,8 @@ class DataCapture(DataCaptureParameters):
         """
         Function to convert prediction output to Pandas dataframe to be inserted in DB
         """
-        if not self.operation_type in (DATABASE_OPERATION_TYPE_INSERT,):
-            raise Exception(f"Method is only allowed for operation type {DATABASE_OPERATION_TYPE_INSERT}")
-
+        if not self.operation_type in (DATABASE_OPERATION_TYPE_INSERT_PREDICTION,):
+            raise Exception(f"Method is only allowed for operation type {DATABASE_OPERATION_TYPE_INSERT_PREDICTION}")
         if self.y_name:
             pred = pd.DataFrame(data.prediction, columns=[self.y_name])
         else:
@@ -140,15 +136,34 @@ class DataCapture(DataCaptureParameters):
 
         data_with_prediction["uuid"] = [uuid.uuid4() for _ in range(len(data_with_prediction.index))]
 
-        DataFactory.sql_ingestion(self.storage_engine, data_with_prediction, self.login_url)
+        # Set 'TimeStamp' field as index of dataframe
+        data_with_prediction.set_index("Timestamp", inplace=True)
+
+        DataFactory.sql_ingestion("test_meas", self.storage_engine, data_with_prediction, self.login_url)
         logger.info("Data was successfully ingested into the db")
         return
 
     def collect(self):
         """Function for retrieving Pandas dataframe from the DB"""
-        if not self.operation_type in (DATABASE_OPERATION_TYPE_RETRIEVE,):
-            raise Exception(f"Method is only allowed for operation type {DATABASE_OPERATION_TYPE_RETRIEVE}")
-        return DataFactory.sql_digestion(self.storage_engine, self.login_url)
+        return DataFactory.sql_digestion(DB_PREDICTION_MEASURMENT, self.storage_engine, self.login_url)
+
+    def collect_period(self):
+        """ Retrieves last period what was inseted to the database
+        """
+        df = DataFactory.sql_digestion(DB_PERIOD_MEASURMENT, self.storage_engine, self.login_url)
+        if df:
+            df.iloc[df["preiod_timestamp"].argmax()]["period_timestamp"]
+        return None
+
+    def push_period(self, period_df):
+        """ Inserts period to the database
+        """
+        DataFactory.sql_ingestion(DB_PERIOD_MEASURMENT, self.storage_engine, period_df, self.login_url)
+
+    def push_metrics(self, metrics_df):
+        """ Insterts metrics dataframe to the database
+        """
+        DataFactory.sql_ingestion(DB_METRICS_MEASURMENT, self.storage_engine, metrics_df, self.login_url)
 
 
 class DataFactory:
@@ -166,18 +181,18 @@ class DataFactory:
             )
 
     @classmethod
-    def sql_ingestion(cls, storage_engine: str, dataframe: pd.DataFrame, database_login: DatabaseLogin):
+    def sql_ingestion(cls, measurment_name, storage_engine: str, dataframe: pd.DataFrame, database_login: DatabaseLogin):
         """Function to import DB connection based on storage engine and call sql_insertion"""
         sengine = cls.get_storage_engine(storage_engine)
 
-        sengine().sql_insertion(df=dataframe, database_login=database_login)
+        sengine().sql_insertion(measurment_name, df=dataframe, database_login=database_login, )
 
     @classmethod
-    def sql_digestion(cls, storage_engine: str, database_login: DatabaseLogin = None):
+    def sql_digestion(cls, measurment_name, storage_engine: str, database_login: DatabaseLogin = None):
         """Function to export DB connection based on storage engine and call sql_digestion"""
 
         sengine = cls.get_storage_engine(storage_engine)
-        return sengine().sql_digestion(database_login=database_login)
+        return sengine().sql_digestion(measurment_name, database_login=database_login)
 
     @classmethod
     def imp_module(cls, storage_engine: str):

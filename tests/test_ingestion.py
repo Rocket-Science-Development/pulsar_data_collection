@@ -19,8 +19,7 @@ class TestDataIngestionInfluxDB:
 
         prediction = model.predict(to_predict)
 
-        database_login = DatabaseLogin(db_host="localhost", db_port=8086, db_user="admin", db_password="pass123",
-                                       db_name="testDB", protocol="line", measurement="something")
+        database_login = DatabaseLogin(db_host="localhost", db_port=8086, db_user="admin", db_password="pass123", protocol="line")
 
         dat_predict = DataWithPrediction(prediction=prediction, data_points=to_predict)
 
@@ -30,8 +29,8 @@ class TestDataIngestionInfluxDB:
             model_version="1.0",
             data_id="FluxDB",
             y_name="ABC",
-            pred_name="ABC",
-            operation_type="INSERT",
+            pred_name="target",
+            operation_type="INSERT_PREDICTION",
             login_url=database_login
         )
 
@@ -44,7 +43,7 @@ class TestDataIngestionInfluxDB:
 
         dat_capture = DataCapture(
             storage_engine="influxdb",
-            operation_type="RETRIEVE",
+            operation_type="METRICS",
             login_url=database_login
         )
 

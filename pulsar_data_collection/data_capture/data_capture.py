@@ -139,7 +139,7 @@ class DataCapture(DataCaptureParameters):
         # Set 'TimeStamp' field as index of dataframe
         data_with_prediction.set_index("Timestamp", inplace=True)
 
-        DataFactory.sql_ingestion("test_meas", self.storage_engine, data_with_prediction, self.login_url)
+        DataFactory.sql_ingestion(DB_PREDICTION_MEASURMENT, self.storage_engine, data_with_prediction, self.login_url)
         logger.info("Data was successfully ingested into the db")
         return
 

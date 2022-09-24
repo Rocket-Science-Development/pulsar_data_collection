@@ -62,7 +62,6 @@ class DataCaptureParameters(BaseModel):
     pred_name: Optional[str]
     other_labels: Optional[List[str]] = None
 
-
     @validator("model_id", "model_version", "data_id")
     def check_model_version(cls, value, values):
         if values.get("operation_type") == DATABASE_OPERATION_TYPE_INSERT_PREDICTION:
@@ -122,7 +121,7 @@ class DataCapture(DataCaptureParameters):
         data_with_prediction.loc[:, "model_id"] = self.model_id
         data_with_prediction.loc[:, "model_version"] = self.model_version
         data_with_prediction.loc[:, "data_id"] = self.data_id
-        data_with_prediction.loc[:, "pred_timestamp"] = data.timestamp
+        data_with_prediction.loc[:, "pred_timestamp"] = datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ')
 
         if self.pred_name:
             data_with_prediction.loc[:, self.pred_name] = self.pred_name

@@ -12,7 +12,7 @@ from pydantic import BaseModel, Field, validator
 from ..db_connectors.influxdb.config import (
     DB_HOST,
     DB_NAME,
-    DB_PERIOD_MEASURMENT,
+    DB_EVAL_TIMESTAMP_MEASURMENT,
     DB_METRICS_MEASURMENT,
     DB_PREDICTION_MEASURMENT,
     DB_PASSWORD,
@@ -130,6 +130,7 @@ class DataCapture(DataCaptureParameters):
         data_with_prediction.loc[:, "model_id"] = self.model_id
         data_with_prediction.loc[:, "model_version"] = self.model_version
         data_with_prediction.loc[:, "data_id"] = self.data_id
+        data_with_prediction.loc[:, "pred_timestamp"] = data.timestamp
 
         if self.pred_name:
             data_with_prediction.loc[:, self.pred_name] = self.pred_name
@@ -147,18 +148,18 @@ class DataCapture(DataCaptureParameters):
         """Function for retrieving Pandas dataframe from the DB"""
         return DataFactory.sql_digestion(DB_PREDICTION_MEASURMENT, self.storage_engine, self.login_url)
 
-    def collect_period(self):
+    def collect_eval_timestamp(self):
         """ Retrieves last period what was inseted to the database
         """
-        df = DataFactory.sql_digestion(DB_PERIOD_MEASURMENT, self.storage_engine, self.login_url)
+        df = DataFactory.sql_digestion(DB_EVAL_TIMESTAMP_MEASURMENT, self.storage_engine, self.login_url)
         if df:
-            df.iloc[df["preiod_timestamp"].argmax()]["period_timestamp"]
+            df.iloc[df["eval_timestamp"].argmax()]["eval_timestamp"]
         return None
 
-    def push_period(self, period_df):
+    def push_eval_timestamp(self, eval_df):
         """ Inserts period to the database
         """
-        DataFactory.sql_ingestion(DB_PERIOD_MEASURMENT, self.storage_engine, period_df, self.login_url)
+        DataFactory.sql_ingestion(DB_EVAL_TIMESTAMP_MEASURMENT, self.storage_engine, eval_df, self.login_url)
 
     def push_metrics(self, metrics_df):
         """ Insterts metrics dataframe to the database

@@ -39,7 +39,7 @@ class TestDataIngestionInfluxDB:
 
     def test_data_digestion(self):
         database_login = DatabaseLogin(db_host="localhost", db_port=8086, db_user="admin", db_password="pass123",
-                                       db_name="testDB", protocol="line", measurement="something")
+                                        protocol="line")
 
         dat_capture = DataCapture(
             storage_engine="influxdb",

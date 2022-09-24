@@ -62,16 +62,8 @@ class DataCaptureParameters(BaseModel):
     pred_name: Optional[str]
     other_labels: Optional[List[str]] = None
 
-    # Adding a sample validator for checking the value of model_id.
-    @validator("model_id")
-    def check_model_id(cls, value, values):
-        if values.get("operation_type") == DATABASE_OPERATION_TYPE_INSERT_PREDICTION:
-            if value not in ("RS101", "RS102"):
-                raise ValueError("Model ID can only be RS101 or RS102.")
-            return value
-        return ""
 
-    @validator("model_version", "data_id")
+    @validator("model_id", "model_version", "data_id")
     def check_model_version(cls, value, values):
         if values.get("operation_type") == DATABASE_OPERATION_TYPE_INSERT_PREDICTION:
             if not value:

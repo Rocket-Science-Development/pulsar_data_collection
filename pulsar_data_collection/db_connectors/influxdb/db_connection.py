@@ -2,8 +2,7 @@
 # import influxdb_client as ifdb
 import pandas as pd
 from influxdb import DataFrameClient
-from .config import DB_NAME, DB_METRICS_MEASURMENT, DB_PREDICTION_MEASURMENT, \
-    DB_PERIOD_MEASURMENT
+from .config import DB_NAME
 
 
 class StorageEngine:

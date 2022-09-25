@@ -46,8 +46,17 @@ class TestDataIngestionInfluxDB:
             operation_type="METRICS",
             login_url=database_login
         )
-
-        data = dat_capture.collect()
-
+        dat_capture.collect()
 
 
+    def test_period_digestion(self):
+        database_login = DatabaseLogin(db_host="localhost", db_port=8086, db_user="admin", db_password="pass123",
+                                       protocol="line")
+        dat_capture = DataCapture(
+            storage_engine="influxdb",
+            operation_type="METRICS",
+            login_url=database_login
+        )
+        eval_timestamp = dat_capture.collect_eval_timestamp()
+        print(eval_timestamp)
+        s

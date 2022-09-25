@@ -32,7 +32,7 @@ class StorageEngine:
 
         return df
 
-    def sql_digestion(self, measurment_name, database_login):
+    def sql_digestion(self, measurment_name, database_login, filters=None):
         client = DataFrameClient(
             database_login.db_host,
             database_login.db_port,
@@ -40,10 +40,15 @@ class StorageEngine:
             database_login.db_password,
             DB_NAME
         )
+        filter_string = ""
+        if filters:
+            filter_string += "where "
+            for key, value in filters.items():
+                filter_string += f"{key}{value}"
 
         client.switch_database(DB_NAME)
 
-        df = client.query(f"select * from {measurment_name}", chunked=True)
+        df = client.query(f"select * from {measurment_name} {filter_string}", chunked=True)
 
         return df
 

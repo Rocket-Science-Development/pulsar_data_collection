@@ -121,7 +121,6 @@ class DataCapture(DataCaptureParameters):
         data_with_prediction.loc[:, "model_id"] = self.model_id
         data_with_prediction.loc[:, "model_version"] = self.model_version
         data_with_prediction.loc[:, "data_id"] = self.data_id
-        data_with_prediction.loc[:, "pred_timestamp"] = datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ')
 
         if self.pred_name:
             data_with_prediction.loc[:, self.pred_name] = self.pred_name
@@ -135,16 +134,19 @@ class DataCapture(DataCaptureParameters):
         logger.info("Data was successfully ingested into the db")
         return
 
-    def collect(self):
+    def collect(self, filters: dict = None):
         """Function for retrieving Pandas dataframe from the DB"""
-        return DataFactory.sql_digestion(DB_PREDICTION_MEASURMENT, self.storage_engine, self.login_url)
+        return DataFactory.sql_digestion(DB_PREDICTION_MEASURMENT, self.storage_engine, self.login_url, filters)
 
     def collect_eval_timestamp(self):
         """ Retrieves last period what was inseted to the database
         """
-        df = DataFactory.sql_digestion(DB_EVAL_TIMESTAMP_MEASURMENT, self.storage_engine, self.login_url)
-        if df:
-            df.iloc[df["eval_timestamp"].argmax()]["eval_timestamp"]
+        results = DataFactory.sql_digestion(DB_EVAL_TIMESTAMP_MEASURMENT, self.storage_engine, self.login_url)
+
+        if list(results.get("eval_timestamp")):
+            df = pd.DataFrame(results.get("eval_timestamp"))
+            df["eval_timestamp"] = pd.to_datetime(df["eval_timestamp"])
+            return df.iloc[df["eval_timestamp"].argmax()]["eval_timestamp"]
         return None
 
     def push_eval_timestamp(self, eval_df):
@@ -180,11 +182,11 @@ class DataFactory:
         sengine().sql_insertion(measurment_name, df=dataframe, database_login=database_login, )
 
     @classmethod
-    def sql_digestion(cls, measurment_name, storage_engine: str, database_login: DatabaseLogin = None):
+    def sql_digestion(cls, measurment_name, storage_engine: str, database_login: DatabaseLogin = None, filters: dict = None):
         """Function to export DB connection based on storage engine and call sql_digestion"""
 
         sengine = cls.get_storage_engine(storage_engine)
-        return sengine().sql_digestion(measurment_name, database_login=database_login)
+        return sengine().sql_digestion(measurment_name, database_login=database_login, filters=filters)
 
     @classmethod
     def imp_module(cls, storage_engine: str):

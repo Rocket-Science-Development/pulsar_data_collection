@@ -46,8 +46,7 @@ class TestDataIngestionInfluxDB:
             operation_type="METRICS",
             login_url=database_login
         )
-        dat_capture.collect()
-
+        dat_capture.collect({"time": ">= '2022-07-23 18:09:21'"})
 
     def test_period_digestion(self):
         database_login = DatabaseLogin(db_host="localhost", db_port=8086, db_user="admin", db_password="pass123",
@@ -57,4 +56,4 @@ class TestDataIngestionInfluxDB:
             operation_type="METRICS",
             login_url=database_login
         )
-        eval_timestamp = dat_capture.collect_eval_timestamp()
+        dat_capture.collect_eval_timestamp()

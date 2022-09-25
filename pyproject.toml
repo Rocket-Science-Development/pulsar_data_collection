@@ -1,6 +1,6 @@
 [tool.poetry]
 name = "pulsar-data-collection"
-version = "0.1.8"
+version = "0.1.9"
 description = "sdk enabling data collection from model serving code for our MPM solution"
 authors = ["Your Name <you@example.com>"]
 

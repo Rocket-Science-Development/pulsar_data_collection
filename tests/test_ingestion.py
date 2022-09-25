@@ -58,5 +58,3 @@ class TestDataIngestionInfluxDB:
             login_url=database_login
         )
         eval_timestamp = dat_capture.collect_eval_timestamp()
-        print(eval_timestamp)
-        s

@@ -143,7 +143,7 @@ class DataCapture(DataCaptureParameters):
         """
         results = DataFactory.sql_digestion(DB_EVAL_TIMESTAMP_MEASURMENT, self.storage_engine, self.login_url)
 
-        if list(results.get("eval_timestamp")):
+        if results and list(results.get("eval_timestamp")):
             df = pd.DataFrame(results.get("eval_timestamp"))
             df["eval_timestamp"] = pd.to_datetime(df["eval_timestamp"])
             return df.iloc[df["eval_timestamp"].argmax()]["eval_timestamp"]

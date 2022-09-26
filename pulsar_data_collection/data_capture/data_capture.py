@@ -115,21 +115,18 @@ class DataCapture(DataCaptureParameters):
         else:
             pred = pd.DataFrame(data.prediction, columns=["target"])
 
-        data_with_prediction = pd.concat([data.data_points, pred], axis=1)
+        data_with_prediction = pd.concat([data.data_points, pred], axis=0, join='inner')
 
         data_with_prediction.loc[:, "Timestamp"] = data.timestamp
         data_with_prediction.loc[:, "model_id"] = self.model_id
         data_with_prediction.loc[:, "model_version"] = self.model_version
         data_with_prediction.loc[:, "data_id"] = self.data_id
-
         if self.pred_name:
             data_with_prediction.loc[:, self.pred_name] = self.pred_name
 
         data_with_prediction["uuid"] = [uuid.uuid4() for _ in range(len(data_with_prediction.index))]
-
         # Set 'TimeStamp' field as index of dataframe
         data_with_prediction.set_index("Timestamp", inplace=True)
-
         DataFactory.sql_ingestion(DB_PREDICTION_MEASURMENT, self.storage_engine, data_with_prediction, self.login_url)
         logger.info("Data was successfully ingested into the db")
         return

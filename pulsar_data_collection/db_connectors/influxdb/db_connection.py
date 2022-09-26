@@ -14,7 +14,6 @@ class StorageEngine:
         """
         Function to push Pandas Dataframe into Influx DB.
         """
-
         client = DataFrameClient(
             database_login.db_host,
             database_login.db_port,

@@ -17,11 +17,18 @@ class TestDataIngestionInfluxDB:
 
         to_predict = pd.read_csv("examples/kidney_disease_influxdb/test_data_no_class.csv", sep=",", header=0)
 
+        to_predict1 = to_predict[:15]
+        to_predict2 = to_predict[15:]
+
         prediction = model.predict(to_predict)
+        prediction1 = model.predict(to_predict1)
+        prediction2 = model.predict(to_predict2)
 
         database_login = DatabaseLogin(db_host="localhost", db_port=8086, db_user="admin", db_password="pass123", protocol="line")
 
         dat_predict = DataWithPrediction(prediction=prediction, data_points=to_predict)
+        dat_predict1 = DataWithPrediction(prediction=prediction1, data_points=to_predict1)
+        dat_predict2 = DataWithPrediction(prediction=prediction2, data_points=to_predict2)
 
         dat_capture = DataCapture(
             storage_engine="influxdb",
@@ -33,8 +40,9 @@ class TestDataIngestionInfluxDB:
             operation_type="INSERT_PREDICTION",
             login_url=database_login
         )
+        dat_capture.push(dat_predict1)
+        dat_capture.push(dat_predict2)
 
-        dat_capture.push(dat_predict)
 
 
     def test_data_digestion(self):
@@ -46,7 +54,7 @@ class TestDataIngestionInfluxDB:
             operation_type="METRICS",
             login_url=database_login
         )
-        dat_capture.collect({"time": ">= '2022-07-23 18:09:21'"})
+        dat_capture.collect()
 
     def test_period_digestion(self):
         database_login = DatabaseLogin(db_host="localhost", db_port=8086, db_user="admin", db_password="pass123",

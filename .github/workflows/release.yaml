@@ -62,5 +62,3 @@ jobs:
 
           poetry build
           poetry publish --repository pulsar_data_collection_repository
-
-

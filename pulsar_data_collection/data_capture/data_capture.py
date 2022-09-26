@@ -42,7 +42,7 @@ class DatabaseLogin(BaseModel):
 
 
 class DataWithPrediction(BaseModel):
-    timestamp: datetime = datetime.now()
+    timestamp: datetime = datetime.utcnow()
     prediction: np.ndarray = Field(...)
     data_points: pd.DataFrame = Field(...)
     features_names: Optional[List[str]]

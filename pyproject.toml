@@ -54,10 +54,6 @@ per-file-ignores = [
 max-line-length = 120
 count = true
 
-[[tool.poetry.source]]
-name = "aws_repository"
-url = "https://pulsar-model-performance-management-212028562834.d.codeartifact.us-east-1.amazonaws.com/pypi/pulsar-data-collection/simple/"
-
 [build-system]
 requires = ["poetry-core>=1.0.0"]
 build-backend = "poetry.core.masonry.api"

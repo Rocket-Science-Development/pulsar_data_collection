@@ -20,11 +20,11 @@ repos:
     #     hooks:
     #     -   id: flake8
     #         additional_dependencies: [Flake8-pyproject]
-    # - repo: local
-    #   hooks:
-    #       - id: export-req
-    #         name: export requirements
-    #         language: system
-    #         pass_filenames: false
-    #         entry: poetry export -f requirements.txt -o requirements.txt --without-hashes
-    #         files: ^(pyproject.toml|poetry.lock)$
+    - repo: local
+      hooks:
+          - id: export-req
+            name: export requirements
+            language: system
+            pass_filenames: false
+            entry: poetry export -f requirements.txt -o requirements.txt --without-hashes
+            files: ^(pyproject.toml|poetry.lock)$

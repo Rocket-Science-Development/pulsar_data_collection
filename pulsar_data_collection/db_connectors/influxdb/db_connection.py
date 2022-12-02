@@ -1,42 +1,53 @@
 # -*- coding: utf-8 -*-
-import influxdb_client as ifdb
+# import influxdb_client as ifdb
+import pandas as pd
+from influxdb import DataFrameClient
+from .config import DB_NAME
 
 
 class StorageEngine:
-    def __init__(self, login_url):
+    def __init__(self):
         pass
 
+    def sql_insertion(self, measurment_name, df: pd.DataFrame, database_login=None):
 
-# def sqlupdate(df):
-#     try:
-#         conn = db.connect("SQLite_Python.db")
-#         cursor = conn.cursor()
-#         print("Database created and Successfully Connected to SQLite")
+        """
+        Function to push Pandas Dataframe into Influx DB.
+        """
+        client = DataFrameClient(
+            database_login.db_host,
+            database_login.db_port,
+            database_login.db_user,
+            database_login.db_password,
+            DB_NAME
+        )
+        client.create_database(DB_NAME)
+        client.get_list_database()
+        client.switch_database(DB_NAME)
 
-#         # cursor.execute("SELECT * FROM mpm_data_ing;")
+        client.write_points(
+            df, measurment_name, protocol=database_login.protocol, time_precision="u", tag_columns=("uuid",)
+        )
 
-#         df.to_sql("df", conn, if_exists="replace")
+        return df
 
-#         # print(cursor.fetchall())
+    def sql_digestion(self, measurment_name, database_login, filters=None):
+        client = DataFrameClient(
+            database_login.db_host,
+            database_login.db_port,
+            database_login.db_user,
+            database_login.db_password,
+            DB_NAME
+        )
+        filter_string = ""
+        if filters:
+            filter_string += "where "
+            for key, value in filters.items():
+                filter_string += f"{key}{value}"
 
-#         # cursor.execute(
-#         #     """
-#         #     CREATE TABLE IF NOT EXISTS mpm_data_ing as
-#         #     SELECT * FROM df
-#         #     """
-#         # )
+        client.switch_database(DB_NAME)
 
-#         df.to_sql(name="mpm_10jul", con=conn, if_exists="append")
+        df = client.query(f"select * from {measurment_name} {filter_string}", chunked=True)
 
-#         cursor.execute("SELECT * FROM mpm_10jul;")
-#         print(cursor.fetchall())
+        return df
 
-#     except db.Error as error:
-#         print("Error while connecting to sqlite", error)
-#     finally:
-#         if cursor:
-#             cursor.close()
-#             conn.close()
-#             print("The SQLite connection is closed")
-
-#     return

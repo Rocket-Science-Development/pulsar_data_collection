@@ -21,8 +21,10 @@ pytest = "^7.1.2"
 matplotlib = "^3.5.2"
 scikit-learn = "^1.1.1"
 jupyter = "^1.0.0"
-fastapi = "^0.78.0"
-uvicorn = "^0.18.2"
+
+[tool.poetry.group.dev.dependencies]
+fastapi = "^0.88.0"
+uvicorn = "^0.20.0"
 
 [tool.black]
 line-length = 120

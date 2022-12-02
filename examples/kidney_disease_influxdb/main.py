@@ -1,12 +1,21 @@
 # -*- coding: utf-8 -*-
 import logging
 import pickle as pkl
+import sys
 from io import StringIO
 
 import pandas as pd
 import uvicorn
 from fastapi import FastAPI
+from numpy import ndarray
 from pydantic import BaseModel
+
+sys.path.append("../../")
+from pulsar_data_collection.data_capture.data_capture import (
+    DatabaseLogin,
+    DataCapture,
+    DataWithPrediction,
+)
 
 logging.basicConfig(level=logging.DEBUG, format="%(asctime)s:%(levelname)s:%(name)s:%(message)s")
 app = FastAPI()
@@ -39,60 +48,29 @@ def predict(data: RequestBody):
 
     prediction = model.predict(to_predict)
 
-    data_with_prediction = dataframe_create(prediction, to_predict)
+    database_login = DatabaseLogin(
+        db_host="influx",
+        db_port=8086,
+        db_user="admin",
+        db_password="pass123",
+        db_name="testDB",
+        protocol="line",
+        measurement="something",
+    )
 
-    # print(data_with_prediction)
+    dat_predict = DataWithPrediction(prediction=prediction, data_points=to_predict)
 
-    sql_insertion(data_with_prediction)
+    dat_capture = DataCapture(
+        storage_engine="influxdb",
+        model_id="RS101",
+        model_version="1.0",
+        data_id="FluxDB",
+        y_name="y_pred",
+        pred_name="clf_target",
+        operation_type="INSERT",
+        login_url=database_login,
+    )
 
+    dat_capture.push(dat_predict)
     prediction_as_list = prediction.tolist()
     return prediction_as_list
-
-
-# Function to convert prediction output to Pandas dataframe to be inserted in DB
-def dataframe_create(prediction, to_predict: pd.DataFrame):
-    # Creating dataframe with the output prediction
-    pred_df = pd.DataFrame(prediction, columns=["class"])
-    # Concat the input and output predicton dataframes on y-axis (columns)
-    df = pd.concat([to_predict, pred_df], axis=1)
-    # Adding current timestamp as a new column to existing Dataframe
-    df.loc[:, "Timestamp"] = datetime.datetime.now()
-
-    return df
-
-
-def sql_insertion(df):
-    try:
-        conn = db.connect("SQLite_Python.db")
-        cursor = conn.cursor()
-        logging.info("Database created and Successfully Connected to SQLite")
-
-        # cursor.execute("SELECT * FROM mpm_data_ing;")
-
-        df.to_sql("df", conn, if_exists="replace")
-
-        # print(cursor.fetchall())
-
-        # cursor.execute(
-        #     """
-        #     CREATE TABLE IF NOT EXISTS mpm_data_ing as
-        #     SELECT * FROM df
-        #     """
-        # )
-
-        df.to_sql(name="mpm_19jul", con=conn, if_exists="append", index=False)
-
-        df = pd.read_sql_query("SELECT * from mpm_19jul", conn)
-        logging.info(df)
-        # cursor.execute("SELECT * FROM mpm_10jul;")
-        # print(cursor.fetchall())
-
-    except db.Error as error:
-        logging.error("Error while connecting to sqlite", error)
-    finally:
-        if cursor:
-            cursor.close()
-            conn.close()
-            logging.info("The SQLite connection is closed")
-
-    return df

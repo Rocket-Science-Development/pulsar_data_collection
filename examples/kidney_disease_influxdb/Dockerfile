@@ -2,6 +2,8 @@ FROM python:3.9.13-slim-buster
 
 WORKDIR /app
 
+RUN apt-get update && apt-get install -y git && apt-get -y install gcc
+
 RUN adduser app && chown -R app /app
 USER app
 

@@ -1,6 +1,6 @@
 [tool.poetry]
 name = "pulsar-data-collection"
-version = "0.1.0"
+version = "1.1.0"
 description = "sdk enabling data collection from model serving code for our MPM solution"
 authors = ["Your Name <you@example.com>"]
 
@@ -9,9 +9,9 @@ python = "^3.9"
 pandas = "^1.4.2"
 pysqlite3 = "^0.4.7"
 SQLAlchemy = "^1.4.39"
-influxdb-client = "^1.30.0"
-flake8 = "^5.0.4"
-Flake8-pyproject = "^1.1.0"
+influxdb-client = {extras = ["ciso"], version = "^1.31.0"}
+pydantic = "^1.6.2"
+influxdb = "5.3.1"
 
 [tool.poetry.dev-dependencies]
 black = "^22.3.0"
@@ -46,13 +46,13 @@ extend-exclude = '''
 [tool.isort]
 profile = "black"
 
-[tool.flake8]
-ignore = ['E231', 'E241']
-per-file-ignores = [
-    '__init__.py:F401',
-]
-max-line-length = 120
-count = true
+# [tool.flake8]
+# ignore = ['E231', 'E241']
+# per-file-ignores = [
+#     '__init__.py:F401',
+# ]
+# max-line-length = 120
+# count = true
 
 [build-system]
 requires = ["poetry-core>=1.0.0"]

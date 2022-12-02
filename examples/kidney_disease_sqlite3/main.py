@@ -1,6 +1,8 @@
 # -*- coding: utf-8 -*-
+import datetime
 import logging
 import pickle as pkl
+import sys
 from io import StringIO
 
 import pandas as pd
@@ -9,9 +11,23 @@ import pandas as pd
 from fastapi import FastAPI
 from pydantic import BaseModel
 
-# import ...pulsar_data_collection
+sys.path.append("../../")
+from pulsar_data_collection.data_capture.data_capture import (
+    DataCaptureParameters as DCParam,
+)
+from pulsar_data_collection.data_capture.data_capture import DataFrame as DFrame
+from pulsar_data_collection.data_capture.data_capture import (
+    DataFrameCreate as DFrameCreate,
+)
+from pulsar_data_collection.data_capture.data_capture import (
+    DataWithPrediction as DPredict,
+)
+from pulsar_data_collection.db_connectors.sqlite.db_connection import (
+    StorageEngine as SQLiteStorage,
+)
 
 logging.basicConfig(level=logging.DEBUG, format="%(asctime)s:%(levelname)s:%(name)s:%(message)s")
+
 app = FastAPI()
 
 model = pkl.load(open("kidney_disease.pkl", "rb"))
@@ -30,7 +46,7 @@ def hello_world():
 
 # Endpoint to receive data for making prediction
 @app.post("/predict")
-def predict(data: RequestBody):
+async def predict(data: RequestBody):
 
     if data.type == "csv":
         pass
@@ -40,61 +56,17 @@ def predict(data: RequestBody):
 
     if data.type == "json":
         pass
+        jsonStringIO = StringIO(data.content)
+        logging.info(jsonStringIO)
+        to_predict = pd.read_json(jsonStringIO, strict=False)
 
     prediction = model.predict(to_predict)
 
-    # data_with_prediction = dataframe_create(prediction, to_predict)
+    dframe = DFrame(prediction=prediction, to_predict=to_predict)
+    # struc_dframe = DFrame(**dframe)
+    data_with_prediction = DFrameCreate().dataframe_create(dframe)
 
-    # sql_insertion(data_with_prediction)
+    SQLiteStorage().sql_insertion(data_with_prediction)
 
     prediction_as_list = prediction.tolist()
     return prediction_as_list
-
-
-# Function to convert prediction output to Pandas dataframe to be inserted in DB
-def dataframe_create(prediction, to_predict: pd.DataFrame):
-    # Creating dataframe with the output prediction
-    pred_df = pd.DataFrame(prediction, columns=["class"])
-    # Concat the input and output predicton dataframes on y-axis (columns)
-    df = pd.concat([to_predict, pred_df], axis=1)
-    # Adding current timestamp as a new column to existing Dataframe
-    # df.loc[:, "Timestamp"] = datetime.datetime.now()
-
-    return df
-
-
-# def sql_insertion(df):
-#     try:
-#         conn = db.connect("SQLite_Python.db")
-#         cursor = conn.cursor()
-#         logging.info("Database created and Successfully Connected to SQLite")
-
-#         # cursor.execute("SELECT * FROM mpm_data_ing;")
-
-#         df.to_sql("df", conn, if_exists="replace")
-
-#         # print(cursor.fetchall())
-
-#         # cursor.execute(
-#         #     """
-#         #     CREATE TABLE IF NOT EXISTS mpm_data_ing as
-#         #     SELECT * FROM df
-#         #     """
-#         # )
-
-#         df.to_sql(name="mpm_19jul", con=conn, if_exists="append", index=False)
-
-#         df = pd.read_sql_query("SELECT * from mpm_19jul", conn)
-#         logging.info(df)
-#         # cursor.execute("SELECT * FROM mpm_10jul;")
-#         # print(cursor.fetchall())
-
-#     except db.Error as error:
-#         logging.error("Error while connecting to sqlite", error)
-#     finally:
-#         if cursor:
-#             cursor.close()
-#             conn.close()
-#             logging.info("The SQLite connection is closed")
-
-#     return df

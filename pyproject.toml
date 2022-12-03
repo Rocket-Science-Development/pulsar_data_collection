@@ -23,6 +23,7 @@ scikit-learn = "^1.1.1"
 jupyter = "^1.0.0"
 fastapi = "^0.88.0"
 uvicorn = "^0.20.0"
+flake8 = "^6.0.0"
 
 [tool.black]
 line-length = 120

@@ -24,6 +24,7 @@ jupyter = "^1.0.0"
 fastapi = "^0.88.0"
 uvicorn = "^0.20.0"
 flake8 = "^6.0.0"
+flake8-pyproject = "^1.2.1"
 
 [tool.black]
 line-length = 130

@@ -351,6 +351,21 @@ pycodestyle = ">=2.10.0,<2.11.0"
 pyflakes = ">=3.0.0,<3.1.0"
 
 [[package]]
+name = "flake8-pyproject"
+version = "1.2.1"
+description = "Flake8 plug-in loading the configuration from pyproject.toml"
+category = "dev"
+optional = false
+python-versions = ">= 3.6"
+
+[package.dependencies]
+Flake8 = ">=5,<7"
+TOMLi = {version = "*", markers = "python_version < \"3.11\""}
+
+[package.extras]
+dev = ["pyTest", "pyTest-cov"]
+
+[[package]]
 name = "fonttools"
 version = "4.38.0"
 description = "Tools to manipulate font files"
@@ -1755,7 +1770,7 @@ testing = ["flake8 (<5)", "func-timeout", "jaraco.functools", "jaraco.itertools"
 [metadata]
 lock-version = "1.1"
 python-versions = "^3.9"
-content-hash = "ae81c4c1b80ea84d1c201115b7c53680c525cc934514997c6e22a6ee6f7ea731"
+content-hash = "3425c176e358672e33aeb9db0a81f5599ee6b8026a91c688cf60e886e866fece"
 
 [metadata.files]
 anyio = [
@@ -2059,6 +2074,9 @@ filelock = [
 flake8 = [
     {file = "flake8-6.0.0-py2.py3-none-any.whl", hash = "sha256:3833794e27ff64ea4e9cf5d410082a8b97ff1a06c16aa3d2027339cd0f1195c7"},
     {file = "flake8-6.0.0.tar.gz", hash = "sha256:c61007e76655af75e6785a931f452915b371dc48f56efd765247c8fe68f2b181"},
+]
+flake8-pyproject = [
+    {file = "flake8_pyproject-1.2.1-py3-none-any.whl", hash = "sha256:d2470803b38883881c250c27f361ca4c49e7b8f9e3a17f7d44aa43b6965b2363"},
 ]
 fonttools = [
     {file = "fonttools-4.38.0-py3-none-any.whl", hash = "sha256:820466f43c8be8c3009aef8b87e785014133508f0de64ec469e4efb643ae54fb"},

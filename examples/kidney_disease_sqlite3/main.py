@@ -6,7 +6,8 @@ import sys
 from io import StringIO
 
 import pandas as pd
-import uvicorn
+
+# import uvicorn
 from fastapi import FastAPI
 from pydantic import BaseModel
 
@@ -30,6 +31,7 @@ logging.basicConfig(level=logging.DEBUG, format="%(asctime)s:%(levelname)s:%(nam
 app = FastAPI()
 
 model = pkl.load(open("kidney_disease.pkl", "rb"))
+
 
 # Class to define the request body and the type hints of each attribute
 class RequestBody(BaseModel):

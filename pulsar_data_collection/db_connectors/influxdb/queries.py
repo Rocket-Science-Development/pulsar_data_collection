@@ -1,14 +1,7 @@
 # -*- coding: utf-8 -*-
-import csv
-import logging
-import pickle as pkl
 import sqlite3 as db
-from io import StringIO
 
 import pandas as pd
-import uvicorn
-from fastapi import FastAPI
-from pydantic import BaseModel
 
 
 def sql_insertion(df):

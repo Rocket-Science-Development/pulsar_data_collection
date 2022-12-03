@@ -13,7 +13,7 @@ influxdb-client = {extras = ["ciso"], version = "^1.31.0"}
 pydantic = "^1.6.2"
 influxdb = "5.3.1"
 
-[tool.poetry.dev-dependencies]
+[tool.poetry.group.dev.dependencies]
 black = "^22.3.0"
 isort = "^5.10.1"
 pre-commit = "^2.19.0"
@@ -21,11 +21,13 @@ pytest = "^7.1.2"
 matplotlib = "^3.5.2"
 scikit-learn = "^1.1.1"
 jupyter = "^1.0.0"
-fastapi = "^0.78.0"
-uvicorn = "^0.18.2"
+fastapi = "^0.88.0"
+uvicorn = "^0.20.0"
+flake8 = "^6.0.0"
+flake8-pyproject = "^1.2.1"
 
 [tool.black]
-line-length = 120
+line-length = 130
 target-version = ['py36', 'py37', 'py38', 'py39']
 include = '\.pyi?$'
 extend-exclude = '''
@@ -45,6 +47,14 @@ extend-exclude = '''
 
 [tool.isort]
 profile = "black"
+
+[tool.flake8]
+ignore = ['E231', 'E241']
+per-file-ignores = [
+    '__init__.py:F401',
+]
+max-line-length = 130
+count = true
 
 [build-system]
 requires = ["poetry-core>=1.0.0"]

@@ -3,7 +3,7 @@ name: "Continuous Integration"
 on:
   push:
     branches:
-      - "**"
+      - main
     tags:
       - "**"
   pull_request:
@@ -38,7 +38,7 @@ jobs:
       - name: Configure poetry
         run: poetry config virtualenvs.in-project true
 
-      - name: Install only dev dependencies
+      - name: Install dependencies
         run: poetry install
 
       - name: Format code

@@ -64,7 +64,7 @@ jobs:
               body: output
             })
 
-      - name: Terraform Plan Status
+      - name: Pipeline Status
         if: steps.fmt.outcome == 'failure' || steps.lint.outcome == 'failure'
         run: exit 1
 

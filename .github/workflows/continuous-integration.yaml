@@ -1,28 +1,24 @@
-name: BuildReleasePublish
+name: "Continuous Integration"
 
 on:
   push:
+    branches:
+      - main
     tags:
-      - "*"
+      - "**"
+  pull_request:
+
+env:
+  PYTHON_VERSION: 3.9.13
+  POETRY_VERSION: 1.2.2
 
 jobs:
-  build-release-publish:
-    name: Build release publish
+  continuous-integration:
+    name: Run Continuous Integration
     runs-on: ubuntu-latest
-    env:
-      PYTHON_VERSION: 3.9
-      POETRY_VERSION: 1.1.15
     steps:
       - name: Checkout code
         uses: actions/checkout@v2
-
-      - name: Configure AWS credentials
-        uses: aws-actions/configure-aws-credentials@v1
-        with:
-          aws-region: us-east-1 # change to appropriate region
-          role-to-assume: arn:aws:iam::212028562834:role/data-collection-publish-to-repo-role
-          role-session-name: RepoPublishPackage
-          role-duration-seconds: 900
 
       - name: Set up Python ${{ env.PYTHON_VERSION }}
         uses: actions/setup-python@v2
@@ -40,8 +36,7 @@ jobs:
           poetry --help
 
       - name: Configure poetry
-        run: |
-          poetry config virtualenvs.in-project true
+        run: poetry config virtualenvs.in-project true
 
       - name: Set up cache
         uses: actions/cache@v2
@@ -54,7 +49,38 @@ jobs:
         if: steps.cache.outputs.cache-hit == 'true'
         run: timeout 10s poetry run pip --version || rm -rf .venv
 
+      - name: Install dependencies
+        run: poetry install
+
+      - name: Format code
+        id: fmt
+        run: |
+          poetry run python -m isort --check pulsar_data_collection/
+          poetry run python -m black --check pulsar_data_collection/
+
+      - name: Lint code
+        id: lint
+        run: |
+          poetry run python -m flake8 pulsar_data_collection/
+
+      - uses: actions/github-script@v6
+        if: github.event_name == 'pull_request'
+        with:
+          script: |
+            const output = `#### Format 🖌\`${{ steps.fmt.outcome }}\`
+            #### Linting ⚙️\`${{ steps.lint.outcome }}\`
+
+            *Pushed by: @${{ github.actor }}, Action: \`${{ github.event_name }}\`*`;
+
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: output
+            })
+
       - name: Build and publish
+        if: startsWith(github.ref, 'refs/tags/') && github.event_name == 'push'
         run: |
           poetry config repositories.aws_repository https://pulsar-model-performance-management-212028562834.d.codeartifact.us-east-1.amazonaws.com/pypi/pulsar-data-collection/simple/
           poetry config http-basic.aws_repository aws $(aws codeartifact get-authorization-token --domain pulsar-model-performance-management --query authorizationToken --output text --region us-east-1)

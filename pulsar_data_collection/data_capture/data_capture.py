@@ -9,14 +9,13 @@ import numpy as np
 import pandas as pd
 from pydantic import BaseModel, Field, validator
 
-from ..db_connectors.influxdb.config import (
-    DB_HOST,
-    DB_NAME,
+from ..db_connectors.influxdb.config import (  # DB_NAME,
     DB_EVAL_TIMESTAMP_MEASURMENT,
+    DB_HOST,
     DB_METRICS_MEASURMENT,
-    DB_PREDICTION_MEASURMENT,
     DB_PASSWORD,
     DB_PORT,
+    DB_PREDICTION_MEASURMENT,
     DB_PROTOCOL,
     DB_USER,
 )
@@ -27,10 +26,7 @@ logger = logging.getLogger()
 DATABASE_OPERATION_TYPE_INSERT_PREDICTION = "INSERT_PREDICTION"
 DATABASE_OPERATION_TYPE_METRICS = "METRICS"
 
-DATABASE_OPERATION_TYPES = (
-    DATABASE_OPERATION_TYPE_INSERT_PREDICTION,
-    DATABASE_OPERATION_TYPE_METRICS
-)
+DATABASE_OPERATION_TYPES = (DATABASE_OPERATION_TYPE_INSERT_PREDICTION, DATABASE_OPERATION_TYPE_METRICS)
 
 
 class DatabaseLogin(BaseModel):
@@ -67,7 +63,7 @@ class DataCaptureParameters(BaseModel):
         if values.get("operation_type") == DATABASE_OPERATION_TYPE_INSERT_PREDICTION:
             if not value:
                 raise ValueError(
-                    "Some required parameters were missed. Fields model_id, model_version, and data_id are required for Insert operation."
+                    "Required parameters missing. model_id, model_version, and data_id are required for Insert operation."
                 )
             return value
         return ""
@@ -106,9 +102,10 @@ class DataCapture(DataCaptureParameters):
     def push(self, data=DataWithPrediction):
 
         """
-        Function to convert prediction output to Pandas dataframe to be inserted in DB
+        Function to convert prediction output to Pandas dataframe
+        to be inserted in DB
         """
-        if not self.operation_type in (DATABASE_OPERATION_TYPE_INSERT_PREDICTION,):
+        if self.operation_type not in (DATABASE_OPERATION_TYPE_INSERT_PREDICTION,):
             raise Exception(f"Method is only allowed for operation type {DATABASE_OPERATION_TYPE_INSERT_PREDICTION}")
 
         data_with_prediction = data.data_points.copy()
@@ -133,8 +130,7 @@ class DataCapture(DataCaptureParameters):
         return DataFactory.sql_digestion(DB_PREDICTION_MEASURMENT, self.storage_engine, self.login_url, filters)
 
     def collect_eval_timestamp(self):
-        """ Retrieves last period what was inseted to the database
-        """
+        """Retrieves last period what was inseted to the database"""
         results = DataFactory.sql_digestion(DB_EVAL_TIMESTAMP_MEASURMENT, self.storage_engine, self.login_url)
 
         if results and list(results.get("eval_timestamp")):
@@ -144,13 +140,11 @@ class DataCapture(DataCaptureParameters):
         return None
 
     def push_eval_timestamp(self, eval_df):
-        """ Inserts period to the database
-        """
+        """Inserts period to the database"""
         DataFactory.sql_ingestion(DB_EVAL_TIMESTAMP_MEASURMENT, self.storage_engine, eval_df, self.login_url)
 
     def push_metrics(self, metrics_df):
-        """ Insterts metrics dataframe to the database
-        """
+        """Insterts metrics dataframe to the database"""
         DataFactory.sql_ingestion(DB_METRICS_MEASURMENT, self.storage_engine, metrics_df, self.login_url)
 
 
@@ -173,7 +167,11 @@ class DataFactory:
         """Function to import DB connection based on storage engine and call sql_insertion"""
         sengine = cls.get_storage_engine(storage_engine)
 
-        sengine().sql_insertion(measurment_name, df=dataframe, database_login=database_login, )
+        sengine().sql_insertion(
+            measurment_name,
+            df=dataframe,
+            database_login=database_login,
+        )
 
     @classmethod
     def sql_digestion(cls, measurment_name, storage_engine: str, database_login: DatabaseLogin = None, filters: dict = None):

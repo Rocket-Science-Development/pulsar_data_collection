@@ -2,6 +2,7 @@
 # import influxdb_client as ifdb
 import pandas as pd
 from influxdb import DataFrameClient
+
 from .config import DB_NAME
 
 
@@ -15,29 +16,19 @@ class StorageEngine:
         Function to push Pandas Dataframe into Influx DB.
         """
         client = DataFrameClient(
-            database_login.db_host,
-            database_login.db_port,
-            database_login.db_user,
-            database_login.db_password,
-            DB_NAME
+            database_login.db_host, database_login.db_port, database_login.db_user, database_login.db_password, DB_NAME
         )
         client.create_database(DB_NAME)
         client.get_list_database()
         client.switch_database(DB_NAME)
 
-        client.write_points(
-            df, measurment_name, protocol=database_login.protocol, time_precision="u", tag_columns=("uuid",)
-        )
+        client.write_points(df, measurment_name, protocol=database_login.protocol, time_precision="u", tag_columns=("uuid",))
 
         return df
 
     def sql_digestion(self, measurment_name, database_login, filters=None):
         client = DataFrameClient(
-            database_login.db_host,
-            database_login.db_port,
-            database_login.db_user,
-            database_login.db_password,
-            DB_NAME
+            database_login.db_host, database_login.db_port, database_login.db_user, database_login.db_password, DB_NAME
         )
         filter_string = ""
         if filters:
@@ -50,4 +41,3 @@ class StorageEngine:
         df = client.query(f"select * from {measurment_name} {filter_string}", chunked=True)
 
         return df
-

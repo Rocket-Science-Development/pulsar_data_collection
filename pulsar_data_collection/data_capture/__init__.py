@@ -1,2 +1,6 @@
-from .data_capture import DatabaseLogin, DataWithPrediction, DataCaptureParameters, \
-    DataCapture
+from .data_capture import (
+    DatabaseLogin,
+    DataCapture,
+    DataCaptureParameters,
+    DataWithPrediction,
+)

@@ -1,9 +1,0 @@
-services:
-  model-api:
-    build: .
-    ports:
-      - "8000:8000"
-    links:
-      - sqlite3
-  sqlite3:
-    image: keinos/sqlite3:3.39.0

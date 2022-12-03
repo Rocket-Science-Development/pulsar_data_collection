@@ -1,63 +1,60 @@
-name: ContinuousIntegration
+name: "Continuous Integration"
 
 on:
   push:
     branches:
       - main
-      - release/*
-      - '**'
   pull_request:
-    branches:
-      - main
+
 env:
-  PYTHON_VERSION: 3.9
-  POETRY_VERSION: 1.1.15
+  PYTHON_VERSION: 3.9.13
+  POETRY_VERSION: 1.2.2
 
 jobs:
-  continuous-integratiion:
+  continuous-integration:
     name: Run Continuous Integration
     runs-on: ubuntu-latest
     steps:
-          - name: Checkout code
-            uses: actions/checkout@v2
+      - name: Checkout code
+        uses: actions/checkout@v2
 
-          - name: Set up Python ${{ env.PYTHON_VERSION }}
-            uses: actions/setup-python@v2
-            with:
-              python-version: ${{ env.PYTHON_VERSION }}
+      - name: Set up Python ${{ env.PYTHON_VERSION }}
+        uses: actions/setup-python@v2
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
 
-          - name: Set up Poetry ${{ env.POETRY_VERSION }}
-            uses: abatilo/actions-poetry@v2.0.0
-            with:
-              poetry-version: ${{ env.POETRY_VERSION }}
+      - name: Set up Poetry ${{ env.POETRY_VERSION }}
+        uses: abatilo/actions-poetry@v2.0.0
+        with:
+          poetry-version: ${{ env.POETRY_VERSION }}
 
-          - name: Check poetry
-            run: |
-              poetry --version
-              poetry --help
+      - name: Check poetry
+        run: |
+          poetry --version
+          poetry --help
 
-          - name: Configure poetry
-            run: poetry config virtualenvs.in-project true
+      - name: Configure poetry
+        run: poetry config virtualenvs.in-project true
 
-          - name: Set up cache
-            uses: actions/cache@v2
-            id: cache
-            with:
-              path: .venv
-              key: venv-${{ runner.os }}-${{ steps.full-python-version.outputs.version }}-${{ hashFiles('**/poetry.lock') }}
+      - name: Set up cache
+        uses: actions/cache@v2
+        id: cache
+        with:
+          path: .venv
+          key: venv-${{ runner.os }}-${{ steps.full-python-version.outputs.version }}-${{ hashFiles('**/poetry.lock') }}
 
-          - name: Ensure cache is healthy
-            if: steps.cache.outputs.cache-hit == 'true'
-            run: timeout 10s poetry run pip --version || rm -rf .venv
+      - name: Ensure cache is healthy
+        if: steps.cache.outputs.cache-hit == 'true'
+        run: timeout 10s poetry run pip --version || rm -rf .venv
 
-          - name: Install dependencies
-            run: poetry install
+      - name: Install dependencies
+        run: poetry install
 
-          - name: Format code
-            run: |
-              poetry run python -m isort --check pulsar_data_collection/
-              poetry run python -m black --check pulsar_data_collection/
+      - name: Format code
+        run: |
+          poetry run python -m isort --check pulsar_data_collection/
+          poetry run python -m black --check pulsar_data_collection/
 
-          - name: Lint code
-            run: |
-              poetry run python -m flake8 pulsar_data_collection/
+      - name: Lint code
+        run: |
+          poetry run python -m flake8 pulsar_data_collection/

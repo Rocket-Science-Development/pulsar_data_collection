@@ -71,7 +71,4 @@ jobs:
       - name: Build and publish
         if: startsWith(github.ref, 'refs/tags/') && github.event_name == 'push'
         run: |
-          poetry config repositories.aws_repository https://pulsar-model-performance-management-212028562834.d.codeartifact.us-east-1.amazonaws.com/pypi/pulsar-data-collection/simple/
-          poetry config http-basic.aws_repository aws $(aws codeartifact get-authorization-token --domain pulsar-model-performance-management --query authorizationToken --output text --region us-east-1)
-
-          poetry publish --build --repository aws_repository
+          poetry publish --build

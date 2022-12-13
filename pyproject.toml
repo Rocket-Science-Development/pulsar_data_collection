@@ -2,7 +2,12 @@
 name = "pulsar-data-collection"
 version = "1.1.0"
 description = "sdk enabling data collection from model serving code for our MPM solution"
-authors = ["Your Name <you@example.com>"]
+authors = [
+    "Pulsar team <pulsar@data-rs.io>"
+    ]
+readme = "README.md"
+homepage = "https://github.com/Rocket-Science-Development/pulsar_data_collection"
+license = "MIT"
 
 [tool.poetry.dependencies]
 python = "^3.9"

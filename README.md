@@ -1,45 +1,112 @@
 # data-collection-sdk
 
-Authors:
-    - ehammel@rocketscience.one
-    - marya@rocketscience.one
+Pulsar data collection SDK is an open-source Python library for
+pushing/processing/collecting features, predictions and metadata. Works with different
+data storages, at this point InfluxDB is implemented.
 
-Objective
-Lightweight python SDK enabling data collection of features, predictions and metadata from an ML model serving code/micro-service
 
-Background
-The project falls within the scope of Model Performance Management product workflow.
-First step is to collect an ML model's predictions, features and other metadata. Then, store these information in order to
+<h2>Getting started</h2>
 
-Benefits
-If your proposal is implemented, how does it benefit the company?
+Install Pulsar Data Collection with pip:
+```
+python3 -m pip install --upgrade pip
+python3 -m pip install --upgrade pulsar-data-collection
+```
 
-Goals
-What exactly are you trying to do? Why? These should be measurable and specific.
+<h3>Components</h3>
+There are two core components in data collection SDK: storage engine and data capture.
+Right now storage engine implemented only for InfluxDb, it helps to make ingestion and digestion operations
+to the database.
 
-Non-goals
-What are you explicitly not trying to do? Why?
+<h4>Data Capture</h4>
+`DataCapture` class helps to ingest dataset to database with needed parameters and needed format for future
+digestion and metrics calculation without any significant changes of data.
 
-Design Overview
-At a high level, how is your service put together? What’s the block-level diagram for the service?
+It requires `storage_engine` (available only influxdb right now), `operation_type` (`DATABASE_OPERATION_TYPE_INSERT_PREDICTION`,
+`DATABASE_OPERATION_TYPE_METRICS`),  `login_url` (object of DatabaseLogin class) as input parameters.
 
-Detailed Design
-Another level of detail beyond the design overview, if needed.
+Operation type `DATABASE_OPERATION_TYPE_INSERT_PREDICTION` uses for any ingestion operations to the database.
+It requires additional parameters: `model_id`, `model_version`, `data_id`", `y_name`, `pred_name` what describes
+an input dataset.
+For operation type `DATABASE_OPERATION_TYPE_METRICS` what commonly uses for retrieving dataset ready for metrics
+calculation these parameters aren't required.
 
-Performance Implications
-What should we know about performance?
+The last and probably one the most important class to work with is `DataWithPrediction`.
+It requires two parameters as input: `prediction`, `data_points`. Where `prediction` is prediction value of the model,
+and `data_points` is features dataset. `Push` method of the `DataCapture` takes object of `DataWithPrediction` as
+required parameter, and after that makes ingestion operation to database with data transforming, like adding timestamp,
+changing name of prediction column in dataset, combining features with prediction into single dataset, creating
+influxdb unique cache, etc.
 
-Security Implications
-Are there known or potential security issues that should be pointed out? How are, or will they be, addressed?
+List of methods of `DataCapture` class:
+- push(data: DataWithPrediction) - ingests data to the db after preprocessing it;
+- collect(filters: dict) - retrieves data from db;
+- collect_eval_timestamp - retrieves the newest timestamp in the database;
+- push_eval_timestamp(eval_df: df) - ingesting new one timestamp into db;
+- push_metrics(metrics_df: df) - ingesting metrics dataframe to the database after calculations
 
-Privacy/GDPR Implications
-Are there known or potential privacy or GDPR issues that should be pointed out? How are, or will they be, addressed?
+<h3>Example usage </h3>
+Initialize Database credentials:
+```
+from pulsar_data_collection.data_capture import DatabaseLogin
+database_login = DatabaseLogin(db_host=<db_host>), db_port=<db_port>, db_user=<db_user>, db_password=<db_password>, protocol=<db_protocol>)
+```
 
-Logging Impacts
-What kind of logs are you generating? At what volume? How long do will we expect to keep them?
+Initialize DataCapture class, depends on operation type use appropriate constant.
+For inserting data into the database:
+```
+from pulsar_data_collection.data_capture import DataCapture, DATABASE_OPERATION_TYPE_INSERT_PREDICTION
 
-Engineering Asks
-What does the rest of engineering have to do if this project is implemented?
+dat_predict = DataWithPrediction(prediction=prediction, data_points=to_predict)
 
-Sign-off List
-Who has to sign off on this before it can move to implementation?
+dat_capture = DataCapture(
+    storage_engine="influxdb",
+    model_id=<model_id>,
+    model_version=<model_verstion>,
+    data_id=<data_id>,
+    y_name=<y_name>,
+    pred_name=<pred_name>,
+    operation_type=<operation_type>,
+    login_url=<database_login>,
+)
+
+dat_capture.push(dat_predict)
+```
+
+For collecting data from the database:
+```
+from pulsar_data_collection.data_capture import DataCapture, DATABASE_OPERATION_TYPE_METRICS
+
+dat_capture = DataCapture(
+    storage_engine="influxdb",
+    operation_type=DATABASE_OPERATION_TYPE_METRICS,
+    login_url=database_login
+)
+
+dat_capture.collect()
+```
+
+Collection the newest prediction data what wasn't precessed
+```
+# receiving the last period of data
+
+last_eval_timestamp = dat_capture.collect_eval_timestamp()
+
+# if last period exists, collecting only data what wasn't collected previously
+if last_eval_timestamp:
+    last_eval_timestamp_str = last_eval_timestamp.strftime('%Y-%m-%d %H:%M:%S')
+    db_df = pd.DataFrame(dat_capture.collect({"time": f">= '{last_eval_timestamp_str}'"}).get("prediction"))
+else:
+    db_df = pd.DataFrame(dat_capture.collect().get("prediction"))
+```
+
+Example of pushing calculated metrics:
+```
+dat_capture.push_metrics(df_result_drift)
+```
+Example of pushing the timestamp when metrics were calculated:
+```
+dat_capture.push_eval_timestamp(eval_timestamp_df)
+```
+
+TODO: add use cases of input dataframes: metrics, prediction, datapoint

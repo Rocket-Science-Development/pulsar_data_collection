@@ -120,7 +120,6 @@ Example of pushing the timestamp when metrics were calculated:
 ```python
 dat_capture.push_eval_timestamp(eval_timestamp_df)
 ```
-
 TODO: add use cases of input dataframes: metrics, prediction, datapoint
 
 ## About [PulsarML](https://pulsar.ml/)
@@ -141,3 +140,6 @@ Powered by [Rocket Science Development](https://rocketscience.one/)
 
 1. Fork this repository, develop, and test your changes
 2. Submit a pull request
+
+TODO: add use cases of input dataframes: metrics, prediction, datapoint
+

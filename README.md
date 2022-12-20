@@ -127,6 +127,7 @@ TODO: add use cases of input dataframes: metrics, prediction, datapoint
 PulsarML is a project helping with monitoring your models and gain powerful insights into its performance.
 
 We released two Open Source packages :
+
 - [pulsar-data-collection](https://github.com/Rocket-Science-Development/pulsar_data_collection) :  lightweight python SDK enabling data collection of features, predictions and metadata from an ML model serving code/micro-service
 - [pulsar-metrics](https://github.com/Rocket-Science-Development/pulsar_metrics) : library for evaluating and monitoring data and concept drift with an extensive set of metrics. It also offers the possibility to use custom metrics defined by the user.
 
@@ -139,7 +140,8 @@ Powered by [Rocket Science Development](https://rocketscience.one/)
 ## Contributing
 
 1. Fork this repository, develop, and test your changes
-2. Submit a pull request
+2. open an issue
+3. Submit a pull request with a reference to the issue
 
 TODO: add use cases of input dataframes: metrics, prediction, datapoint
 

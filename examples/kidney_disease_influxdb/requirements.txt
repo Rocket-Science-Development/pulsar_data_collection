@@ -2,5 +2,5 @@ numpy==1.23.1
 pysqlite3==0.4.7
 fastapi>=0.68.0,<0.69.0
 uvicorn>=0.15.0,<0.16.0
-git+https://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@github.com/Rocket-Science-Development/data-collection-sdk.git@feature/michael/data-capture-refactors
+pulsar-data-collection==0.1.1
 sklearn==0.0

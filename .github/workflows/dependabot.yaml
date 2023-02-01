@@ -1,0 +1,23 @@
+# To get started with Dependabot version updates, you'll need to specify which
+# package ecosystems to update and where the package manifests are located.
+# Please see the documentation for all configuration options:
+# https://docs.github.com/github/administering-a-repository/configuration-options-for-dependency-updates
+
+version: 2
+updates:
+  - package-ecosystem: "pip" # See documentation for possible values
+    directory: "/" # Location of package manifests
+    schedule:
+      interval: "weekly"
+      day: "wednesday"
+      time: "9:30"
+      timezone: "America/Montreal"
+    commit-message:
+      # Prefix all commit messages with "[docker] " (no colon, but a trailing whitespace)
+      prefix: "[DEPENDENCY]"
+      prefix-development: "[DEV-DEPENDENCY]"
+      include: "scope"
+    pull-request-branch-name:
+      seperator: "-"
+    reviewers:
+      - " Rocket-Science-Development/pulsar"

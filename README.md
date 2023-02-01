@@ -137,11 +137,4 @@ Want to interact with the community? join our [slack channel](https://pulsarml.s
 
 Powered by [Rocket Science Development](https://rocketscience.one/)
 
-## Contributing
-
-1. Fork this repository, develop, and test your changes
-2. open an issue
-3. Submit a pull request with a reference to the issue
-
 TODO: add use cases of input dataframes: metrics, prediction, datapoint
-

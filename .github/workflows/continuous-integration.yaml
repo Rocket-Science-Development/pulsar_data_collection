@@ -46,6 +46,13 @@ jobs:
         id: lint
         run: |
           poetry run python -m flake8 pulsar_data_collection/
+          poetry run python -m bandit -c pyproject.toml -r pulsar_data_collection/
+        continue-on-error: true
+
+      - name: Security issues scanning on code
+        id: lint
+        run: |
+          poetry run python -m bandit -c pyproject.toml -r pulsar_data_collection/
         continue-on-error: true
 
       - uses: actions/github-script@v6

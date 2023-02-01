@@ -50,7 +50,7 @@ jobs:
         continue-on-error: true
 
       - name: Security issues scanning on code
-        id: lint
+        id: security-checks
         run: |
           poetry run python -m bandit -c pyproject.toml -r pulsar_data_collection/
         continue-on-error: true
@@ -61,6 +61,7 @@ jobs:
           script: |
             const output = `#### Format 🎨\`${{ steps.fmt.outcome }}\`
             #### Linting 👕\`${{ steps.lint.outcome }}\`
+            #### Security Checks 🔍\`${{ steps.security-checks.outcome }}\`
 
             *Pushed by: @${{ github.actor }}, Action: \`${{ github.event_name }}\`*`;
 

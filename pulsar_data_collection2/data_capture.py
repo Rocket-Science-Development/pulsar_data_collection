@@ -1,7 +1,7 @@
 import database as db
 from input import PulseParameters
 
-factories = {"influxdb": db.database.InfluxdbActionsExporter}
+factories = {"influxdb": db.InfluxdbActionsExporter}
 
 
 class Pulse(PulseParameters):
@@ -13,7 +13,7 @@ class Pulse(PulseParameters):
     def __init__(self, data=PulseParameters):
 
         if data.storage_engine not in factories:
-            raise ValueError("Storage Engine not supported")
+            raise ValueError(f"{data.storage_engine} Storage Engine not supported")
         else:
             self.database = factories[data.storage_engine]
 

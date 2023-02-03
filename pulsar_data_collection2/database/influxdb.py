@@ -12,7 +12,7 @@ class InfluxdbActions(DatabaseActions):
         """Sends data to the database"""
 
 
-class InfluxdbActionsFactory(DatabaseActionsFactory):
+class Influxdb(DatabaseActionsFactory):
     """Infuxdb database connection"""
 
     def get_database_actions(self) -> DatabaseActions:

@@ -1,19 +1,18 @@
 from database_actions import DatabaseActions, DatabaseActionsFactory
-
-# from influxdb import InfluxDBClient
+from influxdb import InfluxDBClient
 
 
 class InfluxdbActions(DatabaseActions):
     """Infuxdb database connection"""
 
-    def __init__(self):
-        pass
-
-    def make_connection(self):
+    def make_connection(
+        self, host: str, port: int, password: str, database_name: str, ssl: bool = False, verify_ssl: bool = False
+    ) -> InfluxDBClient:
         """Makes connection to the Influxdb database"""
-        pass
 
-    def write_data(self):
+        return InfluxDBClient(host=host, port=port, password=password, ssl=ssl, verify_ssl=verify_ssl)
+
+    def write_data(self, client: InfluxDBClient):
         """Sends data to the database"""
         pass
 

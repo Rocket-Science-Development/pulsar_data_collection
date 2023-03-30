@@ -1,5 +1,5 @@
 from config import factories
-from pulsar_data_collection2.models import DataWithPrediction, PulseParameters
+from models import DataWithPrediction, PulseParameters
 
 
 class Pulse(PulseParameters):
@@ -18,6 +18,7 @@ class Pulse(PulseParameters):
         self.y_name = data.y_name
         database = factories.get(data.storage_engine)
         self.db_connection = database.make_connection(**data.login)
+        self.login = data.login
         self.other_labels = data.other_labels
 
     def capture_data(self, data=DataWithPrediction):
@@ -32,4 +33,7 @@ class Pulse(PulseParameters):
         data_with_prediction.loc[:, "data_id"] = self.data_id
         data_with_prediction.set_index("Timestamp", inplace=True)
 
-        # self.db_connection.write_data
+        self.database.write_data(
+            async_client=self.db_connection,
+            bucket_name=self.login["bucket_name"],
+        )

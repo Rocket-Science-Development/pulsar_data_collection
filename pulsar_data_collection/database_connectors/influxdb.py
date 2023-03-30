@@ -1,6 +1,3 @@
-from typing import List
-
-import pandas as pd
 from database_actions import DatabaseActions, DatabaseActionsFactory
 from influxdb_client.client.influxdb_client_async import (
     InfluxDBClient,
@@ -11,28 +8,36 @@ from influxdb_client.client.influxdb_client_async import (
 class InfluxdbActions(DatabaseActions):
     """Infuxdb database connection"""
 
-    def make_connection(self, url: str, token: str, org: str, bucket_name: str) -> InfluxDBClientAsync:
-        """Makes connection to the Influxdb database"""
-        if self._check_if_bucket_exists(url=url, token=token, org=org, bucket_name=bucket_name):
-            return InfluxDBClientAsync(url=url, token=token, org=org)
+    def make_connection(self, **kwargs) -> InfluxDBClientAsync:
+        """Makes connection to the Influxdb database
+        Parameters
+        ----------
+        url: str
+        token: str
+        org: str
+        bucket_name: str
+        """
+        if self._check_if_bucket_exists(url=kwargs.url, token=kwargs.token, org=kwargs.org, bucket_name=kwargs.bucket_name):
+            return InfluxDBClientAsync(url=kwargs.url, token=kwargs.token, org=kwargs.org)
 
-    async def write_data(
-        self,
-        async_client: InfluxDBClientAsync,
-        bucket_name: str,
-        records: pd.DataFrame,
-        data_frame_measurement_name: str,
-        data_frame_tag_columns: List[str],
-        data_frame_timestamp_column: str,
-    ):
-        """Sends data to the database"""
-        async with async_client as client:
+    async def write_data(self, **kwargs):
+        """Write data to the database
+        Parameters
+        ----------
+        async_client: InfluxDBClientAsync
+        bucket_name: str
+        records: pd.DataFrame
+        data_frame_measurement_name: str
+        data_frame_tag_columns: List[str]
+        data_frame_timestamp_column: str
+        """
+        async with kwargs.async_client as client:
             await client.write_api().write(
-                bucket=bucket_name,
-                record=records,
-                data_frame_measurement_name=data_frame_measurement_name,
-                data_frame_tag_columns=data_frame_tag_columns,
-                data_frame_timestamp_column=data_frame_timestamp_column,
+                bucket=kwargs.bucket_name,
+                record=kwargs.records,
+                data_frame_measurement_name=kwargs.data_frame_measurement_name,
+                data_frame_tag_columns=kwargs.data_frame_tag_columns,
+                data_frame_timestamp_column=kwargs.data_frame_timestamp_column,
             )
 
     def _check_if_bucket_exists(self, url: str, token: str, org: str, bucket_name: str):

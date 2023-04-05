@@ -12,5 +12,12 @@
             "source.organizeImports": true
         }
     },
+    "python.formatting.blackArgs": [
+        "--line-length",
+        "130"
+    ],
+    "python.linting.flake8Args": [
+        "--max-line-length=130"
+    ],
     "python.analysis.typeCheckingMode": "off",
 }

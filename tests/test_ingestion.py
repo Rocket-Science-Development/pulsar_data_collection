@@ -26,8 +26,8 @@
 #         prediction1 = model.predict(to_predict1)
 #         prediction2 = model.predict(to_predict2)
 
-#         database_login = DatabaseLogin(db_host="localhost", db_port=8086,
-#           db_user="admin", db_password="pass123", protocol="line")
+#         database_login = DatabaseLogin(db_host="localhost", db_port=8086, db_user="admin",
+#                                       db_password="pass123", protocol="line")
 
 #         dat_predict = DataWithPrediction(prediction=prediction, data_points=to_predict)
 #         dat_predict1 = DataWithPrediction(prediction=prediction1, data_points=to_predict1)
@@ -48,14 +48,14 @@
 #         dat_capture.push(dat_predict2)
 
 #     def test_data_digestion(self):
-#         database_login = DatabaseLogin(db_host="localhost",
-#               db_port=8086, db_user="admin", db_password="pass123", protocol="line")
+#         database_login = DatabaseLogin(db_host="localhost", db_port=8086, db_user="admin",
+#                                       db_password="pass123", protocol="line")
 
 #         dat_capture = DataCapture(storage_engine="influxdb", operation_type="METRICS", login_url=database_login)
 #         dat_capture.collect()
 
 #     def test_period_digestion(self):
-#         database_login = DatabaseLogin(db_host="localhost", db_port=8086,
-#           db_user="admin", db_password="pass123", protocol="line")
+#         database_login = DatabaseLogin(db_host="localhost", db_port=8086, db_user="admin",
+#            db_password="pass123", protocol="line")
 #         dat_capture = DataCapture(storage_engine="influxdb", operation_type="METRICS", login_url=database_login)
 #         dat_capture.collect_eval_timestamp()

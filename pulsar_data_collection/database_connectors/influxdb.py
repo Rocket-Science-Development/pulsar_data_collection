@@ -1,8 +1,7 @@
-from database_actions import DatabaseActions, DatabaseActionsFactory
-from influxdb_client.client.influxdb_client_async import (
-    InfluxDBClient,
-    InfluxDBClientAsync,
-)
+from influxdb_client import InfluxDBClient
+from influxdb_client.client.influxdb_client_async import InfluxDBClientAsync
+
+from .database_actions import DatabaseActions, DatabaseActionsFactory
 
 
 class InfluxdbActions(DatabaseActions):

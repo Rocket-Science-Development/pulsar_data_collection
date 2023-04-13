@@ -43,4 +43,4 @@ class Pulse(PulseParameters):
             data_frame_measurement_name=f"{self.model_id}_{self.model_version}",
             data_frame_tag_columns=["model_id", "model_version", "data_id"],
             data_frame_timestamp_column="timestamp",
-        ),
+        )

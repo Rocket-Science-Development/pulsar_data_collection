@@ -37,7 +37,7 @@ class Pulse(PulseParameters):
         # TODO : plan to dynamically set the method's input in
         # relation to the storage engine assigned
         self.database.write_data(
-            async_client=self.db_connection,
+            client=self.db_connection,
             bucket_name=self.login["bucket_name"],
             records=data_with_prediction,
             data_frame_measurement_name=f"{self.model_id}_{self.model_version}",

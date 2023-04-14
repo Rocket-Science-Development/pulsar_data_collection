@@ -13,11 +13,11 @@ class DatabaseActions(ABC):
 
     @abstractmethod
     def make_connection(self):
-        ...
+        """Sets up the connection object"""
 
     @abstractmethod
     def write_data(self):
-        ...
+        """Writes Data to the database"""
 
 
 class DatabaseActionsFactory(ABC):
@@ -28,4 +28,3 @@ class DatabaseActionsFactory(ABC):
     @abstractmethod
     def get_database_actions(self) -> DatabaseActions:
         """Returns a new video exporter belonging to this factory."""
-        ...

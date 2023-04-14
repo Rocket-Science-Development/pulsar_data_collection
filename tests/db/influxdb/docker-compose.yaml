@@ -2,7 +2,7 @@ services:
   influxdb:
     image: "influxdb:2.6.1"
     env_file:
-      - ./influxv2.env
+      - ./.env
     volumes:
       # Mount for influxdb data directory and configuration
       - influxdbv2:/var/lib/influxdb2:rw

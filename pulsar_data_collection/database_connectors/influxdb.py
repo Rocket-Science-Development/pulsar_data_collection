@@ -34,7 +34,7 @@ class InfluxdbActions(DatabaseActions):
         data_frame_timestamp_column: str
         """
         with kwargs.client as client:
-            await client.write_api().write(
+            client.write_api().write(
                 bucket=kwargs.bucket_name,
                 record=kwargs.records,
                 data_frame_measurement_name=kwargs.data_frame_measurement_name,

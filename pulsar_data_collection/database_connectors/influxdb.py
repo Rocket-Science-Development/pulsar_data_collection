@@ -5,7 +5,7 @@ from influxdb_client.client.exceptions import InfluxDBError
 
 from .database_actions import DatabaseActions, DatabaseActionsFactory
 
-# from influxdb_client.client.influxdb_client_async import InfluxDBClientAsync
+# from influxdb_client.client.write_api import SYNCHRONOUS
 
 
 class BatchingCallback(object):
@@ -52,7 +52,9 @@ class InfluxdbActions(DatabaseActions):
         with db_client as client:
             callback = BatchingCallback()
             with client.write_api(
-                success_callback=callback.success, error_callback=callback.error, retry_callback=callback.retry
+                success_callback=callback.success,
+                error_callback=callback.error,
+                retry_callback=callback.retry,
             ) as write_api:
                 write_api.write(
                     bucket=kwargs["bucket_name"],

@@ -5,12 +5,10 @@ from influxdb_client.client.exceptions import InfluxDBError
 
 from .database_actions import DatabaseActions, DatabaseActionsFactory
 
-# from influxdb_client.client.write_api import SYNCHRONOUS
-
 
 class BatchingCallback(object):
     def success(self, conf: Tuple[str], data: str):
-        print(f"Written batch: {conf}")
+        print(f"Written batch: {conf}. \n")
 
     def error(self, conf: Tuple[str], data: str, exception: InfluxDBError):
         print(f"Cannot write batch: {conf} \n due: {exception}")
@@ -58,7 +56,7 @@ class InfluxdbActions(DatabaseActions):
             ) as write_api:
                 write_api.write(
                     bucket=kwargs["bucket_name"],
-                    record=kwargs["records"],
+                    record=kwargs["record"],
                     data_frame_measurement_name=kwargs["data_frame_measurement_name"],
                     data_frame_tag_columns=kwargs["data_frame_tag_columns"],
                     data_frame_timestamp_column=kwargs["data_frame_timestamp_column"],

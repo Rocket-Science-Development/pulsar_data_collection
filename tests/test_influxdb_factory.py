@@ -124,13 +124,12 @@ class TestInfluxDBMakeConnection:
 
         # get dataframe to write
         test_data = pd.read_csv("data/split/test_data_no_class.csv", header=0).copy()
-        test_data.loc[:, "_time"] = now
+        test_data.loc[:, "_time"] = pd.date_range(start=now, periods=test_data.shape[0], freq="L", inclusive="left", tz="UTC")
         test_data.loc[:, "model_id"] = "test_id"
         test_data.loc[:, "model_version"] = "test_version"
         test_data.loc[:, "data_id"] = "test_data_id"
         test_data.set_index("_time")
 
-        # print(test_data.shape)
         # Create connections
         influxdb = storage_engine.get_database_actions()
         db_connection = influxdb.make_connection(**db_login)
@@ -138,26 +137,24 @@ class TestInfluxDBMakeConnection:
         params = {
             "client": db_connection,
             "bucket_name": "demo",
-            "records": test_data,
+            "record": test_data,
             "data_frame_measurement_name": "test_write_data",
             "data_frame_timestamp_column": "_time",
             "data_frame_tag_columns": [],
         }
-
+        min_ts = test_data.loc[0, "_time"]
+        max_ts = test_data.loc[31, "_time"]
+        print(f"timestamp goes from {min_ts} to {max_ts}")
+        query2 = f"""
+        from(bucket: "demo")
+        |> range(start: {min_ts.isoformat()})
+        |> filter(fn: (r) => r["_measurement"] == "test_write_data")
+        |> group(columns: ["_field"])
+        |> pivot(rowKey:["_time"], columnKey: ["_field"], valueColumn: "_value")
+        """
         influxdb.write_data(**params)
-        # query_api = db_connection.query_api()
+        db_connection = influxdb.make_connection(**db_login)
+        query_api = db_connection.query_api()
+        data_frame = query_api.query_data_frame(query=query2)
 
-        # query2 = """
-        # from(bucket: "demo")
-        # |> range(start: -1m)
-        # |> filter(fn: (r) => r["_measurement"] == "test_write_data")
-        # |> pivot(rowKey:["_time"], columnKey: ["_field"], valueColumn: "_value")
-        # |> keep(columns: ["id","model_id", "model_version", "data_id","age","bp","sg","al","su",
-        # "rbc","pc","pcc","ba", "bgr","bu","sc","sod","pot","hemo","pcv","wbcc","rbcc",
-        # "htn","dm","cad","appet","pe","ane"])
-        # """
-
-        # data_frame = query_api.query_data_frame(query=query2)
-
-        # print(data_frame.to_string())
-        assert False
+        assert data_frame is not None

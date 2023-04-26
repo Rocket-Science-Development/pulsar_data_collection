@@ -9,14 +9,14 @@ from pulsar_data_collection.config import factories
 now = datetime.now().isoformat()
 
 
-# def is_responsive(**kwargs):
-#     try:
-#         with InfluxDBClient(url=kwargs["url"], token=kwargs["token"], org=kwargs["org"]) as conn:
-#             response = conn.ping()
-#             if response:
-#                 return True
-#     except ConnectionError:
-#         return False
+def is_responsive(**kwargs):
+    try:
+        with InfluxDBClient(url=kwargs["url"], token=kwargs["token"], org=kwargs["org"]) as conn:
+            response = conn.ping()
+            if response:
+                return True
+    except ConnectionError:
+        return False
 
 
 @pytest.fixture(scope="session")
@@ -83,7 +83,7 @@ class TestInfluxDBMakeConnection:
         params = {
             "client": db_connection,
             "bucket_name": "demo",
-            "records": test_data,
+            "record": test_data,
             "data_frame_measurement_name": "test_write_data",
             "data_frame_timestamp_column": "_time",
             "data_frame_tag_columns": [],
@@ -110,7 +110,7 @@ class TestInfluxDBMakeConnection:
         params = {
             "client": db_connection,
             "bucket_name": "WrongBucketName",
-            "records": test_data,
+            "record": test_data,
             "data_frame_measurement_name": "test_write_data",
             "data_frame_timestamp_column": "_time",
             "data_frame_tag_columns": [],

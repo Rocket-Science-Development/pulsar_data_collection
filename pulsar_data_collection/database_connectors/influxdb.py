@@ -2,6 +2,7 @@ from typing import Tuple
 
 from influxdb_client import BucketsApi, InfluxDBClient
 from influxdb_client.client.exceptions import InfluxDBError
+from influxdb_client.client.write_api import PointSettings
 
 from .database_actions import DatabaseActions, DatabaseActionsFactory
 
@@ -42,17 +43,23 @@ class InfluxdbActions(DatabaseActions):
         client: InfluxDBClient
         bucket_name: str
         records: pd.DataFrame
+
         data_frame_measurement_name: str
         data_frame_tag_columns: List[str]
         data_frame_timestamp_column: str
+        default_tags: Dict[str, str]
         """
         db_client = kwargs["client"]
         with db_client as client:
             callback = BatchingCallback()
+            point_settings = PointSettings()
+            for key, value in kwargs["default_tags"]:
+                point_settings.add_default_tag(key, value)
             with client.write_api(
                 success_callback=callback.success,
                 error_callback=callback.error,
                 retry_callback=callback.retry,
+                point_settings=point_settings,
             ) as write_api:
                 write_api.write(
                     bucket=kwargs["bucket_name"],

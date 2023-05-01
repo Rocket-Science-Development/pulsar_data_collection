@@ -53,7 +53,7 @@ class InfluxdbActions(DatabaseActions):
         with db_client as client:
             callback = BatchingCallback()
             point_settings = PointSettings()
-            for key, value in kwargs["default_tags"]:
+            for key, value in kwargs["default_tags"].items():
                 point_settings.add_default_tag(key, value)
             with client.write_api(
                 success_callback=callback.success,

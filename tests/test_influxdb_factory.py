@@ -71,14 +71,14 @@ class TestInfluxDBMakeConnection:
         # get dataframe to write
         test_data = pd.read_csv("data/split/test_data_no_class.csv", header=0).copy()
         test_data.loc[:, "_time"] = now
-        test_data.loc[:, "model_id"] = "test_id"
-        test_data.loc[:, "model_version"] = "test_version"
-        test_data.loc[:, "data_id"] = "test_data_id"
         test_data.set_index("_time")
 
         # Create connections
         influxdb = storage_engine.get_database_actions()
         db_connection = influxdb.make_connection(**db_login)
+
+        other_labels = {"environment": "test", "tag": "whatever"}
+        default_tags = {"model_id": "test_id", "model_version": "test_version", "data_id": "test_data_id", **other_labels}
 
         params = {
             "client": db_connection,
@@ -87,6 +87,7 @@ class TestInfluxDBMakeConnection:
             "data_frame_measurement_name": "test_write_data",
             "data_frame_timestamp_column": "_time",
             "data_frame_tag_columns": [],
+            "default_tags": default_tags,
         }
 
         influxdb.write_data(**params)
@@ -98,14 +99,14 @@ class TestInfluxDBMakeConnection:
         # get dataframe to write
         test_data = pd.read_csv("data/split/test_data_no_class.csv", header=0).copy()
         test_data.loc[:, "_time"] = now
-        test_data.loc[:, "model_id"] = "test_id"
-        test_data.loc[:, "model_version"] = "test_version"
-        test_data.loc[:, "data_id"] = "test_data_id"
         test_data.set_index("_time")
 
         # Create connections
         influxdb = storage_engine.get_database_actions()
         db_connection = influxdb.make_connection(**db_login)
+
+        other_labels = {"environment": "test", "tag": "whatever"}
+        default_tags = {"model_id": "test_id", "model_version": "test_version", "data_id": "test_data_id", **other_labels}
 
         params = {
             "client": db_connection,
@@ -114,6 +115,7 @@ class TestInfluxDBMakeConnection:
             "data_frame_measurement_name": "test_write_data",
             "data_frame_timestamp_column": "_time",
             "data_frame_tag_columns": [],
+            "default_tags": default_tags,
         }
 
         influxdb.write_data(**params)
@@ -125,14 +127,13 @@ class TestInfluxDBMakeConnection:
         # get dataframe to write
         test_data = pd.read_csv("data/split/test_data_no_class.csv", header=0).copy()
         test_data.loc[:, "_time"] = pd.date_range(start=now, periods=test_data.shape[0], freq="L", inclusive="left", tz="UTC")
-        test_data.loc[:, "model_id"] = "test_id"
-        test_data.loc[:, "model_version"] = "test_version"
-        test_data.loc[:, "data_id"] = "test_data_id"
         test_data.set_index("_time")
 
         # Create connections
         influxdb = storage_engine.get_database_actions()
         db_connection = influxdb.make_connection(**db_login)
+        other_labels = {"environment": "test", "tag": "whatever"}
+        default_tags = {"model_id": "test_id", "model_version": "test_version", "data_id": "test_data_id", **other_labels}
 
         params = {
             "client": db_connection,
@@ -141,6 +142,7 @@ class TestInfluxDBMakeConnection:
             "data_frame_measurement_name": "test_write_data",
             "data_frame_timestamp_column": "_time",
             "data_frame_tag_columns": [],
+            "default_tags": default_tags,
         }
         query2 = f"""
         from(bucket: "demo")
@@ -168,7 +170,8 @@ class TestInfluxDBMakeConnection:
         db_connection = influxdb.make_connection(**db_login)
 
         other_labels = {"environment": "test", "tag": "whatever"}
-        defautl_tags = {"model_id": "test_id", "model_version": "test_version", "data_id": "test_data_id", **other_labels}
+        default_tags = {"model_id": "test_id", "model_version": "test_version", "data_id": "test_data_id", **other_labels}
+
         params = {
             "client": db_connection,
             "bucket_name": "demo",
@@ -176,14 +179,14 @@ class TestInfluxDBMakeConnection:
             "data_frame_measurement_name": "test_write_data",
             "data_frame_timestamp_column": "_time",
             "data_frame_tag_columns": [],
-            "default_tags": defautl_tags,
+            "default_tags": default_tags,
         }
         query2 = f"""
         from(bucket: "demo")
         |> range(start: {test_data.loc[0, "_time"].isoformat()})
         |> filter(fn: (r) => r["_measurement"] == "test_write_data")
         |> group(columns: ["_field"])
-        |> pivot(rowKey:["_time"], columnKey: ["_field"], valueColumn: "_value")
+        |> pivot(rowKey:["_time"], columnKey: ["_field", "tag"], valueColumn: "_value")
         """
         influxdb.write_data(**params)
         db_connection = influxdb.make_connection(**db_login)

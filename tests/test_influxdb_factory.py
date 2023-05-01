@@ -1,4 +1,5 @@
 from datetime import datetime
+from pathlib import Path
 
 import pandas as pd
 import pytest
@@ -35,19 +36,18 @@ def db_login(docker_ip):
     return db_login
 
 
-# @pytest.fixture(scope="session")
-# def docker_compose_file(pytestconfig):
-#     return Path("db/influxdb/docker-compose.yaml")
+@pytest.fixture(scope="session")
+def docker_compose_file(pytestconfig):
+    return Path("db/influxdb/docker-compose.yaml")
 
 
-# # TODO: change docker based fixture to a mock in order to make tests faster
-# @pytest.fixture(scope="session")
-# def run_influxdb(db_login, docker_services):
-#     docker_services.wait_until_responsive(timeout=2, pause=0,
-# check=lambda: is_responsive(**db_login))
+# TODO: change docker based fixture to a mock in order to make tests faster
+@pytest.fixture(scope="session")
+def run_influxdb(db_login, docker_services):
+    docker_services.wait_until_responsive(timeout=2, pause=0, check=lambda: is_responsive(**db_login))
 
 
-@pytest.mark.usefixtures("db_login", "storage_engine")
+@pytest.mark.usefixtures("db_login", "storage_engine", "run_influxdb")
 class TestInfluxDBMakeConnection:
     def test_make_connection_is_not_none(self, db_login, storage_engine):
         influxdb = storage_engine.get_database_actions()

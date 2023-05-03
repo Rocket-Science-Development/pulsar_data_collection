@@ -48,7 +48,7 @@ def run_influxdb(db_login, docker_services):
 
 
 @pytest.mark.usefixtures("db_login", "storage_engine", "run_influxdb")
-class TestInfluxDBMakeConnection:
+class TestInfluxDBIntegration:
     def test_make_connection_is_not_none(self, db_login, storage_engine):
         influxdb = storage_engine.get_database_actions()
         db_connection = influxdb.make_connection(**db_login)

@@ -1,4 +1,5 @@
-from config import factories, write_data_parameters
+import pandas as pd
+from config import factories
 from models import DataWithPrediction, PulseParameters
 
 
@@ -16,31 +17,37 @@ class Pulse(PulseParameters):
         self.model_version = data.model_version
         self.reference_data_storage = data.reference_data_storage
         self.y_name = data.y_name
-        self.storage_engine = factories.get(data.storage_engine)
+        self.storage_engine = factories[data.storage_engine]
         self.db_connection = self.storage_engine.make_connection(**data.login)
         self.login = data.login
         self.other_labels = data.other_labels
-        self.write_data_parameters_dict = write_data_parameters(data.storage_engine)
+        self.timezone = data.timezone
 
     def capture_data(self, data=DataWithPrediction):
         """
         Capturing data from inference code
         """
         data_with_prediction = data.data_points.copy()
-        data_with_prediction[f"{self.y_name}_prediction"] = data.prediction
-        data_with_prediction.loc[:, "timestamp"] = data.timestamp
-        data_with_prediction.loc[:, "model_id"] = self.model_id
-        data_with_prediction.loc[:, "model_version"] = self.model_version
-        data_with_prediction.loc[:, "data_id"] = self.data_id
-        data_with_prediction.set_index("timestamp", inplace=True)
+        data_with_prediction.loc[:, "timestamp"] = pd.date_range(
+            start=data.timestamp, periods=data.data_points.shape[0], freq="L", inclusive="left", tz=self.timezone
+        )
+        data_with_prediction.set_index("timestamp")
+        data_with_prediction.loc[f"{self.y_name}_prediction"] = data.prediction
 
+        params = {
+            "client": self.db_connection,
+            "bucket_name": self.login["bucket_name"],
+            "record": data_with_prediction,
+            "data_frame_measurement_name": f"{self.model_id}",
+            "data_frame_timestamp_column": "timestamp",
+            "data_frame_tag_columns": [],
+            "default_tags": {
+                "model_id": self.model_id,
+                "model_version": self.model_version,
+                "data_id": self.data_id,
+                **self.other_labels,
+            },
+        }
         # TODO : plan to dynamically set the method's input in
         # relation to the storage engine assigned
-        self.database.write_data(
-            client=self.db_connection,
-            bucket_name=self.login["bucket_name"],
-            records=data_with_prediction,
-            data_frame_measurement_name=f"{self.model_id}_{self.model_version}",
-            data_frame_tag_columns=["model_id", "model_version", "data_id"],
-            data_frame_timestamp_column="timestamp",
-        )
+        self.database.write_data(**params)

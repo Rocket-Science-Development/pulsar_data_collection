@@ -1,11 +1,10 @@
-from datetime import datetime
-from typing import Any, Dict, List, Optional, Union
+import datetime
+from typing import Dict, List, Optional, Union
 
-import numpy as np
 import pandas as pd
 import pytz
 from config import factories
-from pydantic import BaseModel, Field, validator
+from pydantic import BaseModel, validator
 
 
 class PulseParameters(BaseModel):
@@ -13,30 +12,17 @@ class PulseParameters(BaseModel):
     model_id: str
     model_version: str
     data_id: str
-    reference_data_storage: str
-    y_name: str
+    reference_data_storage: Dict[str, str]
+    target_name: str
     storage_engine: str
-    login: Dict[Any, Union[str, int, bool]]
+    login: Dict[str, Union[str, int, bool]]
     features_metadata: Optional[Dict[str, type]]  # key: feature_name, value : feature type
-    other_labels: Optional[Dict[Any, Union[str, int, Any]]]
-    timezone: str = "UTC"
-
-    @validator("model_id", "model_version", "data_id", "reference_data")
-    def check_model_version(cls, value):
-        if not value:
-            raise ValueError("model_id, model_version, data_id, reference_data missing.")
-        return value
+    other_labels: Optional[Dict[str, Union[str, int, bool]]] = None
 
     @validator("storage_engine")
     def check_storage_engine(cls, value):
-        if value not in factories.keys:
+        if value not in factories:
             raise ValueError(f"Storage Engine for {value} not supported")
-        return value
-
-    @validator("timezone")
-    def check_timezone(cls, value):
-        if value not in pytz.timezone:
-            raise ValueError("timezone does not exist")
         return value
 
 
@@ -45,7 +31,14 @@ class DataWithPrediction(BaseModel):
         arbitrary_types_allowed = True
 
     prediction_id: str
-    timestamp: datetime = datetime.now()
-    prediction: np.ndarray = Field(..., allow_mutation=False)
-    data_points: pd.DataFrame = Field(..., allow_mutation=False)
+    timestamp: datetime.datetime = datetime.datetime.now()
+    prediction: Dict
+    data_points: pd.DataFrame
     features_names: List[str]
+    timezone: str = str(datetime.datetime.now(datetime.timezone.utc).astimezone().tzinfo)
+
+    @validator("timezone")
+    def check_timezone(cls, value):
+        if value not in pytz.timezone:
+            raise ValueError(f"chose timezone value in {pytz.timezone}")
+        return value

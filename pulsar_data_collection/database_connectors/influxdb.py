@@ -1,5 +1,6 @@
 from typing import Tuple
 
+import pandas as pd
 from influxdb_client import BucketsApi, InfluxDBClient
 from influxdb_client.client.exceptions import InfluxDBError
 from influxdb_client.client.write_api import PointSettings
@@ -36,20 +37,54 @@ class InfluxdbActions(DatabaseActions):
         ):
             return InfluxDBClient(url=kwargs["url"], token=kwargs["token"], org=kwargs["org"])
 
+    def param_dict(self, **kwargs):
+        """Create parameter dictionary containing all required information to write to an influx Database
+        Parameters
+        ----------
+        client: InfluxDBClient
+        bucket_name: str
+        model_id: str
+        model_version: str
+        data_id: str
+        other_label: Dict
+
+        """
+
+        tags = {"model_id": kwargs["model_id"], "model_version": kwargs["model_version"], "data_id": kwargs["data_id"]}
+        if kwargs["other_labels"]:
+            tags = {**tags, **kwargs["other_labels"]}
+        return {
+            "client": kwargs["client"],
+            "bucket_name": kwargs["login"]["bucket_name"],
+            "record": kwargs["data_with_prediction"],
+            "data_frame_measurement_name": f"{kwargs['model_id']}_{kwargs['model_version']}_input_data",
+            "data_frame_timestamp_column": kwargs["timestamp"],
+            "default_tags": tags,
+        }
+
     def write_data(self, **kwargs):
         """Write data to the database
         Parameters
         ----------
         client: InfluxDBClient
         bucket_name: str
-        records: pd.DataFrame
 
         data_frame_measurement_name: str
-        data_frame_tag_columns: List[str]
         data_frame_timestamp_column: str
         default_tags: Dict[str, str]
+        prediction: Dict
+        data_points: pd.DataFrame
+        timestamp:
+        timezone: str
         """
         db_client = kwargs["client"]
+
+        data_with_prediction = kwargs["data_points"].copy()
+        data_with_prediction.append(kwargs["prediction"])
+        data_with_prediction.loc[:, "timestamp"] = pd.date_range(
+            start=kwargs["timestamp"], periods=kwargs["data_points"].shape[0], freq="L", inclusive="left", tz=kwargs["timezone"]
+        )
+        data_with_prediction.set_index("timestamp")
         with db_client as client:
             callback = BatchingCallback()
             point_settings = PointSettings()
@@ -63,9 +98,8 @@ class InfluxdbActions(DatabaseActions):
             ) as write_api:
                 write_api.write(
                     bucket=kwargs["bucket_name"],
-                    record=kwargs["record"],
+                    record=data_with_prediction,
                     data_frame_measurement_name=kwargs["data_frame_measurement_name"],
-                    data_frame_tag_columns=kwargs["data_frame_tag_columns"],
                     data_frame_timestamp_column=kwargs["data_frame_timestamp_column"],
                 )
 

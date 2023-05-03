@@ -19,6 +19,10 @@ class DatabaseActions(ABC):
     def write_data(self):
         """Writes Data to the database"""
 
+    @abstractmethod
+    def param_dict(self):
+        """Create the parameter dictionary to write to a database implementation"""
+
 
 class DatabaseActionsFactory(ABC):
     """

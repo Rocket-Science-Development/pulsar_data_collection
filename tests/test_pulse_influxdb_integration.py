@@ -55,10 +55,27 @@ def run_influxdb(db_login, docker_services):
     docker_services.wait_until_responsive(timeout=2, pause=0, check=lambda: is_responsive(**db_login))
 
 
-@pytest.mark.usefixtures("run_influxdb", "pulse_parameters")
-class TestPulseInfluxdbIntegration:
-    def test_pulse_interface(self):
+class TestModels:
+    def test_PulseParameters(self, docker_ip):
 
-        pulse = Pulse(pulse_parameters)
+        Pulse(
+            PulseParameters(
+                model_id="test_id",
+                model_version="version_test",
+                data_id="test_data_id",
+                reference_data_storage={"bucket": "bucket-address", "filename": "filename.csv"},
+                target_name="class",
+                storage_engine="influxdb",
+                login={
+                    "url": f"http://{docker_ip}:8086/",
+                    "token": "mytoken",
+                    "org": "pulsarml",
+                    "bucket_name": "demo",
+                },
+            )
+        )
 
-        assert isinstance(pulse.db_connection, InfluxDBClient)
+        assert False
+
+    def test_DataWithPrediction(self):
+        pass

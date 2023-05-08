@@ -12,7 +12,7 @@ class PulseParameters(BaseModel):
     model_id: str
     model_version: str
     data_id: str
-    reference_data_storage: Dict[str, str]
+    reference_data_storage: Union[str, Dict[str, str]]
     target_name: str
     storage_engine: str
     login: Dict[str, Union[str, int, bool]]
@@ -33,7 +33,7 @@ class DataWithPrediction(BaseModel):
 
     prediction_id: str
     timestamp: datetime.datetime = datetime.datetime.now()
-    prediction: Dict
+    prediction: Union[Dict, pd.DataFrame]
     data_points: pd.DataFrame
     features_names: List[str]
     timezone: str = str(datetime.datetime.now(datetime.timezone.utc).astimezone().tzinfo)

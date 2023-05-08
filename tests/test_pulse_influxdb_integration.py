@@ -1,6 +1,9 @@
+import pickle as pkl
 from datetime import datetime
+from pathlib import Path
 from typing import Dict
 
+import pandas as pd
 import pytest
 from influxdb_client import InfluxDBClient
 
@@ -87,3 +90,36 @@ class TestModels:
             "org": "pulsarml",
             "bucket_name": "demo",
         }
+
+    def test_Pulse_capture_data_method(self, docker_ip):
+
+        # TODO : move these to become
+        model_path = Path("model/kidney_disease.pkl")
+        inference_dataset = pd.read_csv("data/split/test_data_no_class.csv", header=0)
+        reference_data = Path("../data/raw/csv_result-chronic_kidney_disease.csv")
+        params = PulseParameters(
+            model_id="test_id",
+            model_version="version_test",
+            data_id="test_data_id",
+            reference_data_storage=reference_data,
+            target_name="class",
+            storage_engine="influxdb",
+            login={
+                "url": f"http://{docker_ip}:8086/",
+                "token": "mytoken",
+                "org": "pulsarml",
+                "bucket_name": "demo",
+            },
+        )
+        pulse = Pulse(data=params)
+        capture_dict = {}
+        pickle_model = pkl.load(open(model_path, "rb"))
+        prediction = pickle_model.predict(inference_dataset.reshape(-1, 1))
+
+        capture_dict["record"] = inference_dataset
+        capture_dict["prediction"] = prediction
+        capture_dict["timestamp"] = datetime.now()
+
+        pulse.capture_data(data=capture_dict)
+
+        assert False

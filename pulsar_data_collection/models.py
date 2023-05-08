@@ -18,6 +18,7 @@ class PulseParameters(BaseModel):
     login: Dict[str, Union[str, int, bool]]
     features_metadata: Optional[Dict[str, type]]  # key: feature_name, value : feature type
     other_labels: Optional[Dict[str, Union[str, int, bool]]] = None
+    timestamp_column_name: str = "timestamp"
 
     @validator("storage_engine")
     def check_storage_engine(cls, value):

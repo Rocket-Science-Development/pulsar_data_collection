@@ -56,9 +56,8 @@ class InfluxdbActions(DatabaseActions):
         return {
             "client": kwargs["client"],
             "bucket_name": kwargs["login"]["bucket_name"],
-            "record": kwargs["data_with_prediction"],
             "data_frame_measurement_name": f"{kwargs['model_id']}_{kwargs['model_version']}_input_data",
-            "data_frame_timestamp_column": kwargs["timestamp"],
+            "data_frame_timestamp_column": kwargs["timestamp_column_name"],
             "default_tags": tags,
         }
 

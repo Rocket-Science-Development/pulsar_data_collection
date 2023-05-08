@@ -1,5 +1,5 @@
 from datetime import datetime
-from pathlib import Path
+from typing import Dict
 
 import pytest
 from influxdb_client import InfluxDBClient
@@ -44,38 +44,46 @@ def pulse_parameters(db_login):
     )
 
 
-@pytest.fixture(scope="session")
-def docker_compose_file(pytestconfig):
-    return Path("db/influxdb/docker-compose.yaml")
+# @pytest.fixture(scope="session")
+# def docker_compose_file(pytestconfig):
+#     return Path("db/influxdb/docker-compose.yaml")
 
 
-# TODO: change docker based fixture to a mock in order to make tests faster
-@pytest.fixture(scope="session")
-def run_influxdb(db_login, docker_services):
-    docker_services.wait_until_responsive(timeout=2, pause=0, check=lambda: is_responsive(**db_login))
+# # TODO: change docker based fixture to a mock in order to make tests faster
+# @pytest.fixture(scope="session")
+# def run_influxdb(db_login, docker_services):
+#     docker_services.wait_until_responsive(timeout=2, pause=0, check=lambda: is_responsive(**db_login))
 
 
 class TestModels:
     def test_PulseParameters(self, docker_ip):
 
-        Pulse(
-            PulseParameters(
-                model_id="test_id",
-                model_version="version_test",
-                data_id="test_data_id",
-                reference_data_storage={"bucket": "bucket-address", "filename": "filename.csv"},
-                target_name="class",
-                storage_engine="influxdb",
-                login={
-                    "url": f"http://{docker_ip}:8086/",
-                    "token": "mytoken",
-                    "org": "pulsarml",
-                    "bucket_name": "demo",
-                },
-            )
+        params = PulseParameters(
+            model_id="test_id",
+            model_version="version_test",
+            data_id="test_data_id",
+            reference_data_storage={"bucket": "bucket-address", "filename": "filename.csv"},
+            target_name="class",
+            storage_engine="influxdb",
+            login={
+                "url": f"http://{docker_ip}:8086/",
+                "token": "mytoken",
+                "org": "pulsarml",
+                "bucket_name": "demo",
+            },
         )
+        pulse = Pulse(data=params)
 
-        assert False
-
-    def test_DataWithPrediction(self):
-        pass
+        assert pulse.model_id == "test_id"
+        assert pulse.model_version == "version_test"
+        assert isinstance(pulse.reference_data_storage, Dict)
+        assert pulse.reference_data_storage == {"bucket": "bucket-address", "filename": "filename.csv"}
+        assert pulse.target_name == "class"
+        assert isinstance(pulse.db_connection, InfluxDBClient)
+        assert isinstance(pulse.login, Dict)
+        assert pulse.login == {
+            "url": f"http://{docker_ip}:8086/",
+            "token": "mytoken",
+            "org": "pulsarml",
+            "bucket_name": "demo",
+        }

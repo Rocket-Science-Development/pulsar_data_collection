@@ -26,6 +26,7 @@ class Pulse:
         """
         Capturing data from inference code
         """
+
         self.params["record"] = data.data_points
         self.params["prediction"] = data.prediction
         self.params["timestamp"] = data.timestamp

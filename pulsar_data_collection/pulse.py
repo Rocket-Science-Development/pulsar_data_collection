@@ -28,7 +28,7 @@ class Pulse:
         """
 
         self.params["record"] = data.data_points
-        self.params["prediction"] = data.prediction
+        self.params["prediction"] = data.predictions
         self.params["timestamp"] = data.timestamp
         self.params["timezone"] = data.timezone
         self.storage_engine.write_data(**self.params)

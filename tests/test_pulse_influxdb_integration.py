@@ -114,10 +114,10 @@ class TestModels:
         pulse = Pulse(data=params)
         capture_dict = {}
         pickle_model = pkl.load(open(model_path, "rb"))
-        prediction = pickle_model.predict(inference_dataset.reshape(-1, 1))
+        prediction = pickle_model.predict(inference_dataset)
 
-        capture_dict["record"] = inference_dataset
-        capture_dict["prediction"] = prediction
+        capture_dict["data_points"] = inference_dataset
+        capture_dict["predictions"] = prediction
         capture_dict["timestamp"] = datetime.now()
 
         pulse.capture_data(data=capture_dict)

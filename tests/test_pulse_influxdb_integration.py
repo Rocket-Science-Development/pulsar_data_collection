@@ -40,7 +40,7 @@ def db_login(docker_ip):
 
 @pytest.fixture(scope="session")
 def docker_compose_file(pytestconfig):
-    return Path("db/influxdb/docker-compose.yaml")
+    return Path("tests/db/influxdb/docker-compose.yaml")
 
 
 # TODO: change docker based fixture to a mock in order to make tests faster
@@ -76,8 +76,8 @@ class TestModels:
 
     def test_Pulse_capture_data_method_simple_prediction(self, docker_ip):
         # TODO : move these to become
-        model_path = Path("model/kidney_disease.pkl")
-        inference_dataset = pd.read_csv("data/split/test_data_no_class.csv", header=0)
+        model_path = Path("tests/model/kidney_disease.pkl")
+        inference_dataset = pd.read_csv("tests/data/split/test_data_no_class.csv", header=0)
         reference_data = "/data/raw/csv_result-chronic_kidney_disease.csv"
         params = PulseParameters(
             model_id="simple_prediction",
@@ -130,8 +130,8 @@ class TestModels:
 
     def test_Pulse_capture_data_method_proba_prediction(self, docker_ip):
         # TODO : move these to become fixtures
-        model_path = Path("model/kidney_disease.pkl")
-        inference_dataset = pd.read_csv("data/split/test_data_no_class.csv", header=0)
+        model_path = Path("tests/model/kidney_disease.pkl")
+        inference_dataset = pd.read_csv("tests/data/split/test_data_no_class.csv", header=0)
         reference_data = "/data/raw/csv_result-chronic_kidney_disease.csv"
         params = PulseParameters(
             model_id="test_id",

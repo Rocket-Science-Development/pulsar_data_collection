@@ -38,7 +38,7 @@ def db_login(docker_ip):
 
 @pytest.fixture(scope="session")
 def docker_compose_file(pytestconfig):
-    return Path("db/influxdb/docker-compose.yaml")
+    return Path("tests/db/influxdb/docker-compose.yaml")
 
 
 # TODO: change docker based fixture to a mock in order to make tests faster
@@ -68,7 +68,7 @@ class TestInfluxDBIntegration:
 
     def test_write_data_writes_data(self, storage_engine, db_login, capsys):
         # get dataframe to write
-        test_data = pd.read_csv("data/split/test_data_no_class.csv", header=0).copy()
+        test_data = pd.read_csv("tests/data/split/test_data_no_class.csv", header=0).copy()
 
         # Create connections
         influxdb = storage_engine.get_database_actions()
@@ -95,7 +95,7 @@ class TestInfluxDBIntegration:
 
     def test_write_data_fails(self, storage_engine, db_login, capsys):
         # get dataframe to write
-        test_data = pd.read_csv("data/split/test_data_no_class.csv", header=0).copy()
+        test_data = pd.read_csv("tests/data/split/test_data_no_class.csv", header=0).copy()
 
         # Create connections
         influxdb = storage_engine.get_database_actions()
@@ -122,7 +122,7 @@ class TestInfluxDBIntegration:
 
     def test_write_data_returns_not_none(self, storage_engine, db_login):
         # get dataframe to write
-        test_data = pd.read_csv("data/split/test_data_no_class.csv", header=0).copy()
+        test_data = pd.read_csv("tests/data/split/test_data_no_class.csv", header=0).copy()
 
         # Create connections
         influxdb = storage_engine.get_database_actions()
@@ -157,7 +157,7 @@ class TestInfluxDBIntegration:
 
     def test_write_data_returns_pandas_dataframe(self, storage_engine, db_login):
         # get dataframe to write
-        test_data = pd.read_csv("data/split/test_data_no_class.csv", header=0).copy()
+        test_data = pd.read_csv("tests/data/split/test_data_no_class.csv", header=0).copy()
 
         # Create connections
         influxdb = storage_engine.get_database_actions()

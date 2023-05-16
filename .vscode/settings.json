@@ -5,12 +5,13 @@
     "python.linting.flake8Enabled": true,
     "python.linting.mypyEnabled": true,
     "python.linting.banditEnabled": true,
-    "python.formatting.provider": "black",
+    "python.formatting.provider": "none",
     "[python]": {
         "editor.formatOnSave": true,
         "editor.codeActionsOnSave": {
             "source.organizeImports": true
-        }
+        },
+        "editor.defaultFormatter": "ms-python.black-formatter"
     },
     "python.formatting.blackArgs": [
         "--line-length",

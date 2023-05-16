@@ -27,8 +27,11 @@ class Pulse:
         Capturing data from inference code
         """
 
-        self.params["record"] = data.data_points
-        self.params["prediction"] = data.predictions
-        self.params["timestamp"] = data.timestamp
-        self.params["timezone"] = data.timezone
+        self.params.update(
+            {
+                "data_points": data.data_points,
+                "prediction": data.predictions,
+                "timestamp": data.timestamp,
+            }
+        )
         self.storage_engine.write_data(**self.params)

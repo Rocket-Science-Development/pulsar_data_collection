@@ -67,11 +67,8 @@ class TestInfluxDBIntegration:
         assert db_connection.org == "pulsarml"
 
     def test_write_data_writes_data(self, storage_engine, db_login, capsys):
-
         # get dataframe to write
         test_data = pd.read_csv("data/split/test_data_no_class.csv", header=0).copy()
-        test_data.loc[:, "_time"] = now
-        test_data.set_index("_time")
 
         # Create connections
         influxdb = storage_engine.get_database_actions()
@@ -83,11 +80,13 @@ class TestInfluxDBIntegration:
         params = {
             "client": db_connection,
             "bucket_name": "demo",
-            "record": test_data,
+            "data_points": test_data,
             "data_frame_measurement_name": "test_write_data",
             "data_frame_timestamp_column": "_time",
             "data_frame_tag_columns": [],
             "default_tags": default_tags,
+            "timestamp": now,
+            "timezone": "EST",
         }
 
         influxdb.write_data(**params)
@@ -95,11 +94,8 @@ class TestInfluxDBIntegration:
         assert "Written batch" in captured.out
 
     def test_write_data_fails(self, storage_engine, db_login, capsys):
-
         # get dataframe to write
         test_data = pd.read_csv("data/split/test_data_no_class.csv", header=0).copy()
-        test_data.loc[:, "_time"] = now
-        test_data.set_index("_time")
 
         # Create connections
         influxdb = storage_engine.get_database_actions()
@@ -111,11 +107,13 @@ class TestInfluxDBIntegration:
         params = {
             "client": db_connection,
             "bucket_name": "WrongBucketName",
-            "record": test_data,
+            "data_points": test_data,
             "data_frame_measurement_name": "test_write_data",
             "data_frame_timestamp_column": "_time",
             "data_frame_tag_columns": [],
             "default_tags": default_tags,
+            "timestamp": now,
+            "timezone": "EST",
         }
 
         influxdb.write_data(**params)
@@ -123,11 +121,8 @@ class TestInfluxDBIntegration:
         assert "Cannot write batch:" in captured.out
 
     def test_write_data_returns_not_none(self, storage_engine, db_login):
-
         # get dataframe to write
         test_data = pd.read_csv("data/split/test_data_no_class.csv", header=0).copy()
-        test_data.loc[:, "_time"] = pd.date_range(start=now, periods=test_data.shape[0], freq="L", inclusive="left", tz="UTC")
-        test_data.set_index("_time")
 
         # Create connections
         influxdb = storage_engine.get_database_actions()
@@ -138,15 +133,17 @@ class TestInfluxDBIntegration:
         params = {
             "client": db_connection,
             "bucket_name": "demo",
-            "record": test_data,
+            "data_points": test_data,
             "data_frame_measurement_name": "test_write_data",
             "data_frame_timestamp_column": "_time",
             "data_frame_tag_columns": [],
             "default_tags": default_tags,
+            "timestamp": now,
+            "timezone": "EST",
         }
-        query2 = f"""
+        query2 = """
         from(bucket: "demo")
-        |> range(start: {test_data.loc[0, "_time"].isoformat()})
+        |> range(start: 1)
         |> filter(fn: (r) => r["_measurement"] == "test_write_data")
         |> group(columns: ["_field"])
         |> pivot(rowKey:["_time"], columnKey: ["_field"], valueColumn: "_value")
@@ -159,11 +156,8 @@ class TestInfluxDBIntegration:
         assert data_frame is not None
 
     def test_write_data_returns_pandas_dataframe(self, storage_engine, db_login):
-
         # get dataframe to write
         test_data = pd.read_csv("data/split/test_data_no_class.csv", header=0).copy()
-        test_data.loc[:, "_time"] = pd.date_range(start=now, periods=test_data.shape[0], freq="L", inclusive="left", tz="UTC")
-        test_data.set_index("_time")
 
         # Create connections
         influxdb = storage_engine.get_database_actions()
@@ -175,15 +169,17 @@ class TestInfluxDBIntegration:
         params = {
             "client": db_connection,
             "bucket_name": "demo",
-            "record": test_data,
+            "data_points": test_data,
             "data_frame_measurement_name": "test_write_data",
             "data_frame_timestamp_column": "_time",
             "data_frame_tag_columns": [],
             "default_tags": default_tags,
+            "timestamp": now,
+            "timezone": "EST",
         }
         query2 = f"""
         from(bucket: "demo")
-        |> range(start: {test_data.loc[0, "_time"].isoformat()})
+        |> range(start: {pd.Timestamp(now,tz="UTC").isoformat()})
         |> filter(fn: (r) => r["_measurement"] == "test_write_data")
         |> group(columns: ["_field"])
         |> pivot(rowKey:["_time"], columnKey: ["_field", "tag"], valueColumn: "_value")
@@ -212,7 +208,7 @@ class TestInfluxDBIntegration:
     #     params = {
     #         "client": db_connection,
     #         "bucket_name": "demo",
-    #         "record": test_data,
+    #         "data_points": test_data,
     #         "data_frame_measurement_name": "test_write_data",
     #         "data_frame_timestamp_column": "_time",
     #         "data_frame_tag_columns": [],

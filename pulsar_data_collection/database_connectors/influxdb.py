@@ -71,19 +71,25 @@ class InfluxdbActions(DatabaseActions):
         data_frame_measurement_name: str
         data_frame_timestamp_column: str
         default_tags: Dict[str, str]
-        prediction: Dict
+        prediction: pd.DataFrame
         data_points: pd.DataFrame
-        timestamp:
+        timestamp: datetime
         timezone: str
         """
         db_client = kwargs["client"]
 
-        data_with_prediction = kwargs["data_points"].copy()
-        data_with_prediction.append(kwargs["prediction"])
-        data_with_prediction.loc[:, "timestamp"] = pd.date_range(
-            start=kwargs["timestamp"], periods=kwargs["data_points"].shape[0], freq="L", inclusive="left", tz=kwargs["timezone"]
+        data = kwargs["data_points"]
+        if "prediction" in kwargs.keys():
+            data = pd.concat(objs=[data, kwargs["prediction"]], copy=False, axis=1)
+
+        data.loc[:, "_time"] = pd.date_range(
+            start=kwargs["timestamp"],
+            periods=kwargs["data_points"].shape[0],
+            freq="L",
+            inclusive="left",
         )
-        data_with_prediction.set_index("timestamp")
+        data.set_index("_time")
+
         with db_client as client:
             callback = BatchingCallback()
             point_settings = PointSettings()
@@ -97,7 +103,7 @@ class InfluxdbActions(DatabaseActions):
             ) as write_api:
                 write_api.write(
                     bucket=kwargs["bucket_name"],
-                    record=data_with_prediction,
+                    record=data,
                     data_frame_measurement_name=kwargs["data_frame_measurement_name"],
                     data_frame_timestamp_column=kwargs["data_frame_timestamp_column"],
                 )

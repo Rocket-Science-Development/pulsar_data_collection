@@ -1,126 +1,88 @@
 # pulsar_data_collection
 
-Pulsar data collection SDK is an open-source Python library for
-pushing/processing/collecting features, predictions and metadata. Works with different
-data storages, at this point InfluxDB is implemented.
+[![PyPI Latest Release](https://img.shields.io/pypi/v/pulsar-data-collection.svg)](https://pypi.org/project/pulsar-data-collection/)
+[![Package Status](https://img.shields.io/pypi/status/pulsar-data-collection.svg)](https://pypi.org/project/pulsar-data-collection/)
+[![License](https://img.shields.io/pypi/l/pulsar-data-collection.svg)](https://github.com/Rocket-Science-Development/pulsar_data_collection/blob/main/LICENSE)
+[![Coverage](https://codecov.io/github/pandas-dev/pandas/coverage.svg?branch=main)](https://codecov.io/gh/pandas-dev/pandas)
+[![Code style: black](https://img.shields.io/badge/code%20style-black-000000.svg)](https://github.com/psf/black)
+[![Imports: isort](https://img.shields.io/badge/%20imports-isort-%231674b1?style=flat&labelColor=ef8336)](https://pycqa.github.io/isort/)
 
-## Getting started
+## What is it?
 
+**pulsar-data-collection** is a package for collecting and pushing data (features, predictions, and metadata) from an inference/prediction Jupyter notebook or Python micro-service serving a ML model (Flask, FastAPI) to a Database. It aims to provide an easy and flexible way to log data point used to perform predictions, prediction, and other relevant metadate informing the context in which the model is perform its predection. Once this data is stored, it will be used to compute metrics in order to provide ML models monitoring using our [pulsar-metrics](https://github.com/Rocket-Science-Development/pulsar_metrics) package. Further demonstration on how these packages are leveraged can found in [pulsar-demo](https://github.com/Rocket-Science-Development/pulsar_demo).
+
+We currently support writing to InfluxDB v2.6.1, support for other technologies is coming
+
+## Main Features
+
+Here are just a few of the things that pandas does well:
+
+- Collect data related to a model's lifecycle in production, i.e, data points, predictions, and metadata
+- Can be used inside a Python inference micro-service or a Jupyter Notebook used to perform predictions
+- Easy and flexible interface that has the ability to integrate with provided support of storage solution as well as the ability to easily integrate with custom storage solutions.
+- Lightweight package to limit the impact on the inference/prediction service performance
+
+## Where to get it
+
+The source code is currently hosted on GitHub at: [https://github.com/Rocket-Science-Development/pulsar_data_collection](https://github.com/Rocket-Science-Development/pulsar_data_collection)
+
+Binary installers for the latest released version are available at the [Python Package Index (PyPI)](https://pypi.org/project/pulsar-data-collection/)
 Install Pulsar Data Collection with pip:
 
-```bash
-python3 -m pip install --upgrade pip
-python3 -m pip install --upgrade pulsar-data-collection
+```sh
+pip install pulsar-data-collection
 ```
-
-### Components
-
-There are two core components in data collection SDK: storage engine and data capture.
-Right now storage engine implemented only for InfluxDb, it helps to make ingestion and digestion operations
-to the database.
-
-#### Data Capture
-
-`DataCapture` class helps to ingest dataset to database with needed parameters and needed format for future
-digestion and metrics calculation without any significant changes of data.
-
-It requires `storage_engine` (available only influxdb right now), `operation_type` (`DATABASE_OPERATION_TYPE_INSERT_PREDICTION`,
-`DATABASE_OPERATION_TYPE_METRICS`),  `login_url` (object of DatabaseLogin class) as input parameters.
-
-Operation type `DATABASE_OPERATION_TYPE_INSERT_PREDICTION` uses for any ingestion operations to the database.
-It requires additional parameters: `model_id`, `model_version`, `data_id`", `y_name`, `pred_name` what describes
-an input dataset.
-For operation type `DATABASE_OPERATION_TYPE_METRICS` what commonly uses for retrieving dataset ready for metrics
-calculation these parameters aren't required.
-
-The last and probably one the most important class to work with is `DataWithPrediction`.
-It requires two parameters as input: `prediction`, `data_points`. Where `prediction` is prediction value of the model,
-and `data_points` is features dataset. `Push` method of the `DataCapture` takes object of `DataWithPrediction` as
-required parameter, and after that makes ingestion operation to database with data transforming, like adding timestamp,
-changing name of prediction column in dataset, combining features with prediction into single dataset, creating
-influxdb unique cache, etc.
-
-List of methods of `DataCapture` class:
-
-- push(data: DataWithPrediction)
-- ingests data to the db after preprocessing it;
-- collect(filters: dict) - retrieves data from db;
-- collect_eval_timestamp - retrieves the newest timestamp in the database;
-- push_eval_timestamp(eval_df: df) - ingesting new one timestamp into db;
-- push_metrics(metrics_df: df) - ingesting metrics dataframe to the database after calculations
 
 ### Example usage
 
-Initialize Database credentials:
-
 ```python
-from pulsar_data_collection.data_capture import DatabaseLogin
-database_login = DatabaseLogin(db_host=<db_host>), db_port=<db_port>, db_user=<db_user>, db_password=<db_password>, protocol=<db_protocol>)
-```
+import pickle as pkl
+from datetime import datetime as dt
+from datetime import timezone
+from pathlib import Path
 
-Initialize DataCapture class, depends on operation type use appropriate constant.
-For inserting data into the database:
+import pandas as pd
 
-```python
-from pulsar_data_collection.data_capture import DataCapture, DATABASE_OPERATION_TYPE_INSERT_PREDICTION
+from pulsar_data_collection.models import DataWithPrediction, PulseParameters
+from pulsar_data_collection.pulse import Pulse
 
-dat_predict = DataWithPrediction(prediction=prediction, data_points=to_predict)
+# init paths
+model_path = Path("path_to_model")
+inference_dataset = pd.read_csv("path_of_data_for_prediction", header=0)
+reference_data = "path_or_location_reference_data_used_to_train_the_model"
 
-dat_capture = DataCapture(
+params = PulseParameters(
+    model_id="model_id",
+    model_version="model_version",
+    data_id="reference_data_id",
+    reference_data_storage=reference_data,
+    target_name="target_feature_name",
     storage_engine="influxdb",
-    model_id=<model_id>,
-    model_version=<model_verstion>,
-    data_id=<data_id>,
-    y_name=<y_name>,
-    pred_name=<pred_name>,
-    operation_type=<operation_type>,
-    login_url=<database_login>,
+    timestamp_column_name="_time",
+    login={
+        "url": "url_influxdb",
+        "token": "mytoken",
+        "org": "pulsarml",
+        "bucket_name": "demo",
+    },
+    other_labels={"timezone": "EST", "reference_dataset": reference_data},
 )
 
-dat_capture.push(dat_predict)
-```
+pulse = Pulse(data=params)
 
-For collecting data from the database:
+pickle_model = pkl.load(open(model_path, "rb"))
+prediction_simple = pickle_model.predict(inference_dataset)
 
-```python
-from pulsar_data_collection.data_capture import DataCapture, DATABASE_OPERATION_TYPE_METRICS
-
-dat_capture = DataCapture(
-    storage_engine="influxdb",
-    operation_type=DATABASE_OPERATION_TYPE_METRICS,
-    login_url=database_login
+time = dt.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+capture_params = DataWithPrediction(
+    data_points=inference_dataset,
+    predictions=pd.DataFrame(prediction_simple, columns=["prediction"]),
+    timestamp=time,
+    features_names=inference_dataset.columns.tolist(),
 )
 
-dat_capture.collect()
+pulse.capture_data(data=capture_params)
 ```
-
-Collection the newest prediction data what wasn't precessed
-
-```python
-# receiving the last period of data
-
-last_eval_timestamp = dat_capture.collect_eval_timestamp()
-
-# if last period exists, collecting only data what wasn't collected previously
-if last_eval_timestamp:
-    last_eval_timestamp_str = last_eval_timestamp.strftime('%Y-%m-%d %H:%M:%S')
-    db_df = pd.DataFrame(dat_capture.collect({"time": f">= '{last_eval_timestamp_str}'"}).get("prediction"))
-else:
-    db_df = pd.DataFrame(dat_capture.collect().get("prediction"))
-```
-
-Example of pushing calculated metrics:
-
-```python
-dat_capture.push_metrics(df_result_drift)
-```
-
-Example of pushing the timestamp when metrics were calculated:
-
-```python
-dat_capture.push_eval_timestamp(eval_timestamp_df)
-```
-TODO: add use cases of input dataframes: metrics, prediction, datapoint
 
 ## About [PulsarML](https://pulsar.ml/)
 
@@ -128,7 +90,8 @@ PulsarML is a project helping with monitoring your models and gain powerful insi
 
 We released two Open Source packages :
 
-- [pulsar-data-collection](https://github.com/Rocket-Science-Development/pulsar_data_collection) :  lightweight python SDK enabling data collection of features, predictions and metadata from an ML model serving code/micro-service
+- [pulsar-data-collection](https://github.com/Rocket-Science-Development/pulsar_data_collection) :  lightweight python package enabling data collection of features, predictions and metadata from an ML model serving code/micro-service
+
 - [pulsar-metrics](https://github.com/Rocket-Science-Development/pulsar_metrics) : library for evaluating and monitoring data and concept drift with an extensive set of metrics. It also offers the possibility to use custom metrics defined by the user.
 
 We also created [pulsar demo](https://github.com/Rocket-Science-Development/pulsar_demo) to display an example use-case showing how to leverage both packages to implement model monitoring and performance management.
@@ -137,4 +100,4 @@ Want to interact with the community? join our [slack channel](https://pulsarml.s
 
 Powered by [Rocket Science Development](https://rocketscience.one/)
 
-TODO: add use cases of input dataframes: metrics, prediction, datapoint
+

@@ -155,39 +155,3 @@ class TestInfluxDBIntegration:
 
         assert data_frame is not None
         assert isinstance(data_frame, pd.DataFrame)
-
-    # def test_write_data_returns_pandas_dataframe(self, storage_engine, db_login):
-
-    #     # get dataframe to write
-    #     test_data = pd.read_csv("data/split/test_data_no_class.csv", header=0).copy()
-    #     test_data.loc[:, "_time"] = pd.date_range(start=now, periods=test_data.shape[0], freq="L", inclusive="left", tz="UTC")
-    #     test_data.loc[:, "model_id"] = "test_id"
-    #     test_data.loc[:, "model_version"] = "test_version"
-    #     test_data.loc[:, "data_id"] = "test_data_id"
-    #     test_data.set_index("_time")
-
-    #     # Create connections
-    #     influxdb = storage_engine.get_database_actions()
-    #     db_connection = influxdb.make_connection(**db_login)
-
-    #     params = {
-    #         "client": db_connection,
-    #         "bucket_name": "demo",
-    #         "data_points": test_data,
-    #         "data_frame_measurement_name": "test_write_data",
-    #         "data_frame_timestamp_column": "_time",
-    #         "data_frame_tag_columns": [],
-    #     }
-    #     query2 = f"""
-    #     from(bucket: "demo")
-    #     |> range(start: {test_data.loc[0, "_time"].isoformat()})
-    #     |> filter(fn: (r) => r["_measurement"] == "test_write_data")
-    #     |> group(columns: ["_field"])
-    #     |> pivot(rowKey:["_time"], columnKey: ["_field"], valueColumn: "_value")
-    #     """
-    #     influxdb.write_data(**params)
-    #     db_connection = influxdb.make_connection(**db_login)
-    #     query_api = db_connection.query_api()
-    #     data_frame = query_api.query_data_frame(query=query2)
-
-    #     assert isinstance(data_frame, pd.DataFrame)

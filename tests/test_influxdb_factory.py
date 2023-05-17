@@ -154,41 +154,6 @@ class TestInfluxDBIntegration:
         data_frame = query_api.query_data_frame(query=query2)
 
         assert data_frame is not None
-
-    def test_write_data_returns_pandas_dataframe(self, storage_engine, db_login):
-        # get dataframe to write
-        test_data = pd.read_csv("tests/data/split/test_data_no_class.csv", header=0).copy()
-
-        # Create connections
-        influxdb = storage_engine.get_database_actions()
-        db_connection = influxdb.make_connection(**db_login)
-
-        other_labels = {"environment": "test", "tag": "whatever"}
-        default_tags = {"model_id": "test_id", "model_version": "test_version", "data_id": "test_data_id", **other_labels}
-
-        params = {
-            "client": db_connection,
-            "bucket_name": "demo",
-            "data_points": test_data,
-            "data_frame_measurement_name": "test_write_data",
-            "data_frame_timestamp_column": "_time",
-            "data_frame_tag_columns": [],
-            "default_tags": default_tags,
-            "timestamp": now,
-            "timezone": "EST",
-        }
-        query2 = f"""
-        from(bucket: "demo")
-        |> range(start: {pd.Timestamp(now,tz="UTC").isoformat()})
-        |> filter(fn: (r) => r["_measurement"] == "test_write_data")
-        |> group(columns: ["_field"])
-        |> pivot(rowKey:["_time"], columnKey: ["_field", "tag"], valueColumn: "_value")
-        """
-        influxdb.write_data(**params)
-        db_connection = influxdb.make_connection(**db_login)
-        query_api = db_connection.query_api()
-        data_frame = query_api.query_data_frame(query=query2)
-
         assert isinstance(data_frame, pd.DataFrame)
 
     # def test_write_data_returns_pandas_dataframe(self, storage_engine, db_login):

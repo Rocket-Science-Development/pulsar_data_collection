@@ -37,7 +37,7 @@ class InfluxdbActions(DatabaseActions):
         ):
             return InfluxDBClient(url=kwargs["url"], token=kwargs["token"], org=kwargs["org"])
 
-    def param_dict(self, **kwargs):
+    def create_param_dict(self, **kwargs):
         """Create parameter dictionary containing all required information to write to an influx Database
         Parameters
         ----------
@@ -46,35 +46,35 @@ class InfluxdbActions(DatabaseActions):
         model_id: str
         model_version: str
         data_id: str
-        other_label: Dict
+        additional_tags: Optional[Dict]
 
         """
 
         tags = {"model_id": kwargs["model_id"], "model_version": kwargs["model_version"], "data_id": kwargs["data_id"]}
-        if kwargs["other_labels"]:
-            tags = {**tags, **kwargs["other_labels"]}
+        if kwargs["additional_tags"]:
+            tags.update(**kwargs["additional_tags"])
         return {
             "client": kwargs["client"],
             "bucket_name": kwargs["login"]["bucket_name"],
             "data_frame_measurement_name": f"{kwargs['model_id']}_{kwargs['model_version']}_input_data",
             "data_frame_timestamp_column": kwargs["timestamp_column_name"],
-            "default_tags": tags,
+            "tags": tags,
         }
 
     def write_data(self, **kwargs):
         """Write data to the database
         Parameters
         ----------
-        client: InfluxDBClient
-        bucket_name: str
+        kwargs:
+            client: InfluxDBClient
+            bucket_name: str
+            data_frame_measurement_name: str
+            data_frame_timestamp_column: str
+            tags: Dict[str, str]
+            prediction: pd.DataFrame
+            data_points: pd.DataFrame
+            timestamp: datetime
 
-        data_frame_measurement_name: str
-        data_frame_timestamp_column: str
-        default_tags: Dict[str, str]
-        prediction: pd.DataFrame
-        data_points: pd.DataFrame
-        timestamp: datetime
-        timezone: str
         """
         db_client = kwargs["client"]
 
@@ -93,7 +93,7 @@ class InfluxdbActions(DatabaseActions):
         with db_client as client:
             callback = BatchingCallback()
             point_settings = PointSettings()
-            for key, value in kwargs["default_tags"].items():
+            for key, value in kwargs["tags"].items():
                 point_settings.add_default_tag(key, value)
             with client.write_api(
                 success_callback=callback.success,

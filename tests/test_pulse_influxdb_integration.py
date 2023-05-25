@@ -93,7 +93,7 @@ class TestModels:
                 "org": "pulsarml",
                 "bucket_name": "demo",
             },
-            other_labels={"timezone": "EST", "reference_dataset": reference_data},
+            additional_tags={"timezone": "EST", "reference_dataset": reference_data},
         )
         pulse = Pulse(data=params)
 
@@ -147,7 +147,7 @@ class TestModels:
                 "org": "pulsarml",
                 "bucket_name": "demo",
             },
-            other_labels={"timezone": "EST", "reference_dataset": reference_data},
+            additional_tags={"timezone": "EST", "reference_dataset": reference_data},
         )
 
         pulse = Pulse(data=params)

@@ -84,7 +84,7 @@ class TestInfluxDBIntegration:
             "data_frame_measurement_name": "test_write_data",
             "data_frame_timestamp_column": "_time",
             "data_frame_tag_columns": [],
-            "default_tags": default_tags,
+            "tags": default_tags,
             "timestamp": now,
             "timezone": "EST",
         }
@@ -111,7 +111,7 @@ class TestInfluxDBIntegration:
             "data_frame_measurement_name": "test_write_data",
             "data_frame_timestamp_column": "_time",
             "data_frame_tag_columns": [],
-            "default_tags": default_tags,
+            "tags": default_tags,
             "timestamp": now,
             "timezone": "EST",
         }
@@ -137,7 +137,7 @@ class TestInfluxDBIntegration:
             "data_frame_measurement_name": "test_write_data",
             "data_frame_timestamp_column": "_time",
             "data_frame_tag_columns": [],
-            "default_tags": default_tags,
+            "tags": default_tags,
             "timestamp": now,
             "timezone": "EST",
         }

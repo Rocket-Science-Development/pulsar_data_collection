@@ -32,6 +32,13 @@ repos:
       - id: gitleaks
   - repo: local
     hooks:
+      - id: run-tests
+        name: Runs Tests
+        language: system
+        pass_filenames: false
+        entry: pytest tests/
+  - repo: local
+    hooks:
       - id: export-req
         name: export requirements
         language: system

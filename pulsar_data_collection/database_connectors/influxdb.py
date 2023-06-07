@@ -55,7 +55,7 @@ class InfluxdbActions(DatabaseActions):
             tags.update(**kwargs["additional_tags"])
         return {
             "client": kwargs["client"],
-            "bucket_name": kwargs["login"]["bucket_name"],
+            "bucket_name": kwargs["bucket_name"],
             "data_frame_measurement_name": f"{kwargs['model_id']}_{kwargs['model_version']}_input_data",
             "data_frame_timestamp_column": kwargs["timestamp_column_name"],
             "tags": tags,

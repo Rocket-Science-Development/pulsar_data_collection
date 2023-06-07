@@ -100,6 +100,7 @@ class InfluxdbActions(DatabaseActions):
                 error_callback=callback.error,
                 retry_callback=callback.retry,
                 point_settings=point_settings,
+                api_client=client.api_client  # Added this line to pass the api_client to WriteService
             ) as write_api:
                 write_api.write(
                     bucket=kwargs["bucket_name"],

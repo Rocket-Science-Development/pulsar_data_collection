@@ -2,8 +2,9 @@ import datetime
 from typing import Any, Dict, List, Optional, Union
 
 import pandas as pd
-from config import factories
 from pydantic import BaseModel, validator
+
+from .config import factories
 
 
 class PulseParameters(BaseModel):

@@ -45,3 +45,13 @@ class Pulse:
             }
         )
         self.storage_engine.write_data(**self.params)
+
+    def close(self):
+        """Close the connection to the storage engine"""
+        self.db_connection.close()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.close()

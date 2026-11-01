@@ -1,5 +1,5 @@
-from config import factories
-from models import DataWithPrediction, PulseParameters
+from .config import factories
+from .models import DataWithPrediction, PulseParameters
 
 
 class Pulse:

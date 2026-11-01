@@ -89,7 +89,12 @@ class Pulse:
         """
         if self._closed:
             raise RuntimeError("Pulse is closed")
-        frame = self._unique_times(self.storage_engine.prepare_frame(data.data_points, data.predictions, data.timestamp))
+        data_points, predictions = data.data_points, data.predictions
+        if self.options.pii is not None:
+            # masked here, in the caller's thread: raw values never reach the queue nor the spool directory
+            data_points = self.options.pii.apply(data_points)
+            predictions = self.options.pii.apply(predictions, count=False)
+        frame = self._unique_times(self.storage_engine.prepare_frame(data_points, predictions, data.timestamp))
         if self._writer is None:
             self._write(frame, self._write_params)
         else:

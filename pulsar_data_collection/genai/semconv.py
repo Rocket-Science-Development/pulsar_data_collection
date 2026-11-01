@@ -33,6 +33,8 @@ CF_SET_ID = "pulsar.cf.set_id"  # requests of one set differ only by the probed 
 CF_VARIANT = "pulsar.cf.variant"  # group of the value used in this request, e.g. "fr"
 CF_ATTRIBUTE = "pulsar.cf.attribute"  # probed attribute, e.g. "first_name"
 CF_CONTROL = "pulsar.cf.control"  # "none", "placebo" (irrelevant attribute) or "order_swapped"
+# Personal information (pulsar_data_collection.privacy.PiiSession): counts and types only, never the values
+from ..privacy.attributes import PII_COUNT, PII_ROLES, PII_TYPES  # noqa: E402,F401
 
 # Values of gen_ai.operation.name
 OP_CHAT = "chat"

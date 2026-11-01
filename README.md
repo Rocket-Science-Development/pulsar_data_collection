@@ -26,6 +26,7 @@ Supported storage: **InfluxDB 2.x** (tested with 2.6.1). The storage layer is a 
 - [Non-blocking capture and resilience](#non-blocking-capture-and-resilience)
 - [How data is stored](#how-data-is-stored)
 - [LLM applications and agents (OpenTelemetry GenAI)](#llm-applications-and-agents-opentelemetry-genai)
+- [Personal information](#personal-information)
 - [API reference](#api-reference)
 - [Analyzing the collected data with pulsar-metrics](#analyzing-the-collected-data-with-pulsar-metrics)
 - [Development](#development)
@@ -330,6 +331,66 @@ Bonjour, je m'appelle Mathieu Gagnon (dossier A-1042). Je gagne 47000 $. Suis-je
 placebo-00003   ref_a placebo check_eligibility
      cf-00000   en_ca    none check_eligibility
 placebo-00002   ref_b placebo check_eligibility
+```
+
+## Personal information
+
+`pulsar_data_collection.privacy` detects personal information with **validated rules** (checksums, valid dates,
+issuer prefixes, context words) for Canada, in French and English, and **masks it before anything is written**.
+Findings carry the type, the position and a confidence, never the value.
+
+| Type | Label | Validation |
+|---|---|---|
+| `sin` (social insurance number) | `[SIN]` | 9 digits, Luhn checksum, first digit issued |
+| `ramq` (Québec health insurance number) | `[RAMQ]` | 4 letters + 8 digits, valid month (women: +50) and day |
+| `credit_card` | `[CREDIT_CARD]` | 13–19 digits, Luhn, issuer prefix |
+| `email`, `phone` (North American), `postal_code` (Canada) | `[EMAIL]`, `[PHONE]`, `[POSTAL_CODE]` | format |
+| `drivers_licence_qc`, `passport` (Canada) | `[DRIVERS_LICENCE]`, `[PASSPORT]` | format; a passport needs a context word |
+| `date_of_birth` | `[DATE_OF_BIRTH]` | valid date **and** a context word ("né le", "date of birth"...) |
+
+- **Context**: a word such as "NAS", "téléphone" or "passport" just before raises the confidence; a word announcing a
+  business number ("dossier", "commande", "order", "invoice"...) lowers it below the threshold, and so does a currency
+  right after a number ("514 555 0199 $" is an amount). Findings below `min_confidence` (0.5) are ignored.
+- **Tabular models**: `CaptureOptions(pii=PiiPolicy())` masks the text columns in `capture_data`, in the caller's
+  thread, so raw values never reach the queue, the spool directory or the database; a `pii_count` column counts the
+  findings per row. `PiiPolicy(action="flag")` only counts.
+- **LLM applications and agents**: `PiiSession` scans the text of each role and adds counts and types to the spans:
+  `input` (from the user), `context` (retrieved documents, tool results) and `output` (answers, tool calls). A
+  **leak** is personal information in an output that the user did not provide in the same session. The
+  `agent_run`, `llm_call` and `tool_call` records gain `pii_<role>_count` and `pii_<role>_types` (`input`, `context`,
+  `output`, `leak`), only when a session recorded something. The values given by the user stay in memory for the
+  session only.
+- Measured on a synthetic French and English corpus (fictitious values with valid checksums, plus business numbers
+  that must not be detected): precision and recall of 1.00 for every type. The corpus is ours: real text will have
+  misses and false positives, and names and street addresses are not covered by rules.
+
+```python
+import pandas as pd
+
+from pulsar_data_collection.privacy import PiiDetector, PiiPolicy, PiiSession
+
+detector = PiiDetector()
+text = "Mon NAS est 130 692 544, écrivez à lea@exemple.ca. Dossier 450123456."
+print([(f.type, f.start, f.end, f.confidence) for f in detector.scan(text)])  # positions, never the values
+print(detector.mask(text))
+
+# Tabular models: masked before the rows are queued, spooled or written
+policy = PiiPolicy()  # CaptureOptions(pii=PiiPolicy()) applies it in Pulse.capture_data
+print(policy.apply(pd.DataFrame({"comment": ["Joignez-moi au 514-555-0199", "RAS"], "income": [32000, 41000]})))
+
+# Agents: counts and leaks by role, on the spans
+with PiiSession() as session:
+    session.scan("input", "Je suis lea@exemple.ca")
+    print(session.scan("output", "Je réponds à lea@exemple.ca. Votre voisin : 418 555 0142.").leaks)
+```
+
+```
+[('sin', 12, 23, 0.99), ('email', 35, 49, 0.95)]
+Mon NAS est [SIN], écrivez à [EMAIL]. Dossier 450123456.
+                  comment  income  pii_count
+0  Joignez-moi au [PHONE]   32000          1
+1                     RAS   41000          0
+[Finding(type='phone', start=44, end=56, confidence=0.6)]
 ```
 
 ## API reference

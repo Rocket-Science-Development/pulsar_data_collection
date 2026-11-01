@@ -3,6 +3,23 @@
 All notable changes to pulsar-data-collection. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.7.0] - 2026-11-01
+
+### Added
+- `pulsar_data_collection.privacy`: detection and masking of personal information with validated rules for Canada,
+  in French and English: social insurance number (Luhn), Québec health insurance number (RAMQ), credit card (Luhn,
+  issuer prefix), e-mail, North American phone, Canadian postal code, Québec driver's licence, Canadian passport,
+  date of birth. Context words raise or lower the confidence; findings never carry the value.
+- `CaptureOptions(pii=PiiPolicy())`: personal information masked (or only counted) in the text columns before the
+  rows are queued, spooled or written, with a `pii_count` column.
+- `PiiSession`: personal information by role (input, context, output) on the spans of LLM applications and agents,
+  and leaks (personal information in an output that the user did not provide). New fields `pii_<role>_count` and
+  `pii_<role>_types` in the `agent_run`, `llm_call` and `tool_call` records.
+
+### Fixed
+- Integration tests: the Flux queries give an explicit stop, so a server clock slightly behind no longer gives an
+  empty range (intermittent failure).
+
 ## [0.6.0] - 2026-11-01
 
 ### Added

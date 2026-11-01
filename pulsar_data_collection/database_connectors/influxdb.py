@@ -78,40 +78,41 @@ class InfluxdbActions(DatabaseActions):
         """
         db_client = kwargs["client"]
 
-        data = kwargs["data_points"]
+        # Work on a new frame: the caller's data_points must not be modified
         if "prediction" in kwargs.keys():
-            data = pd.concat(objs=[data, kwargs["prediction"]], copy=False, axis=1)
+            data = pd.concat(objs=[kwargs["data_points"], kwargs["prediction"]], axis=1)
+        else:
+            data = kwargs["data_points"].copy()
 
-        data.loc[:, "_time"] = pd.date_range(
+        data["_time"] = pd.date_range(
             start=kwargs["timestamp"],
-            periods=kwargs["data_points"].shape[0],
+            periods=data.shape[0],
             freq="ms",
             inclusive="left",
         )
-        data.set_index("_time")
 
-        with db_client as client:
-            callback = BatchingCallback()
-            point_settings = PointSettings()
-            for key, value in kwargs["tags"].items():
-                point_settings.add_default_tag(key, value)
-            with client.write_api(
-                success_callback=callback.success,
-                error_callback=callback.error,
-                retry_callback=callback.retry,
-                point_settings=point_settings,
-            ) as write_api:
-                write_api.write(
-                    bucket=kwargs["bucket_name"],
-                    record=data,
-                    data_frame_measurement_name=kwargs["data_frame_measurement_name"],
-                    data_frame_timestamp_column=kwargs["data_frame_timestamp_column"],
-                )
+        # The client stays open: it belongs to the caller (Pulse) and is reused for every capture
+        callback = BatchingCallback()
+        point_settings = PointSettings()
+        for key, value in kwargs["tags"].items():
+            point_settings.add_default_tag(key, value)
+        with db_client.write_api(
+            success_callback=callback.success,
+            error_callback=callback.error,
+            retry_callback=callback.retry,
+            point_settings=point_settings,
+        ) as write_api:
+            write_api.write(
+                bucket=kwargs["bucket_name"],
+                record=data,
+                data_frame_measurement_name=kwargs["data_frame_measurement_name"],
+                data_frame_timestamp_column=kwargs["data_frame_timestamp_column"],
+            )
 
     def _check_if_bucket_exists(self, url: str, token: str, org: str, bucket_name: str):
-        connection = InfluxDBClient(url=url, token=token, org=org)
-        if BucketsApi(connection).find_bucket_by_name(bucket_name=bucket_name):
-            return True
+        with InfluxDBClient(url=url, token=token, org=org) as connection:
+            if BucketsApi(connection).find_bucket_by_name(bucket_name=bucket_name):
+                return True
 
 
 class Influxdb(DatabaseActionsFactory):

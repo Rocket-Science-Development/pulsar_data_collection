@@ -1,5 +1,5 @@
 from datetime import datetime as dt
-from datetime import timezone
+from datetime import timedelta, timezone
 from pathlib import Path
 
 import pandas as pd
@@ -184,3 +184,47 @@ class TestModels:
         assert prediction_simple["prediction"] in data_frame["prediction"].values
         assert prediction_proba["proba_class_0"] in data_frame["proba_class_0"].values
         assert prediction_proba["proba_class_1"] in data_frame["proba_class_1"].values
+
+    def test_Pulse_captures_several_times_with_the_same_instance(self, docker_ip, kidney_model):
+        inference_dataset = pd.read_csv("tests/data/split/test_data_no_class.csv", header=0)
+        original = inference_dataset.copy()
+        params = PulseParameters(
+            model_id="several_captures",
+            model_version="0.1",
+            data_id="several_captures_data",
+            reference_data_storage="/data/raw/csv_result-chronic_kidney_disease.csv",
+            target_name="class",
+            storage_engine="influxdb",
+            timestamp_column_name="_time",
+            login={
+                "url": f"http://{docker_ip}:8086/",
+                "token": "mytoken",
+                "org": "pulsarml",
+                "bucket_name": "demo",
+            },
+        )
+        # Past timestamps: a Flux range() stops at now() by default
+        start = (dt.now(timezone.utc) - timedelta(minutes=1)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        with Pulse(data=params) as pulse:
+            for second in range(3):
+                pulse.capture_data(
+                    data=DataWithPrediction(
+                        data_points=inference_dataset,
+                        predictions=pd.DataFrame(kidney_model.predict(inference_dataset), columns=["prediction"]),
+                        timestamp=dt.fromisoformat(start) + timedelta(seconds=second),
+                        features_names=inference_dataset.columns.tolist(),
+                    )
+                )
+            # capture_data must not modify the caller's data points
+            pd.testing.assert_frame_equal(inference_dataset, original)
+
+        query = f"""
+        from(bucket: "demo")
+        |> range(start: {start})
+        |> filter(fn: (r) => r["_measurement"] == "{params.model_id}_{params.model_version}_input_data")
+        |> pivot(rowKey:["_time"], columnKey: ["_field"], valueColumn: "_value")
+        """
+        with InfluxDBClient(url=params.login["url"], token="mytoken", org="pulsarml") as client:
+            data_frame = client.query_api().query_data_frame(query=query)
+
+        assert len(data_frame) == 3 * len(inference_dataset)

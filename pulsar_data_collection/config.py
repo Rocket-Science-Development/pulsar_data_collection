@@ -1,3 +1,3 @@
-import database_connectors.influxdb as influxdb
+from .database_connectors import influxdb
 
 factories = {"influxdb": influxdb.Influxdb()}

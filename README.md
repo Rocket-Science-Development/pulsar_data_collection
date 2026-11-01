@@ -27,10 +27,23 @@ Here are just a few of the things that pandas does well:
 The source code is currently hosted on GitHub at: [https://github.com/Rocket-Science-Development/pulsar_data_collection](https://github.com/Rocket-Science-Development/pulsar_data_collection)
 
 Binary installers for the latest released version are available at the [Python Package Index (PyPI)](https://pypi.org/project/pulsar-data-collection/)
-Install Pulsar Data Collection with pip:
+Install Pulsar Data Collection with pip (Python 3.12 or later):
 
 ```sh
-pip install pulsar-data-collection
+pip install "pulsar-data-collection @ git+https://github.com/Rocket-Science-Development/pulsar_data_collection.git"
+```
+
+The PyPI release (0.1.1) predates the current API and requires Python 3.9.
+
+### Development
+
+The project uses [uv](https://docs.astral.sh/uv/) and a standard PEP 621 `pyproject.toml`.
+Integration tests start InfluxDB 2.6 with Docker: copy `tests/db/influxdb/.env.example` to `tests/db/influxdb/.env` first.
+
+```sh
+uv sync                 # creates .venv with runtime and dev dependencies
+uv run pytest           # requires a running Docker engine
+uv run ruff check . && uv run black --check .
 ```
 
 ### Example usage

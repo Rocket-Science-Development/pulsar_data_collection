@@ -1,82 +1,61 @@
-[tool.poetry]
+[project]
 name = "pulsar-data-collection"
-version = "0.2.0rc"
+version = "0.2.0"
 description = "sdk enabling data collection from model serving code for our MPM solution"
-authors = [
-    "Pulsar team <pulsar@data-rs.io>"
-    ]
+authors = [{ name = "Pulsar team", email = "pulsar@data-rs.io" }]
 readme = "README.md"
-homepage = "https://github.com/Rocket-Science-Development/pulsar_data_collection"
-license = "Apache-2.0"
+license = { text = "Apache-2.0" }
+requires-python = ">=3.12"
+dependencies = [
+  "influxdb-client[async]>=1.45",
+  "pandas>=2.2,<3",
+  "pydantic>=2.7,<3",
+]
 
-[tool.poetry.dependencies]
-python = "^3.9"
-pandas = "^1.4.2"
-influxdb-client = {extras = ["async"], version = "^1.36.1"}
-pydantic = "^1.6.2"
+[project.urls]
+Homepage = "https://github.com/Rocket-Science-Development/pulsar_data_collection"
 
-[tool.poetry.group.dev.dependencies]
-black = "^22.3.0"
-isort = "^5.10.1"
-pre-commit = "^2.19.0"
-pytest = "^7.1.2"
-scikit-learn = "^1.1.1"
-flake8 = "^6.0.0"
-flake8-pyproject = "^1.2.1"
-pylint = "^2.15.10"
-mypy = "^0.991"
-bandit = "^1.7.4"
-pytest-mock = "^3.10.0"
-pytest-docker = "^1.0.1"
-python-dotenv = "^1.0.0"
+[dependency-groups]
+dev = [
+  "bandit>=1.8",
+  "black>=24.10",
+  "pre-commit>=4.0",
+  "pytest>=8.3",
+  "pytest-cov>=6.0",
+  "pytest-docker>=3.1",
+  "pytest-mock>=3.14",
+  "ruff>=0.8",
+  "scikit-learn>=1.5",
+]
 
+[build-system]
+requires = ["hatchling>=1.25"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["pulsar_data_collection"]
 
 [tool.black]
 line-length = 130
-target-version = ['py36', 'py37', 'py38', 'py39']
-include = '\.pyi?$'
-extend-exclude = '''
-/(
-      \.eggs         # exclude a few common directories in the
-    | \.git          # root of the project
-    | \.hg
-    | \.mypy_cache
-    | \.tox
-    | \.venv
-    | _build
-    | buck-out
-    | build
-    | dist
-)/
-'''
+target-version = ["py312"]
 
-[tool.isort]
-profile = "black"
+[tool.ruff]
+line-length = 130
+target-version = "py312"
+extend-exclude = ["*.ipynb"]
 
-[tool.flake8]
-ignore = ['E231', 'E241']
-per-file-ignores = [
-    '__init__.py:F401',
-]
-max-line-length = 130
-count = true
+[tool.ruff.lint]
+select = ["E", "F", "I"]
+ignore = ["E231", "E241"]
+
+[tool.ruff.lint.per-file-ignores]
+"__init__.py" = ["F401"]
 
 [tool.bandit]
 targets = ["pulsar_data_collection"]
 exclude_dirs = ["tests"]
 
-[tool.mypy]
-plugins = [ "pydantic.mypy",]
-
-[tool.pydantic-mypy]
-init_forbid_extra = true
-init_typed = true
-warn_required_dynamic_aliases = true
-warn_untyped_fields = true
-
 [tool.pytest.ini_options]
-pythonpath = [".", "pulsar_data_collection", "tests"]
-
-[build-system]
-requires = ["poetry-core>=1.0.0"]
-build-backend = "poetry.core.masonry.api"
+pythonpath = ["."]
+testpaths = ["tests"]
+filterwarnings = ["error::FutureWarning", "error::pydantic.warnings.PydanticDeprecatedSince20"]

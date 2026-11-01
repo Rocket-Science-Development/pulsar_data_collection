@@ -2,8 +2,9 @@ import datetime
 from typing import Any, Dict, List, Optional, Union
 
 import pandas as pd
-from config import factories
-from pydantic import BaseModel, validator
+from pydantic import BaseModel, ConfigDict, field_validator
+
+from .config import factories
 
 
 class PulseParameters(BaseModel):
@@ -26,7 +27,7 @@ class PulseParameters(BaseModel):
     Storage engine used to store collected logs
     login: Dict[str, Union[str, int, bool]]
     Dictionary containing the element required to perform successful login to storage engine
-    features_metadata: Optional[Dict[str, type]]  # key: feature_name, value : feature type
+    features_metadata: Optional[Dict[str, type]] = None  # key: feature_name, value : feature type
     Dictionary containing the schema of features used for the model prediction
     other_labels: Optional[Dict[str, Union[str, int, bool]]] = None
     Dictionary of additional labels used provide more metadata regarding the context surrounding the model
@@ -42,11 +43,12 @@ class PulseParameters(BaseModel):
     target_name: str
     storage_engine: str
     login: Dict[str, Union[str, int, bool]]
-    features_metadata: Optional[Dict[str, type]]  # key: feature_name, value : feature type
+    features_metadata: Optional[Dict[str, type]] = None  # key: feature_name, value : feature type
     additional_tags: Optional[Dict[str, Union[str, int, bool]]] = None
     timestamp_column_name: str = "timestamp"
 
-    @validator("storage_engine")
+    @field_validator("storage_engine")
+    @classmethod
     def check_storage_engine(cls, value):
         if value not in factories:
             raise ValueError(f"Storage Engine for {value} not supported")
@@ -60,7 +62,7 @@ class DataWithPrediction(BaseModel):
     Attributes
     ----------
 
-    prediction_id: Optional[str]
+    prediction_id: Optional[str] = None
     Identifier of prediction
     timestamp: datetime.datetime = datetime.datetime.now()
     timestamp of when the prediction have been performed
@@ -73,10 +75,9 @@ class DataWithPrediction(BaseModel):
 
     """
 
-    class Config:
-        arbitrary_types_allowed = True
+    model_config = ConfigDict(arbitrary_types_allowed=True)
 
-    prediction_id: Optional[str]
+    prediction_id: Optional[str] = None
     timestamp: datetime.datetime
     predictions: Any
     data_points: pd.DataFrame

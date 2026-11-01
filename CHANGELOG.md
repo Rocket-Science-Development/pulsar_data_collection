@@ -3,6 +3,20 @@
 All notable changes to pulsar-data-collection. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.3.0] - 2026-11-01
+
+### Changed
+- **Unknown fields are rejected** by `PulseParameters` and `DataWithPrediction` (pydantic `extra="forbid"`): a misspelt
+  field such as `other_labels` (instead of `additional_tags`) raised no error and its content was lost (#20).
+- **The storage configuration is checked when `Pulse` is created**: an unknown bucket, an unknown organization or a
+  rejected token raises `StorageConfigurationError` (new, in `pulsar_data_collection.exceptions`, subclass of
+  `ValueError`) with the reason given by InfluxDB. Previously an unknown bucket gave a `None` connection and the error
+  only appeared at the first capture; an unknown organization was not detected; a rejected token raised a raw
+  `ApiException` (#20).
+
+### Fixed
+- `test_make_connection_fails` passed even when no exception was raised (#20).
+
 ## [0.2.1] - 2026-11-01
 
 ### Fixed

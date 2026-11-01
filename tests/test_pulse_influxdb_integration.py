@@ -7,6 +7,7 @@ import pytest
 from influxdb_client import InfluxDBClient
 
 from pulsar_data_collection.config import factories
+from pulsar_data_collection.exceptions import StorageConfigurationError
 from pulsar_data_collection.models import DataWithPrediction, PulseParameters
 from pulsar_data_collection.pulse import Pulse
 
@@ -228,3 +229,17 @@ class TestModels:
             data_frame = client.query_api().query_data_frame(query=query)
 
         assert len(data_frame) == 3 * len(inference_dataset)
+
+    def test_Pulse_fails_at_creation_when_the_bucket_does_not_exist(self, docker_ip):
+        params = PulseParameters(
+            model_id="m",
+            model_version="1",
+            data_id="d",
+            reference_data_storage="ref.csv",
+            target_name="class",
+            storage_engine="influxdb",
+            timestamp_column_name="_time",
+            login={"url": f"http://{docker_ip}:8086/", "token": "mytoken", "org": "pulsarml", "bucket_name": "no_such_bucket"},
+        )
+        with pytest.raises(StorageConfigurationError, match="no_such_bucket"):
+            Pulse(data=params)

@@ -1,10 +1,13 @@
+import json
 from typing import Tuple
 
 import pandas as pd
 from influxdb_client import BucketsApi, InfluxDBClient
 from influxdb_client.client.exceptions import InfluxDBError
 from influxdb_client.client.write_api import PointSettings
+from influxdb_client.rest import ApiException
 
+from ..exceptions import StorageConfigurationError
 from .database_actions import DatabaseActions, DatabaseActionsFactory
 
 
@@ -31,11 +34,16 @@ class InfluxdbActions(DatabaseActions):
         token: str
         org: str
         bucket_name: str
+
+        Raises
+        ------
+        StorageConfigurationError
+            if the bucket or the organization does not exist, or the token is rejected
         """
-        if self._check_if_bucket_exists(
+        self._check_if_bucket_exists(
             url=kwargs["url"], token=kwargs["token"], org=kwargs["org"], bucket_name=kwargs["bucket_name"]
-        ):
-            return InfluxDBClient(url=kwargs["url"], token=kwargs["token"], org=kwargs["org"])
+        )
+        return InfluxDBClient(url=kwargs["url"], token=kwargs["token"], org=kwargs["org"])
 
     def create_param_dict(self, **kwargs):
         """Create parameter dictionary containing all required information to write to an influx Database
@@ -109,10 +117,32 @@ class InfluxdbActions(DatabaseActions):
                 data_frame_timestamp_column=kwargs["data_frame_timestamp_column"],
             )
 
-    def _check_if_bucket_exists(self, url: str, token: str, org: str, bucket_name: str):
+    def _check_if_bucket_exists(self, url: str, token: str, org: str, bucket_name: str) -> bool:
+        """Check that the bucket exists in the organization and that the token can access it
+
+        Raises
+        ------
+        StorageConfigurationError
+            with the reason given by InfluxDB (unknown bucket, unknown organization, unauthorized token)
+        """
         with InfluxDBClient(url=url, token=token, org=org) as connection:
-            if BucketsApi(connection).find_bucket_by_name(bucket_name=bucket_name):
-                return True
+            try:
+                buckets = BucketsApi(connection).find_buckets(name=bucket_name, org=org).buckets
+            except ApiException as e:
+                raise StorageConfigurationError(
+                    f"InfluxDB at {url} rejected org '{org}' / bucket '{bucket_name}': {e.status} {_api_error_message(e)}"
+                ) from e
+        if not buckets:
+            raise StorageConfigurationError(f"Bucket '{bucket_name}' not found in organization '{org}' at {url}")
+        return True
+
+
+def _api_error_message(error: ApiException) -> str:
+    """Message returned by the InfluxDB API, or the HTTP reason"""
+    try:
+        return json.loads(error.body).get("message") or error.reason
+    except (TypeError, ValueError, AttributeError):
+        return str(error.reason)
 
 
 class Influxdb(DatabaseActionsFactory):

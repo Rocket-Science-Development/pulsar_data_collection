@@ -1,6 +1,6 @@
 [project]
 name = "pulsar-data-collection"
-version = "0.4.0"
+version = "0.5.0"
 description = "sdk enabling data collection from model serving code for our MPM solution"
 authors = [{ name = "Pulsar team", email = "pulsar@data-rs.io" }]
 readme = "README.md"
@@ -15,10 +15,16 @@ dependencies = [
 [project.urls]
 Homepage = "https://github.com/Rocket-Science-Development/pulsar_data_collection"
 
+[project.optional-dependencies]
+genai = [
+    "opentelemetry-sdk>=1.30",
+]
+
 [dependency-groups]
 dev = [
   "bandit>=1.8",
   "black>=24.10",
+  "opentelemetry-sdk>=1.30",
   "pre-commit>=4.0",
   "pytest>=8.3",
   "pytest-cov>=6.0",

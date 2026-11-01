@@ -1,5 +1,8 @@
 import logging
+import threading
 from typing import Optional
+
+import pandas as pd
 
 from .config import factories
 from .exceptions import StorageUnavailableError
@@ -61,6 +64,8 @@ class Pulse:
 
         self._writer = None
         self._closed = False
+        self._last_time = None
+        self._time_lock = threading.Lock()
         if self.options.mode == "background":
             self._writer = BackgroundWriter(
                 write=self._write,
@@ -84,11 +89,27 @@ class Pulse:
         """
         if self._closed:
             raise RuntimeError("Pulse is closed")
-        frame = self.storage_engine.prepare_frame(data.data_points, data.predictions, data.timestamp)
+        frame = self._unique_times(self.storage_engine.prepare_frame(data.data_points, data.predictions, data.timestamp))
         if self._writer is None:
             self._write(frame, self._write_params)
         else:
             self._writer.submit(frame)
+
+    def _unique_times(self, frame):
+        """Shift a batch so that its timestamps follow the previous batch of this Pulse
+
+        InfluxDB keeps one point per (measurement, tags, timestamp): two captures with the same timestamp would overwrite
+        each other. System clocks are coarse (15.6 ms on Windows) and concurrent requests share timestamps, so each Pulse
+        keeps its timestamps strictly increasing; a batch starting at or before the previous one is moved just after it.
+        """
+        if frame.empty or "_time" not in frame:
+            return frame
+        with self._time_lock:
+            first = frame["_time"].iloc[0]
+            if self._last_time is not None and first <= self._last_time:
+                frame["_time"] = frame["_time"] + (self._last_time - first + pd.Timedelta(1, "ns"))
+            self._last_time = frame["_time"].iloc[-1]
+        return frame
 
     def flush(self, timeout_s: float = 30.0) -> bool:
         """Wait until the queued rows are written, spooled or dropped (background mode); True if done in time"""

@@ -240,3 +240,39 @@ def test_spool_round_trip_keeps_types_and_nanoseconds():
     back, back_meta = frame_from_json(frame_to_json(frame, meta))
     pd.testing.assert_frame_equal(back, frame)
     assert back_meta == meta
+
+
+def test_captures_with_the_same_timestamp_never_overwrite_each_other(fake):
+    # InfluxDB keeps one point per (measurement, tags, timestamp): equal timestamps would silently lose rows
+    with Pulse(PARAMS, CaptureOptions(mode="sync")) as pulse:
+        for _ in range(3):
+            pulse.capture_data(
+                DataWithPrediction(
+                    data_points=pd.DataFrame({"x": [1.0, 2.0]}),
+                    predictions=None,
+                    timestamp=START,  # identical, as with a coarse clock or concurrent requests
+                    features_names=["x"],
+                )
+            )
+    times = fake.written()["_time"]
+    assert times.is_unique and times.is_monotonic_increasing and len(times) == 6
+    assert times.iloc[0] == pd.Timestamp(START)
+
+
+def test_concurrent_captures_keep_unique_timestamps(fake):
+    with Pulse(PARAMS, fast_options()) as pulse:
+
+        def worker():
+            for _ in range(50):
+                pulse.capture_data(
+                    DataWithPrediction(
+                        data_points=pd.DataFrame({"x": [1.0]}), predictions=None, timestamp=START, features_names=["x"]
+                    )
+                )
+
+        threads = [threading.Thread(target=worker) for _ in range(4)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+    assert len(fake.written()) == 200 and fake.written()["_time"].is_unique

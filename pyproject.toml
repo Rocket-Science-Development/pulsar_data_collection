@@ -1,6 +1,6 @@
 [project]
 name = "pulsar-data-collection"
-version = "0.5.0"
+version = "0.5.1"
 description = "sdk enabling data collection from model serving code for our MPM solution"
 authors = [{ name = "Pulsar team", email = "pulsar@data-rs.io" }]
 readme = "README.md"
@@ -8,7 +8,7 @@ license = { text = "Apache-2.0" }
 requires-python = ">=3.12"
 dependencies = [
   "influxdb-client[async]>=1.45",
-  "pandas>=2.2,<3",
+  "pandas>=2.2,<4",
   "pydantic>=2.7,<3",
 ]
 

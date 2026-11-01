@@ -47,8 +47,9 @@ docker run -d --name influxdb -p 8086:8086 \
   influxdb:2.6.1
 ```
 
-The bucket must exist before collecting. Keep the token out of the code: the example reads it from environment
-variables.
+The bucket must exist before collecting: `Pulse(...)` checks it and raises `StorageConfigurationError` if the bucket
+or the organization does not exist or if the token is rejected. Keep the token out of the code: the example reads it
+from environment variables.
 
 ### 2. Collect predictions
 
@@ -165,7 +166,8 @@ Consequences:
 | `features_metadata` | `dict`, optional | Feature name to type |
 | `timestamp_column_name` | `str` | Name of the timestamp column; use `"_time"` for InfluxDB |
 
-Unknown fields are ignored by pydantic: check field names (for example `additional_tags`, not `other_labels`).
+Unknown fields are rejected with a pydantic `ValidationError`, so that a misspelt field is not silently lost (for
+example `other_labels` instead of `additional_tags`). The same applies to `DataWithPrediction`.
 
 ### `DataWithPrediction`
 
@@ -181,7 +183,7 @@ Unknown fields are ignored by pydantic: check field names (for example `addition
 
 | Method | Description |
 |---|---|
-| `Pulse(data: PulseParameters)` | Opens the connection to the storage engine |
+| `Pulse(data: PulseParameters)` | Checks the configuration and opens the connection; raises `StorageConfigurationError` (from `pulsar_data_collection.exceptions`) for an unknown bucket or organization, or a rejected token |
 | `capture_data(data: DataWithPrediction)` | Writes one batch; can be called any number of times; the caller's DataFrames are not modified |
 | `close()` | Closes the connection |
 | `with Pulse(...) as pulse:` | Closes the connection when leaving the block |

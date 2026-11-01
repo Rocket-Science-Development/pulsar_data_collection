@@ -4,9 +4,9 @@ from pathlib import Path
 import pandas as pd
 import pytest
 from influxdb_client import InfluxDBClient
-from influxdb_client.rest import ApiException
 
 from pulsar_data_collection.config import factories
+from pulsar_data_collection.exceptions import StorageConfigurationError
 
 now = datetime.now().isoformat()
 
@@ -168,12 +168,16 @@ class TestInfluxDBIntegration:
         assert data_frame is not None
         assert isinstance(data_frame, pd.DataFrame)
 
-    def test_make_connection_fails(self, storage_engine, wrong_db_login, capsys):
-        # get dataframe to write
+    def test_make_connection_fails(self, storage_engine, wrong_db_login):
         influxdb = storage_engine.get_database_actions()
+        with pytest.raises(StorageConfigurationError, match="401"):
+            influxdb.make_connection(**wrong_db_login)
 
-        try:
-            db_connection = influxdb.make_connection(**wrong_db_login)
-            db_connection
-        except ApiException:
-            assert True
+    @pytest.mark.parametrize(
+        "override, message",
+        [({"bucket_name": "missing_bucket"}, "missing_bucket"), ({"org": "missing_org"}, "missing_org")],
+    )
+    def test_make_connection_fails_on_unknown_bucket_or_org(self, storage_engine, right_db_login, override, message):
+        influxdb = storage_engine.get_database_actions()
+        with pytest.raises(StorageConfigurationError, match=message):
+            influxdb.make_connection(**{**right_db_login, **override})

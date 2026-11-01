@@ -36,6 +36,9 @@ class PulseParameters(BaseModel):
 
     """
 
+    # Unknown fields are rejected: a misspelt field (e.g. other_labels instead of additional_tags) must not be lost
+    model_config = ConfigDict(extra="forbid")
+
     model_id: str
     model_version: str
     data_id: str
@@ -75,7 +78,7 @@ class DataWithPrediction(BaseModel):
 
     """
 
-    model_config = ConfigDict(arbitrary_types_allowed=True)
+    model_config = ConfigDict(arbitrary_types_allowed=True, extra="forbid")
 
     prediction_id: Optional[str] = None
     timestamp: datetime.datetime

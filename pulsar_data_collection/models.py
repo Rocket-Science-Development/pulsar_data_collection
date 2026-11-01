@@ -6,6 +6,7 @@ import pandas as pd
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from .config import factories
+from .privacy import PiiPolicy
 
 
 class PulseParameters(BaseModel):
@@ -114,6 +115,9 @@ class CaptureOptions(BaseModel):
     Raise at creation when the storage engine cannot be reached. By default (background mode) Pulse starts anyway and
     spools or drops until the storage is back. Configuration errors (unknown bucket or organization, rejected token)
     always raise.
+    pii: Optional[PiiPolicy]
+    Personal information in the text columns: masked (or only counted) before the rows are queued, spooled or
+    written. None (default): text is written as captured.
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -126,3 +130,4 @@ class CaptureOptions(BaseModel):
     max_retry_delay_s: float = Field(60.0, gt=0)
     spool_dir: Optional[Path] = None
     strict_startup: bool = False
+    pii: Optional[PiiPolicy] = None

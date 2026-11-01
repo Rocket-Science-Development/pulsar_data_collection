@@ -46,6 +46,22 @@ def _finish_reason(attrs: dict) -> Optional[str]:
     return reasons
 
 
+def _pii_fields(spans: list) -> dict:
+    """pii_<role>_count / pii_<role>_types summed over the spans, only when a PiiSession recorded something"""
+    out = {}
+    for role in sc.PII_ROLES:
+        count_key, types_key = sc.PII_COUNT.format(role=role), sc.PII_TYPES.format(role=role)
+        recorded = [s for s in spans if count_key in s.attributes]
+        if not recorded:
+            continue
+        types = set()
+        for s in recorded:
+            types |= set(filter(None, str(s.attributes.get(types_key, "")).split(",")))
+        out[f"pii_{role}_count"] = sum(int(s.attributes[count_key]) for s in recorded)
+        out[f"pii_{role}_types"] = ",".join(sorted(types)) or "none"
+    return out
+
+
 def llm_call_record(span: SpanView) -> dict:
     a = span.attributes
     return {
@@ -60,6 +76,7 @@ def llm_call_record(span: SpanView) -> dict:
         "error": span.failed,
         "agent_name": a.get(sc.AGENT_NAME),
         "trace_id": format(span.trace_id, "032x"),
+        **_pii_fields([span]),
     }
 
 
@@ -73,6 +90,7 @@ def tool_call_record(span: SpanView, allowed_tools: Optional[set]) -> dict:
         "out_of_scope": allowed_tools is not None and tool not in allowed_tools,
         "agent_name": a.get(sc.AGENT_NAME),
         "trace_id": format(span.trace_id, "032x"),
+        **_pii_fields([span]),
     }
 
 
@@ -130,6 +148,7 @@ def agent_run_record(root: SpanView, descendants: list[SpanView], allowed_tools:
     ):
         if attribute in a:
             record[key] = str(a[attribute])
+    record.update(_pii_fields([root, *descendants]))
     return record
 
 

@@ -109,9 +109,10 @@ class TestModels:
         assert pulse.flush(timeout_s=30)  # background mode: wait until the rows are written
         assert pulse.stats()["written_rows"] == len(inference_dataset)
 
+        # explicit stop: with the default stop (the server's now()), a server clock slightly behind gives an empty range
         query = f"""
         from(bucket: "demo")
-        |> range(start: {time})
+        |> range(start: {time}, stop: 2100-01-01T00:00:00Z)
         |> filter(fn: (r) => r["_measurement"] == "{params.model_id}_{params.model_version}_input_data"
             and r["model_id"] == "{params.model_id}"
             and r["model_version"] == "{params.model_version}")
@@ -165,9 +166,10 @@ class TestModels:
         assert pulse.flush(timeout_s=30)  # background mode: wait until the rows are written
         assert pulse.stats()["written_rows"] == len(inference_dataset)
 
+        # explicit stop: with the default stop (the server's now()), a server clock slightly behind gives an empty range
         query = f"""
         from(bucket: "demo")
-        |> range(start: {time})
+        |> range(start: {time}, stop: 2100-01-01T00:00:00Z)
         |> filter(fn: (r) => r["_measurement"] == "{params.model_id}_{params.model_version}_input_data"
             and r["model_id"] == "{params.model_id}"
             and r["model_version"] == "{params.model_version}")

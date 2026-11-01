@@ -3,6 +3,18 @@
 All notable changes to pulsar-data-collection. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.5.0] - 2026-11-01
+
+### Added
+- `pulsar_data_collection.genai` (extra `genai`): collection for LLM applications and agents from OpenTelemetry
+  GenAI spans (`gen_ai.*`). `PulsarSpanExporter` assembles agent runs (steps, tool calls, distinct tools, tool error
+  rate, repeated calls and loops, out-of-scope calls, delegation depth, tokens, latency, termination, task success,
+  tool sequence, model, prompt version), tool calls and LLM calls, and writes them with `PulseSink` (non-blocking
+  Pulse, tags `record_type` and `schema=pulsar-genai/1`). Only features are stored, never prompts, responses or tool
+  arguments.
+- Pinned GenAI attribute names with normalization of aliases used by other SDKs (`genai/semconv.py`).
+- Instrumentation helpers `agent_span`, `llm_span`, `record_llm_response`, `tool_span`.
+
 ## [0.4.0] - 2026-11-01
 
 ### Changed

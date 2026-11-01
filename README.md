@@ -17,6 +17,7 @@ Supported storage: **InfluxDB 2.x** (tested with 2.6.1). The storage layer is a 
 - [Quick start](#quick-start)
 - [Non-blocking capture and resilience](#non-blocking-capture-and-resilience)
 - [How data is stored](#how-data-is-stored)
+- [LLM applications and agents (OpenTelemetry GenAI)](#llm-applications-and-agents-opentelemetry-genai)
 - [API reference](#api-reference)
 - [Analyzing the collected data with pulsar-metrics](#analyzing-the-collected-data-with-pulsar-metrics)
 - [Development](#development)
@@ -216,6 +217,57 @@ Consequences:
 - A Flux `range()` stops at the server's `now()` by default. Points timestamped with the client clock can be a few
   milliseconds "in the future" for the server (clock skew, frequent with Docker on Windows or macOS) and are then missing
   from a query run right after the write. Use an explicit future stop, e.g. `range(start: -1h, stop: 1m)`.
+
+## LLM applications and agents (OpenTelemetry GenAI)
+
+`pulsar_data_collection.genai` (extra `genai`: `pip install "pulsar-data-collection[genai] @ git+..."`) collects
+LLM applications and agents through **OpenTelemetry**, using the GenAI semantic conventions (`gen_ai.*`). Any span
+carrying `gen_ai.operation.name` is read, whether it comes from an existing instrumentation or from the helpers below.
+`PulsarSpanExporter` turns the spans into three record types written with Pulse (non-blocking):
+
+| `record_type` | One row per | Main fields |
+|---|---|---|
+| `agent_run` | agent run (`invoke_agent` span and its subtree) | `steps` (LLM calls), `tool_calls`, `distinct_tools`, `tool_error_rate`, `repeated_calls`, `loop_detected`, `out_of_scope_calls`, `delegation_depth`, `input_tokens`, `output_tokens`, `latency_s`, `termination`, `task_success`, `first_tool`, `tool_sequence`, `request_model`, `prompt_version` |
+| `tool_call` | `execute_tool` span | `tool_name`, `error`, `latency_s`, `out_of_scope` |
+| `llm_call` | `chat` span | `request_model`, `response_model`, `provider`, `temperature`, `input_tokens`, `output_tokens`, `finish_reason`, `latency_s`, `error` |
+
+Only features are stored: prompts, responses and tool arguments are **not** written (arguments are hashed in memory to
+detect loops). Records carry the tags of `PulseParameters` plus `record_type` and `schema` (`pulsar-genai/1`).
+
+```python
+from opentelemetry import trace
+from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.sdk.trace.export import BatchSpanProcessor
+
+from pulsar_data_collection.genai import PulsarSpanExporter, PulseSink, agent_span, llm_span, record_llm_response, tool_span
+
+exporter = PulsarSpanExporter(
+    PulseSink(params, CaptureOptions(spool_dir=Path("/var/lib/my-agent/spool"))),
+    allowed_tools={"search_programs", "check_eligibility"},  # other tools are counted as out-of-scope calls
+)
+provider = TracerProvider()
+provider.add_span_processor(BatchSpanProcessor(exporter))
+trace.set_tracer_provider(provider)
+tracer = trace.get_tracer("permit-assistant")
+
+with agent_span(tracer, "permit_assistant", prompt_version="v3") as run:
+    with llm_span(tracer, model="llama3.2:3b", provider="ollama", temperature=0.0) as call:
+        ...  # call the model
+        record_llm_response(call, input_tokens=812, output_tokens=64, finish_reason="tool_calls")
+    with tool_span(tracer, "search_programs", arguments={"topic": "renovation"}):
+        ...  # run the tool; an exception marks the call as failed
+    run.set_attribute("pulsar.agent.termination", "completed")
+    run.set_attribute("pulsar.agent.task_success", True)
+
+provider.shutdown()  # at exit: assembles pending traces and closes the Pulse instances
+```
+
+Notes:
+- The GenAI conventions are at the "Development" stage: the attribute names read by Pulsar are pinned in
+  `genai/semconv.py`, and aliases used by other SDKs (`llm.model_name`, `llm.token_count.prompt`...) are normalized.
+- An agent run is assembled when its trace's root span ends; if the root lives in another process (HTTP server span),
+  after `trace_timeout_s` without new span. Sub-agents are part of the run (`delegation_depth`).
+- Read a record type back with `|> filter(fn: (r) => r["record_type"] == "agent_run")`.
 
 ## API reference
 

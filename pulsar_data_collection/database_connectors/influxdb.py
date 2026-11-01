@@ -85,7 +85,7 @@ class InfluxdbActions(DatabaseActions):
         data.loc[:, "_time"] = pd.date_range(
             start=kwargs["timestamp"],
             periods=kwargs["data_points"].shape[0],
-            freq="L",
+            freq="ms",
             inclusive="left",
         )
         data.set_index("_time")

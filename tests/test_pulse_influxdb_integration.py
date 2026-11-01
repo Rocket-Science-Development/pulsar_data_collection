@@ -1,4 +1,3 @@
-import pickle as pkl
 from datetime import datetime as dt
 from datetime import timezone
 from pathlib import Path
@@ -74,9 +73,7 @@ class TestModels:
         assert pulse.target_name == "class"
         assert isinstance(pulse.db_connection, InfluxDBClient)
 
-    def test_Pulse_capture_data_method_simple_prediction(self, docker_ip):
-        # TODO : move these to become
-        model_path = Path("tests/model/kidney_disease.pkl")
+    def test_Pulse_capture_data_method_simple_prediction(self, docker_ip, kidney_model):
         inference_dataset = pd.read_csv("tests/data/split/test_data_no_class.csv", header=0)
         reference_data = "/data/raw/csv_result-chronic_kidney_disease.csv"
         params = PulseParameters(
@@ -97,8 +94,7 @@ class TestModels:
         )
         pulse = Pulse(data=params)
 
-        pickle_model = pkl.load(open(model_path, "rb"))
-        prediction_simple = pickle_model.predict(inference_dataset)
+        prediction_simple = kidney_model.predict(inference_dataset)
 
         time = dt.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
         capture_params = DataWithPrediction(
@@ -128,9 +124,7 @@ class TestModels:
         assert "prediction" in data_frame.columns
         assert prediction_simple in data_frame["prediction"].values
 
-    def test_Pulse_capture_data_method_proba_prediction(self, docker_ip):
-        # TODO : move these to become fixtures
-        model_path = Path("tests/model/kidney_disease.pkl")
+    def test_Pulse_capture_data_method_proba_prediction(self, docker_ip, kidney_model):
         inference_dataset = pd.read_csv("tests/data/split/test_data_no_class.csv", header=0)
         reference_data = "/data/raw/csv_result-chronic_kidney_disease.csv"
         params = PulseParameters(
@@ -152,9 +146,8 @@ class TestModels:
 
         pulse = Pulse(data=params)
 
-        pickle_model = pkl.load(open(model_path, "rb"))
-        prediction_proba = pd.DataFrame(pickle_model.predict_proba(inference_dataset), columns=["proba_class_0", "proba_class_1"])
-        prediction_simple = pd.DataFrame(pickle_model.predict(inference_dataset), columns=["prediction"])
+        prediction_proba = pd.DataFrame(kidney_model.predict_proba(inference_dataset), columns=["proba_class_0", "proba_class_1"])
+        prediction_simple = pd.DataFrame(kidney_model.predict(inference_dataset), columns=["prediction"])
         print(f"proba prediction is {type(prediction_proba)} of size {prediction_proba.shape}")
 
         time = dt.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")

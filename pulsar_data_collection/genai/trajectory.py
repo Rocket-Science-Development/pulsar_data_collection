@@ -122,6 +122,14 @@ def agent_run_record(root: SpanView, descendants: list[SpanView], allowed_tools:
     }
     if sc.TASK_SUCCESS in a:
         record["task_success"] = bool(a[sc.TASK_SUCCESS])
+    for key, attribute in (
+        ("cf_set_id", sc.CF_SET_ID),
+        ("cf_variant", sc.CF_VARIANT),
+        ("cf_attribute", sc.CF_ATTRIBUTE),
+        ("cf_control", sc.CF_CONTROL),
+    ):
+        if attribute in a:
+            record[key] = str(a[attribute])
     return record
 
 

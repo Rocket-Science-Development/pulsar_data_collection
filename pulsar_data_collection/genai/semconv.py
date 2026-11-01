@@ -28,6 +28,11 @@ ERROR_TYPE = "error.type"
 TERMINATION = "pulsar.agent.termination"  # e.g. "completed", "max_steps", "error", "refused"
 TASK_SUCCESS = "pulsar.agent.task_success"  # bool, when the application knows the outcome
 PROMPT_VERSION = "pulsar.prompt.version"
+# Counterfactual probes (pulsar_data_collection.genai.probes): set on the agent span of each probe request
+CF_SET_ID = "pulsar.cf.set_id"  # requests of one set differ only by the probed attribute
+CF_VARIANT = "pulsar.cf.variant"  # group of the value used in this request, e.g. "fr"
+CF_ATTRIBUTE = "pulsar.cf.attribute"  # probed attribute, e.g. "first_name"
+CF_CONTROL = "pulsar.cf.control"  # "none", "placebo" (irrelevant attribute) or "order_swapped"
 
 # Values of gen_ai.operation.name
 OP_CHAT = "chat"

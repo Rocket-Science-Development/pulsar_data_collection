@@ -3,6 +3,17 @@
 All notable changes to pulsar-data-collection. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.6.0] - 2026-11-01
+
+### Added
+- `pulsar_data_collection.genai.probes`: counterfactual probes for LLM applications and agents.
+  `CounterfactualProbe` generates sets of requests that differ only by one attribute, plus placebo sets (an attribute
+  that must not matter, noise floor of the instrument), sends them in a random order and collects the outcomes,
+  keeping failed requests with their error. `ComparativeProbe` asks to choose between two profiles in both orders,
+  with or without a tie option (position-effect control).
+- Span attributes `pulsar.cf.set_id`, `pulsar.cf.variant`, `pulsar.cf.attribute`, `pulsar.cf.control`, carried to the
+  `agent_run` records (`cf_set_id`, `cf_variant`, `cf_attribute`, `cf_control`).
+
 ## [0.5.1] - 2026-11-01
 
 ### Fixed

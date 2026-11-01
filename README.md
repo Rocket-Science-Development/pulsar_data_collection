@@ -11,6 +11,13 @@ Flask, batch job) or a notebook, and writes it to a time series database. The st
 [pulsar-metrics](https://github.com/Rocket-Science-Development/pulsar_metrics) to monitor data drift, concept drift and
 model performance.
 
+It also observes **LLM applications and agents** through OpenTelemetry GenAI traces: each agent run, tool call and
+LLM call becomes a record of features (steps, tools, errors, loops, out-of-scope calls, tokens, latency), without
+storing prompts or answers. Capture never blocks the service: rows are queued and written in the background, and kept
+on disk while the database is unavailable.
+
+![Pulsar.ml architecture](https://raw.githubusercontent.com/Rocket-Science-Development/pulsar_demo/main/images/pulsarml-architecture.png)
+
 Supported storage: **InfluxDB 2.x** (tested with 2.6.1). The storage layer is a factory, so other engines can be added.
 
 - [Installation](#installation)

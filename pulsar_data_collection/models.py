@@ -1,8 +1,9 @@
 import datetime
-from typing import Any, Dict, List, Optional, Union
+from pathlib import Path
+from typing import Any, Dict, List, Literal, Optional, Union
 
 import pandas as pd
-from pydantic import BaseModel, ConfigDict, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from .config import factories
 
@@ -85,3 +86,43 @@ class DataWithPrediction(BaseModel):
     predictions: Any
     data_points: pd.DataFrame
     features_names: List[str]
+
+
+class CaptureOptions(BaseModel):
+    """
+    How Pulse writes the captured data
+
+    Attributes
+    ----------
+    mode: "background" (default) or "sync"
+    background: capture_data() only queues the rows (non-blocking); a thread writes them in batches.
+    sync: capture_data() writes immediately and raises on failure (notebooks, batch jobs, tests).
+    max_queue_rows: int
+    Maximum rows waiting in memory; beyond, the oldest batches are dropped and counted (background mode)
+    max_batch_rows: int
+    Rows per write; a write starts as soon as this many rows are waiting
+    flush_interval_s: float
+    Maximum time a row waits before being written
+    write_timeout_s: float
+    Timeout of every request to the storage engine
+    max_retry_delay_s: float
+    Upper bound of the exponential delay before retrying an unavailable storage engine
+    spool_dir: Optional[Path]
+    Directory where batches are saved while the storage engine is unavailable, then replayed. Without it, these rows
+    are dropped and counted.
+    strict_startup: bool
+    Raise at creation when the storage engine cannot be reached. By default (background mode) Pulse starts anyway and
+    spools or drops until the storage is back. Configuration errors (unknown bucket or organization, rejected token)
+    always raise.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    mode: Literal["background", "sync"] = "background"
+    max_queue_rows: int = Field(100_000, gt=0)
+    max_batch_rows: int = Field(5_000, gt=0)
+    flush_interval_s: float = Field(1.0, gt=0)
+    write_timeout_s: float = Field(5.0, gt=0)
+    max_retry_delay_s: float = Field(60.0, gt=0)
+    spool_dir: Optional[Path] = None
+    strict_startup: bool = False

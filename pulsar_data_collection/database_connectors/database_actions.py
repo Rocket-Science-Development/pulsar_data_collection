@@ -16,6 +16,18 @@ class DatabaseActions(ABC):
         """Sets up the connection object"""
 
     @abstractmethod
+    def create_client(self, **login):
+        """Client object without connection check"""
+
+    @abstractmethod
+    def prepare_frame(self, data_points, prediction=None, timestamp=None):
+        """Rows to write for one capture"""
+
+    @abstractmethod
+    def write_frame(self, client, frame, **write_params):
+        """Writes prepared rows synchronously; raises on failure"""
+
+    @abstractmethod
     def write_data(self):
         """Writes Data to the database"""
 

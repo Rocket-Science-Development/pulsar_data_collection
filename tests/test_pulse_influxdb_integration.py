@@ -8,7 +8,7 @@ from influxdb_client import InfluxDBClient
 
 from pulsar_data_collection.config import factories
 from pulsar_data_collection.exceptions import StorageConfigurationError
-from pulsar_data_collection.models import DataWithPrediction, PulseParameters
+from pulsar_data_collection.models import CaptureOptions, DataWithPrediction, PulseParameters
 from pulsar_data_collection.pulse import Pulse
 
 
@@ -106,6 +106,8 @@ class TestModels:
         )
 
         pulse.capture_data(data=capture_params)
+        assert pulse.flush(timeout_s=30)  # background mode: wait until the rows are written
+        assert pulse.stats()["written_rows"] == len(inference_dataset)
 
         query = f"""
         from(bucket: "demo")
@@ -160,6 +162,8 @@ class TestModels:
         )
 
         pulse.capture_data(data=capture_params)
+        assert pulse.flush(timeout_s=30)  # background mode: wait until the rows are written
+        assert pulse.stats()["written_rows"] == len(inference_dataset)
 
         query = f"""
         from(bucket: "demo")
@@ -243,3 +247,34 @@ class TestModels:
         )
         with pytest.raises(StorageConfigurationError, match="no_such_bucket"):
             Pulse(data=params)
+
+    def test_Pulse_sync_mode_writes_before_returning(self, docker_ip, kidney_model):
+        inference_dataset = pd.read_csv("tests/data/split/test_data_no_class.csv", header=0)
+        params = PulseParameters(
+            model_id="sync_mode",
+            model_version="0.1",
+            data_id="sync_mode_data",
+            reference_data_storage="ref.csv",
+            target_name="class",
+            storage_engine="influxdb",
+            timestamp_column_name="_time",
+            login={"url": f"http://{docker_ip}:8086/", "token": "mytoken", "org": "pulsarml", "bucket_name": "demo"},
+        )
+        start = (dt.now(timezone.utc) - timedelta(minutes=1)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        with Pulse(data=params, options=CaptureOptions(mode="sync")) as pulse:
+            pulse.capture_data(
+                data=DataWithPrediction(
+                    data_points=inference_dataset,
+                    predictions=pd.DataFrame(kidney_model.predict(inference_dataset), columns=["prediction"]),
+                    timestamp=dt.fromisoformat(start),
+                    features_names=inference_dataset.columns.tolist(),
+                )
+            )
+            query = f"""
+            from(bucket: "demo")
+            |> range(start: {start})
+            |> filter(fn: (r) => r["_measurement"] == "sync_mode_0.1_input_data")
+            |> pivot(rowKey:["_time"], columnKey: ["_field"], valueColumn: "_value")
+            """
+            with InfluxDBClient(url=params.login["url"], token="mytoken", org="pulsarml") as client:
+                assert len(client.query_api().query_data_frame(query=query)) == len(inference_dataset)

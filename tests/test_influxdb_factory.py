@@ -4,6 +4,7 @@ from pathlib import Path
 import pandas as pd
 import pytest
 from influxdb_client import InfluxDBClient
+from influxdb_client.rest import ApiException
 
 from pulsar_data_collection.config import factories
 from pulsar_data_collection.exceptions import StorageConfigurationError
@@ -78,7 +79,7 @@ class TestInfluxDBIntegration:
         assert db_connection.token == "mytoken"
         assert db_connection.org == "pulsarml"
 
-    def test_write_data_writes_data(self, storage_engine, right_db_login, capsys):
+    def test_write_data_writes_data(self, storage_engine, right_db_login):
         # get dataframe to write
         test_data = pd.read_csv("tests/data/split/test_data_no_class.csv", header=0).copy()
 
@@ -101,11 +102,10 @@ class TestInfluxDBIntegration:
             "timezone": "EST",
         }
 
-        influxdb.write_data(**params)
-        captured = capsys.readouterr()
-        assert "Written batch" in captured.out
+        # synchronous write: returns without error once InfluxDB has accepted the points
+        assert influxdb.write_data(**params) is None
 
-    def test_write_data_fails(self, storage_engine, right_db_login, capsys):
+    def test_write_data_fails(self, storage_engine, right_db_login):
         # get dataframe to write
         test_data = pd.read_csv("tests/data/split/test_data_no_class.csv", header=0).copy()
 
@@ -128,9 +128,9 @@ class TestInfluxDBIntegration:
             "timezone": "EST",
         }
 
-        influxdb.write_data(**params)
-        captured = capsys.readouterr()
-        assert "Cannot write batch:" in captured.out
+        # errors are raised to the caller instead of being printed by a background callback
+        with pytest.raises(ApiException, match="WrongBucketName"):
+            influxdb.write_data(**params)
 
     def test_write_data_returns_not_none(self, storage_engine, right_db_login):
         # get dataframe to write

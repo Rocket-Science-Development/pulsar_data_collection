@@ -3,6 +3,27 @@
 All notable changes to pulsar-data-collection. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.4.0] - 2026-11-01
+
+### Changed
+- **`capture_data()` no longer waits for the database** (new default `mode="background"`). It queues the rows and a
+  background thread writes them in batches. Previously every capture waited for the write (about 110 ms), and with
+  InfluxDB stopped a single capture blocked the calling thread for 195 s (5 hidden retries) and then returned without
+  error while the data was lost (#21).
+- Writes use the synchronous InfluxDB API with a request timeout (`write_timeout_s`) and no hidden retries;
+  `write_data()` raises on failure instead of printing from a background callback.
+- `Pulse` starts even if InfluxDB is unreachable (warning, rows spooled or counted until it is back); configuration
+  errors still raise. New `StorageUnavailableError`.
+
+### Added
+- `CaptureOptions`: mode (`background` / `sync`), bounded queue, batch size, flush interval, request timeout,
+  retry delay, spool directory, strict startup.
+- Spool directory: batches that cannot be written are saved to disk (exact round trip, nanosecond timestamps) and
+  replayed when InfluxDB is back.
+- `Pulse.flush()` and `Pulse.stats()` (captured, written, spooled, replayed, dropped rows; write errors; queue size).
+- Validated with InfluxDB stopped for 15 s during the service: capture latency 0.8 ms (1.3 ms max), no row lost
+  (3,000 / 3,000); service start with InfluxDB down in 2 s, rows replayed when it came back.
+
 ## [0.3.0] - 2026-11-01
 
 ### Changed

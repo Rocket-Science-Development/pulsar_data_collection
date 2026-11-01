@@ -18,7 +18,7 @@ The value lists are the user's responsibility: lists of names standing for group
 (e.g. by a GBA Plus expert). The ones shipped with the demo are provisional and marked as such.
 """
 
-import random
+import random  # reproducible sampling and ordering of the probe requests, never used for security
 import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Optional, Sequence
@@ -104,7 +104,7 @@ class CounterfactualProbe:
 
     def generate(self, n_sets: int, n_placebo_sets: Optional[int] = None) -> list:
         """`n_sets` sets on the probed attribute and `n_placebo_sets` (default: as many) placebo sets"""
-        rng = random.Random(self.seed)
+        rng = random.Random(self.seed)  # nosec B311
         n_placebo_sets = (n_sets if n_placebo_sets is None else n_placebo_sets) if self.placebo else 0
         probes = []
         for k in range(n_sets + n_placebo_sets):
@@ -151,7 +151,7 @@ class CounterfactualProbe:
         """
         order = list(probes)
         if shuffle:
-            random.Random(self.seed + 1).shuffle(order)
+            random.Random(self.seed + 1).shuffle(order)  # nosec B311
         rows = []
         for i, probe in enumerate(order, start=1):
             row = {
@@ -221,7 +221,7 @@ class ComparativeProbe:
 
     def generate(self, n_sets: int) -> list:
         """Each set: one pair of groups, the two profiles, asked in both orders (control "none" then "order_swapped")"""
-        rng = random.Random(self.seed)
+        rng = random.Random(self.seed)  # nosec B311
         groups = list(self.values)
         pairs = [(a, b) for i, a in enumerate(groups) for b in groups[i + 1 :]]
         probes = []

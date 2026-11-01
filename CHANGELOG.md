@@ -3,6 +3,22 @@
 All notable changes to pulsar-data-collection. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.5.1] - 2026-11-01
+
+### Fixed
+- **Rows silently lost when two captures shared a timestamp.** InfluxDB keeps one point per measurement, tags and
+  timestamp; with a coarse system clock (15.6 ms on Windows) or concurrent requests, captures got identical timestamps
+  and overwrote each other (e.g. 2 agent runs stored out of 3 in the GenAI end-to-end test, intermittently). Each
+  `Pulse` now keeps its timestamps strictly increasing, thread-safely.
+- Under pandas 3, `pd.date_range(..., periods=n, inclusive="left")` returned n - 1 timestamps and `capture_data()`
+  raised `ValueError` in the prediction path.
+- Spool round trip keeps the datetime resolution (pandas 3 defaults to microseconds).
+
+### Changed
+- **pandas 3 supported** (`pandas>=2.2,<4`, lock file on pandas 3.1); **Python 3.14 and 3.15** supported and tested
+  (3.15 requires pandas 3).
+- Continuous integration: Python 3.12 to 3.15 with pandas 3, plus Python 3.12 with pandas 2.
+
 ## [0.5.0] - 2026-11-01
 
 ### Added

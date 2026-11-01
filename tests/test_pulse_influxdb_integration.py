@@ -156,7 +156,7 @@ class TestModels:
         time = dt.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
         capture_params = DataWithPrediction(
             data_points=inference_dataset,
-            predictions=pd.concat(objs=[prediction_simple, prediction_proba], copy=False, axis=1),
+            predictions=pd.concat(objs=[prediction_simple, prediction_proba], axis=1),
             timestamp=time,
             features_names=inference_dataset.columns.tolist(),
         )

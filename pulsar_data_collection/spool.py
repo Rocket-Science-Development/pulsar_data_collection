@@ -10,13 +10,18 @@ from typing import Optional
 import pandas as pd
 
 
+def _datetime_unit(dtype: str) -> str:
+    """Resolution of a datetime dtype string: "datetime64[us, UTC]" -> "us" (pandas 3 defaults to us, pandas 2 to ns)"""
+    return dtype[dtype.index("[") + 1 :].split(",")[0].rstrip("]").strip()
+
+
 def frame_to_json(frame: pd.DataFrame, meta: dict) -> str:
     """Serialize a batch and its write parameters; dates are stored as int64 nanoseconds (exact round trip)"""
     dtypes = {str(c): str(t) for c, t in frame.dtypes.items()}
     out = frame.reset_index(drop=True).copy()
     for column, dtype in dtypes.items():
         if dtype.startswith("datetime64"):
-            out[column] = out[column].astype("int64")
+            out[column] = out[column].dt.as_unit("ns").astype("int64")
     payload = {"meta": meta, "dtypes": dtypes, "columns": list(dtypes), "data": json.loads(out.to_json(orient="values"))}
     return json.dumps(payload)
 
@@ -29,7 +34,8 @@ def frame_from_json(text: str) -> tuple[pd.DataFrame, dict]:
         if dtype.startswith("datetime64"):
             values = pd.to_datetime(frame[column].astype("int64"), unit="ns", utc=True)
             timezone = dtype[dtype.index(",") + 1 : -1].strip() if "," in dtype else None
-            frame[column] = values.dt.tz_convert(timezone) if timezone else values.dt.tz_localize(None)
+            values = values.dt.tz_convert(timezone) if timezone else values.dt.tz_localize(None)
+            frame[column] = values.dt.as_unit(_datetime_unit(dtype))
         else:
             frame[column] = frame[column].astype(dtype)
     return frame, payload["meta"]

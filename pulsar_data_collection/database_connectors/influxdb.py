@@ -74,7 +74,8 @@ class InfluxdbActions(DatabaseActions):
         Always a new frame: the caller's DataFrames are not modified.
         """
         frame = pd.concat(objs=[data_points, prediction], axis=1) if prediction is not None else data_points.copy()
-        frame["_time"] = pd.date_range(start=timestamp, periods=frame.shape[0], freq="ms", inclusive="left")
+        # start + periods only: `inclusive="left"` drops the last timestamp under pandas 3
+        frame["_time"] = pd.date_range(start=timestamp, periods=frame.shape[0], freq="ms")
         return frame
 
     @staticmethod

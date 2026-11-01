@@ -1,7 +1,8 @@
 # pulsar-data-collection
 
 [![Continuous Integration](https://github.com/Rocket-Science-Development/pulsar_data_collection/actions/workflows/continuous-integration.yaml/badge.svg)](https://github.com/Rocket-Science-Development/pulsar_data_collection/actions/workflows/continuous-integration.yaml)
-![Python](https://img.shields.io/badge/python-3.12%20%7C%203.13-blue)
+![Python](https://img.shields.io/badge/python-3.12%20%7C%203.13%20%7C%203.14%20%7C%203.15-blue)
+![pandas](https://img.shields.io/badge/pandas-2.2%2B%20%7C%203.x-blue)
 [![License](https://img.shields.io/badge/license-Apache%202.0-blue)](LICENSE)
 [![Code style: black](https://img.shields.io/badge/code%20style-black-000000.svg)](https://github.com/psf/black)
 
@@ -32,7 +33,8 @@ Supported storage: **InfluxDB 2.x** (tested with 2.6.1). The storage layer is a 
 
 ## Installation
 
-Requires **Python 3.12 or later** (tested on 3.12 and 3.13).
+Requires **Python 3.12 or later** (tested on 3.12, 3.13, 3.14 and 3.15) and pandas 2.2+ or 3.x (Python 3.15 requires
+pandas 3).
 
 ```bash
 pip install "pulsar-data-collection @ git+https://github.com/Rocket-Science-Development/pulsar_data_collection.git"
@@ -217,8 +219,10 @@ the data stored before going on, not in a latency-sensitive service.
 
 Consequences:
 
-- Rows of one capture keep their order and do not overwrite each other. Two captures with the same tags must not
-  start at the same timestamp within the number of rows they contain, or points will be overwritten.
+- InfluxDB keeps a single point per measurement, tags and timestamp. Each `Pulse` therefore keeps its timestamps
+  strictly increasing: a capture starting at or before the end of the previous one is shifted just after it. System
+  clocks are coarse (15.6 ms on Windows) and concurrent requests share timestamps; without this, rows would silently
+  overwrite each other. Several processes writing the same series should add a distinguishing tag (e.g. `instance`).
 - To store the ground truth (when it is known at prediction time, or for a replay), add it as a column of
   `predictions`.
 - A Flux `range()` stops at the server's `now()` by default. Points timestamped with the client clock can be a few
@@ -350,7 +354,7 @@ uv run bandit -c pyproject.toml -r pulsar_data_collection
 ```
 
 The integration tests need a running Docker engine. Continuous integration runs lint, bandit and the tests on
-Python 3.12 and 3.13 for every pull request; tests are required to pass. Pushing a tag builds and publishes the
+Python 3.12 to 3.15 with pandas 3, plus Python 3.12 with pandas 2, for every pull request; tests are required to pass. Pushing a tag builds and publishes the
 package.
 
 ## About [PulsarML](https://pulsar.ml/)

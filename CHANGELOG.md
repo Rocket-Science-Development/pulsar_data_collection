@@ -3,6 +3,32 @@
 All notable changes to pulsar-data-collection. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [Unreleased] - privacy-rules
+
+### Added
+- `PiiDetector(locales=...)`: formats of other countries, opt-in (default `("ca",)`): `us` (`ssn_us`), `fr`
+  (French phone numbers, `nir_fr` with its key), `uk` (UK phone numbers, `nino_uk`), `intl` (E.164 phone numbers,
+  passports and driver's licences of any country after a context word, `drivers_licence`). Night lab LP-01 (M15).
+- `PiiDetector(profiles=("finance",))`: `iban` (mod 97), `bic` (country code, after "SWIFT"/"BIC"), `bank_account`,
+  `bank_routing` (transit, institution, EFT and ABA routing numbers) and `card_security_code`, opt-in. LP-01 (M16).
+- `PiiDetector(profiles=("address",))`: `street_address` (civic number and street type, French and English), opt-in.
+  LP-01 (M13, rules side only).
+- `PiiPolicy(locales=[...], profiles=[...])`, passed to its detector; `ALL_TYPES`, `LOCALES`, `PROFILES` exported.
+- `PiiDetector.scan(text, business_scope="window" | "adjacent")` and `PiiSession(output_business_scope=...)`.
+
+### Changed
+- `PiiSession` outputs: a business word ("dossier", "order"...) lowers a finding only when it is right before the
+  value (`output_business_scope="adjacent"`, new default). The previous default (anywhere in the 40 characters
+  before) was the defect: it hid every leak of an agent that mentions a file (0 of 2,493 counted in LP-02, C4).
+  `output_business_scope="window"` restores it. The values the user gave are taken from both scans, so that the
+  narrow rule creates no false leak.
+- A RAMQ number with dashes or in lower case is recognized (lower case at confidence 0.55 instead of 0.9); the date
+  validation is unchanged. LP-02 (M17: recall 0.80 -> 1.00).
+- Words proper to a type: before a number shaped like a SIN, "client", "customer", "membre", "confirmation",
+  "matricule", "réservation"... lower it, and so does "#" right before; "membre", "confirmation"... right before a
+  phone number beat a generic "numéro". LP-02 (M18: SIN precision 0.81 -> 1.00 on the lab generator).
+- Context-word matching uses one compiled pattern per word list (LP-02 throughput about 2.7 times higher).
+
 ## [0.9.0] - 2026-11-02
 
 ### Added

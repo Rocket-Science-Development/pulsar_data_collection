@@ -155,9 +155,19 @@ Writing to the database must not slow down predictions. By default (`mode="backg
   rows are waiting, with a request timeout of `write_timeout_s`.
 - When a write fails, the database is considered unavailable for an exponential delay (1 s, 2 s, 4 s... up to
   `max_retry_delay_s`). Meanwhile batches go to the **spool directory** (`spool_dir`) instead of waiting, and are
-  replayed, oldest first, as soon as a write succeeds again. Without `spool_dir`, these rows are dropped and counted.
+  replayed, oldest first, as soon as the database is available again. Without `spool_dir`, these rows are dropped and
+  counted. During the delay InfluxDB is probed (`/ping`) every `probe_interval_s` (1 s): writing resumes about a second
+  after the end of an outage, not up to 60 s later.
+- A write that **timed out** may have been stored by InfluxDB: with `spool_dir` it is spooled and written again
+  (writes are idempotent: same measurement, tags and timestamp overwrite the same point, no duplicate); without it the
+  rows are counted in `uncertain_rows`, not in `dropped_rows`.
+- A batch InfluxDB **refuses** (HTTP 400 / 422, e.g. a field type conflict) is never retried nor spooled. Frames are
+  written together only when they share their columns *and* dtypes, object columns mixing numbers and strings are split
+  by kind, and the counters are exact: on a partial write (422 `dropped=N`) the accepted rows are counted in
+  `written_rows` and the refused ones in `rejected_rows`; when the response gives no count, the request is written
+  again batch by batch, then in halves down to single rows.
 - The queue is bounded (`max_queue_rows`): if it is full, the oldest batches are dropped and counted rather than
-  blocking the caller or exhausting memory.
+  blocking the caller or exhausting memory. A single capture larger than `max_queue_rows` keeps only its newest rows.
 - If InfluxDB is unreachable when `Pulse` is created, the service starts anyway (warning in the logs) and spools until
   the database is back. Set `strict_startup=True` to fail instead.
 
@@ -184,9 +194,12 @@ pulse.close()  # at shutdown: writes (or spools) what is still queued
 ```
 
 `pulse.stats()` returns `captured_rows`, `written_rows`, `spooled_rows`, `replayed_rows`, `dropped_rows`,
-`write_errors`, `last_error`, `queued_rows`, `spool_files` and `storage_available`. In normal operation
-`written_rows + replayed_rows + spooled pending + dropped_rows = captured_rows`; any `dropped_rows` is a measured gap in
-the monitoring data. Errors and drops are also logged (logger `pulsar_data_collection`).
+`rejected_rows`, `uncertain_rows`, `write_errors`, `write_timeouts`, `last_error`, `queued_rows`, `writer_lag_s` (age
+of the oldest queued batch), `last_write_ms` / `max_write_ms` (request latency), `spool_files`, `spool_bytes`,
+`spool_evicted_rows` and `storage_available`. Once everything is flushed, `written_rows + spooled_rows + dropped_rows +
+rejected_rows + uncertain_rows = captured_rows`, and spooled rows end up in `replayed_rows` (or `rejected_rows`); any
+`dropped_rows` (which includes `spool_evicted_rows`) is a measured gap in the monitoring data. Errors and drops are also
+logged (logger `pulsar_data_collection`).
 
 `pulse.flush(timeout_s)` waits until the queue is empty, for instance in a notebook before reading the data back.
 
@@ -195,6 +208,52 @@ maximum), the rows went to the spool and were replayed when InfluxDB restarted, 
 
 `mode="sync"` writes in `capture_data()` and raises on failure: use it for batch jobs, notebooks or tests that need
 the data stored before going on, not in a latency-sensitive service.
+
+### Many models in one process: the shared writer
+
+By default each `Pulse` has its own writer thread and HTTP client. With tens or hundreds of models in one process, use
+the **shared writer**: one thread and one HTTP client for every Pulse of the process, the rows of several models sent in
+the same requests, the bucket checked once, up to `concurrency` requests in flight.
+
+```python
+from pulsar_data_collection.writer import SharedWriter
+
+options = CaptureOptions(shared_writer=True)  # SharedWriter.default(): 5,000 rows per request, 2 in flight
+pulses = {model: Pulse(params_for(model), options) for model in models}
+
+# or an explicit writer, e.g. more requests in flight
+writer = SharedWriter(max_batch_rows=5_000, flush_interval_s=1.0, concurrency=4)
+pulse = Pulse(params, CaptureOptions(), writer=writer)
+```
+
+Each Pulse keeps its own queue bound, spool and counters; `max_batch_rows`, `flush_interval_s`, `max_retry_delay_s`
+and `write_concurrency` of its options are replaced by those of the writer. `pulse.close()` detaches the Pulse;
+`writer.close()` stops the thread.
+
+### Durability modes
+
+| `durability` | Rows lost by a crash of the process (`kill -9`) | Cost |
+|---|---|---|
+| `"memory"` (default) | the in-memory queue and the request in flight: about `flush_interval_s` of traffic at normal load, up to `max_queue_rows` + one batch when the writer is saturated (lab: 80,000 to 100,000 rows in a 50k rows/s burst) | none |
+| `"wal"` (needs `spool_dir`) | none: each batch is written to `spool_dir` before `capture_data()` returns, deleted once stored, replayed at the next start | one file write per capture (no fsync: an OS crash or a power loss can still lose the last batches) |
+
+At startup the spool also recovers what a crash left: complete `.tmp` files become spooled batches, incomplete ones are
+deleted, write-ahead copies are replayed. A spool directory belongs to one Pulse of one process at a time.
+
+### Throughput (measured)
+
+Against InfluxDB 2.6.1 in Docker on the same machine, rows of 11 numeric fields, 500-row captures, 15 s per run:
+
+| Setup | Written rows/s | Threads | Capture p99 |
+|---|---|---|---|
+| one Pulse, one request at a time (before, and `write_concurrency=1`) | 21,000 to 23,000 | 2 | 17 ms |
+| one Pulse, `write_concurrency=4` | 37,000 | 2 | 50 ms |
+| 100 Pulse, private writers (before) | 27,500 | 101 | 358 ms |
+| 100 Pulse, one `SharedWriter(concurrency=4)` | 28,600 (40,000 rows/s offered, no loss) | 2 | 90 ms |
+
+Profile of one 5,000-row request: about 60 ms to build the line protocol (influxdb-client serializer, pure Python,
+under the GIL) and 125 ms of HTTP and ingestion, which `concurrency` overlaps. The ceiling of one process is therefore
+the serialization, in the order of 40,000 to 80,000 rows/s depending on the columns; beyond, run several processes.
 
 ### `CaptureOptions`
 
@@ -208,6 +267,15 @@ the data stored before going on, not in a latency-sensitive service.
 | `max_retry_delay_s` | 60.0 | Upper bound of the delay between attempts while InfluxDB is unavailable |
 | `spool_dir` | `None` | Directory for the batches that could not be written (JSON files, replayed then deleted) |
 | `strict_startup` | `False` | Raise at creation if InfluxDB cannot be reached |
+| `shared_writer` | `False` | Use the process-wide `SharedWriter` (see above) |
+| `write_concurrency` | 1 | Requests in flight at once for a private writer |
+| `probe_interval_s` | 1.0 | Probe of an unavailable InfluxDB (`/ping`); `None`: back-off only |
+| `durability` | `"memory"` | `"wal"`: write-ahead copy of each batch in `spool_dir` (see above) |
+| `spool_max_bytes` | `None` | Size limit of `spool_dir`; beyond, rows are dropped and counted (`spool_evicted_rows`) |
+| `spool_eviction` | `"drop_oldest"` | Which rows go when the spool is full: `"drop_oldest"` or `"drop_newest"` |
+| `spool_compression` | `None` | `"gzip"` (level 1): spooled batches 2.2 times smaller on random floats, more on repetitive values (the lab measured about 330 bytes per row of JSON: 1,880 MB for a 30 min outage at 200k rows/min) |
+| `replay_max_rows_per_s` | `None` | Throttle of the spool replay. After a 30 min outage, an unthrottled replay raised the capture p99 from 1 ms to 144 ms |
+| `row_spacing_ns` | 1,000 | Spacing of the timestamps of the rows of one capture (1 µs) |
 
 ## How data is stored
 
@@ -217,7 +285,7 @@ the data stored before going on, not in a latency-sensitive service.
 | Measurement | `{model_id}_{model_version}_input_data` |
 | Tags | `model_id`, `model_version`, `data_id`, plus every key of `additional_tags` |
 | Fields | every column of `data_points` and of `predictions` (numbers, booleans or strings) |
-| Timestamp | row *i* of a capture is stored at `timestamp + i` milliseconds |
+| Timestamp | row *i* of a capture is stored at `timestamp + i` microseconds (`row_spacing_ns`) |
 
 Consequences:
 
@@ -225,6 +293,9 @@ Consequences:
   strictly increasing: a capture starting at or before the end of the previous one is shifted just after it. System
   clocks are coarse (15.6 ms on Windows) and concurrent requests share timestamps; without this, rows would silently
   overwrite each other. Several processes writing the same series should add a distinguishing tag (e.g. `instance`).
+  Rows are 1 µs apart. They were 1 ms apart, so that a model writing more than 1,000 rows/s ran ahead of the clock
+  (+2,760 s after 3 min at 1M rows/min) and was missed by queries stopping at `now()`; a model now stays on time up to
+  1 million rows/s.
 - To store the ground truth (when it is known at prediction time, or for a replay), add it as a column of
   `predictions`.
 - A Flux `range()` stops at the server's `now()` by default. Points timestamped with the client clock can be a few
@@ -414,7 +485,7 @@ Mon NAS est [SIN], écrivez à [EMAIL]. Dossier 450123456.
 
 The analyses of pulsar-metrics return `MetricResults` in memory. `ResultsSink` writes them to InfluxDB, in one
 measurement (`pulsar_results`, one point per result), so that dashboards can show verdicts with their intervals;
-`StatsReporter` publishes the counters of a Pulse (`pulsar_capture_stats`) every few seconds.
+`StatsReporter` publishes the counters of Pulse instances (`pulsar_capture_stats`) every few seconds.
 
 | Tags | Fields |
 |---|---|
@@ -428,6 +499,24 @@ with ResultsSink(url, token, org, bucket) as sink:
     with StatsReporter(pulse, sink, interval_s=10):  # a failed report never disturbs the capture
         ...  # serve predictions
 ```
+
+One reporter can serve the whole process (one thread, one request per interval for every Pulse), with the optional
+process health in its own measurement, `pulsar_process_health` (tags `host`, `pid`): `threads`, and with
+[psutil](https://pypi.org/project/psutil/) installed `rss_bytes`, `os_threads`, `open_fds` (`open_handles` on
+Windows) and `cpu_percent`, plus the writer gauges of the registered Pulse instances: `queued_rows`, `writer_lag_s`,
+`max_write_ms`.
+
+```python
+reporter = StatsReporter(None, sink, interval_s=10, tags={"environment": "prod"}, process_health=True)
+for pulse in pulses.values():
+    reporter.add(pulse)
+reporter.start()
+```
+
+The optional fields of `MetricResults` are written only when present: `n_labelled`, `label_coverage`,
+`missing_share_current` and `missing_share_reference` always as floats (stable field types from one write to the
+next), `reliable` as a boolean, and the string `status` (e.g. `constant_reference`) as the field `result_status`, so
+that it never collides with the numeric verdict `status`.
 
 The Grafana dashboards built on these measurements are in
 [pulsar_demo/observability](https://github.com/Rocket-Science-Development/pulsar_demo/tree/main/observability).

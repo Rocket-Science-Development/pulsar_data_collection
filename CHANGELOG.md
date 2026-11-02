@@ -3,6 +3,58 @@
 All notable changes to pulsar-data-collection. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [Unreleased] - writer-scale
+
+### Added
+- `SharedWriter` (`pulsar_data_collection.writer`): one writer thread and one HTTP client for every Pulse of a process,
+  rows of several models in the same line-protocol requests, bucket checked once per process, up to `concurrency`
+  requests in flight. `CaptureOptions(shared_writer=True)` uses `SharedWriter.default()`; `Pulse(..., writer=...)`
+  takes an explicit one (M31, SC-01 / SC-02).
+- `CaptureOptions(write_concurrency=N)`: several requests in flight for a private writer; 37k rows/s instead of 21k for
+  one Pulse with N = 4 against a local InfluxDB (M34).
+- `CaptureOptions(probe_interval_s=1.0)`: an unavailable InfluxDB is probed (`/ping`) during the back-off, so that
+  writing resumes about a second after an outage instead of up to `max_retry_delay_s` later (M35).
+- `CaptureOptions(durability="wal")`: write-ahead copy of each batch in `spool_dir`, deleted once stored and replayed
+  after a crash; `kill -9` with the storage available no longer loses the in-memory queue. Durability modes documented
+  (M36).
+- `CaptureOptions(spool_max_bytes, spool_eviction, spool_compression="gzip")`: size limit of the spool with eviction of
+  the oldest (or refusal of the newest) batches, counted in `spool_evicted_rows` and `dropped_rows`; gzip spool files;
+  compact JSON (m19).
+- `CaptureOptions(replay_max_rows_per_s)`: throttled spool replay; replayed batches are also merged into requests of up
+  to `max_batch_rows` rows (m18).
+- `CaptureOptions(row_spacing_ns)`, `InfluxdbActions.prepare_frame(row_spacing_ns=...)`.
+- Counters `uncertain_rows`, `write_timeouts`, `writer_lag_s`, `last_write_ms`, `max_write_ms`, `spool_bytes`,
+  `spool_evicted_rows` in `Pulse.stats()`.
+- `StatsReporter(None, sink)` + `add(pulse, tags)`: one reporter thread and one request per interval for every Pulse of
+  the process; `ResultsSink.write_stats_many` (m22).
+- `StatsReporter(process_health=True)` and `results.process_health()`: threads, and with psutil RSS, OS threads, open
+  descriptors (handles on Windows), CPU, plus the writer lag, queued rows and write latency, in the measurement
+  `pulsar_process_health` (m23).
+- `ResultsSink` writes the optional `MetricResults` fields when present: `n_labelled`, `label_coverage`,
+  `missing_share_current`, `missing_share_reference` (always floats), `reliable` (boolean), and the string `status` as
+  `result_status`, never colliding with the numeric verdict `status`.
+- `StorageWriteTimeoutError`; `StorageRejectedError.dropped`; `InfluxdbActions.serialize_frame`, `write_lines`, `ping`,
+  `make_shared_connection`, `release_connection`.
+
+### Changed
+- **Default changed:** the rows of one capture are 1 µs apart instead of 1 ms. The old spacing was the defect: above
+  1,000 rows/s a model ran ahead of the clock (+2,760 s after 3 min at 1M rows/min) and queries stopping at `now()`
+  missed its rows (M33).
+- Writes go through the line protocol (same influxdb-client serializer) when the storage engine is the built-in
+  InfluxDB one; a subclass that overrides `write_frame` keeps frame-by-frame writes.
+
+### Fixed
+- Frames are concatenated only when they share their columns **and dtypes**, and object columns mixing numbers and
+  strings are split by kind: valid rows sharing a write with conflicting rows are stored (lab: 100 of 250 valid rows
+  lost) (M37, SC-14).
+- Exact counters on refused writes: on a 422 partial write the `dropped=N` of InfluxDB splits the batch between
+  `written_rows` and `rejected_rows`; without a count, or when the request held several batches or models, the rows are
+  written again batch by batch, then in halves down to single rows (M37, M38).
+- A write that timed out is no longer counted as lost: spooled and written again (idempotent) with `spool_dir`, counted
+  in `uncertain_rows` without it (M32).
+- A capture larger than `max_queue_rows` keeps only its newest rows; the others are dropped and counted (m20).
+- A spool `.tmp` file left by a crash is recovered at startup when complete, deleted otherwise (m24).
+
 ## [0.9.0] - 2026-11-02
 
 ### Added

@@ -28,6 +28,13 @@ ERROR_TYPE = "error.type"
 TERMINATION = "pulsar.agent.termination"  # e.g. "completed", "max_steps", "error", "refused"
 TASK_SUCCESS = "pulsar.agent.task_success"  # bool, when the application knows the outcome
 PROMPT_VERSION = "pulsar.prompt.version"
+# Tool catalogue offered to the model for this run (list of tool names), set on the agent span: a removed or added tool
+# is then visible from the first run (tool_catalog_hash, catalog_missing_tools, unavailable_tool_calls)
+AVAILABLE_TOOLS = "pulsar.agent.available_tools"
+# Outcome of a tool call, set on the tool span (see record_tool_result): "ok", "error", "timeout", "retry", "invalid",
+# "unavailable"... When absent, it is derived from the span status ("timeout" when error.type names a timeout).
+TOOL_STATUS = "pulsar.tool.status"
+TOOL_OUTPUT_VALID = "pulsar.tool.output_valid"  # bool: the output passed the application's schema check
 # Counterfactual probes (pulsar_data_collection.genai.probes): set on the agent span of each probe request
 CF_SET_ID = "pulsar.cf.set_id"  # requests of one set differ only by the probed attribute
 CF_VARIANT = "pulsar.cf.variant"  # group of the value used in this request, e.g. "fr"
@@ -42,6 +49,20 @@ OP_TEXT_COMPLETION = "text_completion"
 OP_INVOKE_AGENT = "invoke_agent"
 OP_EXECUTE_TOOL = "execute_tool"
 LLM_OPERATIONS = {OP_CHAT, OP_TEXT_COMPLETION, "generate_content"}
+
+# Values of pulsar.tool.status
+TOOL_OK = "ok"
+TOOL_ERROR = "error"
+TOOL_TIMEOUT = "timeout"
+TOOL_UNAVAILABLE = "unavailable"  # the model called a tool that is not (or no longer) offered
+# Statuses of a call that did not raise but returned nothing usable: counted as soft failures
+SOFT_FAILURE_STATUSES = frozenset({"retry", "invalid", "empty", "partial", "garbage"})
+# Statuses meaning that the tool does not exist for the agent
+UNAVAILABLE_STATUSES = frozenset({TOOL_UNAVAILABLE, "unknown_tool", "not_found"})
+
+# Termination of an agent_run written before its root span ended (run still open after max_run_s, or trace whose
+# root never arrived)
+TERMINATION_INCOMPLETE = "incomplete"
 
 # Attribute names used by other SDKs or older versions of the conventions -> pinned name
 ALIASES = {

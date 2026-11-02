@@ -18,6 +18,8 @@ class PiiPolicy(BaseModel):
     columns: text columns to scan; None (default) scans every column holding strings
     types: personal information types to look for; None (default) = all
     min_confidence: findings below are ignored
+    locales: country formats to recognize (None = ("ca",)), e.g. ["ca", "us", "fr", "uk", "intl"]
+    profiles: extra groups of rules (None = none), "finance" (IBAN, bank accounts...) and "address" (street addresses)
     count_column: numeric column added with the number of findings per row (None: not added)
     """
 
@@ -27,13 +29,20 @@ class PiiPolicy(BaseModel):
     columns: Optional[list[str]] = None
     types: Optional[list[str]] = None
     min_confidence: float = 0.5
+    locales: Optional[list[str]] = None
+    profiles: Optional[list[str]] = None
     count_column: Optional[str] = "pii_count"
     _detector: Optional[PiiDetector] = PrivateAttr(default=None)
 
     @property
     def detector(self) -> PiiDetector:
         if self._detector is None:
-            self._detector = PiiDetector(types=self.types, min_confidence=self.min_confidence)
+            self._detector = PiiDetector(
+                types=self.types,
+                min_confidence=self.min_confidence,
+                locales=self.locales if self.locales is not None else ("ca",),
+                profiles=self.profiles or (),
+            )
         return self._detector
 
     def apply(self, frame: pd.DataFrame, count: bool = True) -> pd.DataFrame:

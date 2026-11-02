@@ -106,12 +106,18 @@ def fast_options(**kwargs) -> CaptureOptions:
 def test_capture_does_not_wait_for_a_slow_storage(fake):
     fake.delay_s = 0.5
     with Pulse(PARAMS, fast_options()) as pulse:
-        durations = []
+        durations, cpu = [], []
+        started = time.perf_counter()
         for k in range(20):
-            t = time.perf_counter()
+            t, c = time.perf_counter(), time.thread_time()
             pulse.capture_data(capture(k))
             durations.append(time.perf_counter() - t)
-        assert max(durations) < 0.05  # each write takes 0.5 s
+            cpu.append(time.thread_time() - c)
+        # each write takes 0.5 s: waiting for even one of them would exceed these bounds. They are generous on purpose
+        # (shared CI runners): the wall-clock time of a capture includes the scheduling of the other threads
+        assert time.perf_counter() - started < 2.0  # 20 blocking captures: 10 s
+        assert max(durations) < 0.4 and sorted(durations)[10] < 0.05
+        assert max(cpu) < 0.1  # time spent in the application thread itself
         assert pulse.flush(10)
         assert pulse.stats()["written_rows"] == 200
 

@@ -110,3 +110,38 @@ def test_stats_reporter_never_raises():
     time.sleep(0.12)
     reporter.stop()
     assert reporter.errors >= 2
+
+
+def test_optional_metric_results_fields_have_stable_types():
+    base = {"metric_type": "drift", "metric_name": "ks_2samp", "metric_value": 0.2, "drift_status": None}
+    missing = line(
+        {
+            **base,
+            "n_labelled": None,
+            "label_coverage": None,
+            "missing_share_current": None,
+            "missing_share_reference": None,
+            "reliable": None,
+            "status": None,
+        }
+    )
+    for name in ("n_labelled", "label_coverage", "missing_share", "reliable", "result_status"):
+        assert name not in missing  # None values are left out
+    assert "status=-1i" in missing
+    present = line(
+        {
+            **base,
+            "n_labelled": 120,
+            "label_coverage": 1,
+            "missing_share_current": 0.05,
+            "missing_share_reference": 0,
+            "reliable": False,
+            "status": "constant_reference",
+        }
+    )
+    # integers and floats are both written as floats (no "i" suffix): no field type conflict from one write to the next
+    for part in ("n_labelled=120,", "label_coverage=1,", "missing_share_current=0.05,", "missing_share_reference=0,"):
+        assert part in present
+    assert "120i" not in present
+    assert "reliable=false" in present
+    assert 'result_status="constant_reference"' in present and "status=-1i" in present  # the verdict is kept

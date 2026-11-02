@@ -3,7 +3,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Literal, Optional, Union
 
 import pandas as pd
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from .config import factories
 from .privacy import PiiPolicy
@@ -118,6 +118,27 @@ class CaptureOptions(BaseModel):
     pii: Optional[PiiPolicy]
     Personal information in the text columns: masked (or only counted) before the rows are queued, spooled or
     written. None (default): text is written as captured.
+    shared_writer: bool
+    Use the process-wide SharedWriter (one thread and one HTTP client for every Pulse of the process, rows of several
+    models in the same requests) instead of a private writer thread. Its batch size, flush interval, concurrency and
+    back-off are those of SharedWriter.default(); this Pulse keeps its own queue bound, spool and counters.
+    write_concurrency: int
+    Requests in flight at once for a private writer (1: one at a time, as before)
+    probe_interval_s: Optional[float]
+    While the storage is considered unavailable, probe it (InfluxDB /ping) this often and resume as soon as it
+    answers, instead of waiting for the back-off delay. None: back-off only.
+    durability: "memory" (default) or "wal"
+    wal: every batch is also written to spool_dir before capture_data() returns and deleted once stored, so that a
+    crash of the process (kill -9) loses nothing; costs a file write per capture. Needs spool_dir.
+    spool_max_bytes: Optional[int]
+    Size limit of spool_dir; beyond, spool_eviction decides which rows are dropped (counted in dropped_rows)
+    spool_eviction: "drop_oldest" (default) or "drop_newest"
+    spool_compression: Optional["gzip"]
+    gzip the spooled batches (about 2 times smaller on random floats, more on repetitive values)
+    replay_max_rows_per_s: Optional[float]
+    Throttle of the spool replay, so that replaying a long outage does not slow down the capture. None: unthrottled.
+    row_spacing_ns: int
+    Spacing of the timestamps of the rows of one capture (default 1 µs; it was 1 ms)
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -131,3 +152,18 @@ class CaptureOptions(BaseModel):
     spool_dir: Optional[Path] = None
     strict_startup: bool = False
     pii: Optional[PiiPolicy] = None
+    shared_writer: bool = False
+    write_concurrency: int = Field(1, ge=1, le=32)
+    probe_interval_s: Optional[float] = Field(1.0, gt=0)
+    durability: Literal["memory", "wal"] = "memory"
+    spool_max_bytes: Optional[int] = Field(None, gt=0)
+    spool_eviction: Literal["drop_oldest", "drop_newest"] = "drop_oldest"
+    spool_compression: Optional[Literal["gzip"]] = None
+    replay_max_rows_per_s: Optional[float] = Field(None, gt=0)
+    row_spacing_ns: int = Field(1_000, ge=1)
+
+    @model_validator(mode="after")
+    def check_durability(self):
+        if self.durability == "wal" and self.spool_dir is None:
+            raise ValueError('durability="wal" needs spool_dir')
+        return self

@@ -111,7 +111,6 @@ def test_luhn_valid_customer_and_confirmation_numbers_are_not_sins():
         f"Customer no. {SIN}, thank you.",
         f"Code de confirmation : {compact}",
         f"Confirmation number {compact}",
-        f"Matricule {SIN}",
         f"Votre réservation #{compact} est confirmée.",
         f"Code #{compact}",
     ):
@@ -224,3 +223,27 @@ def test_policy_passes_locales_and_profiles():
     masked = PiiPolicy(locales=["ca", "us"], profiles=["finance"]).apply(frame)
     assert masked["note"].tolist() == ["SSN [SSN]", "IBAN [IBAN]"]
     assert PiiPolicy().apply(frame)["pii_count"].tolist() == [0, 0]
+
+
+def test_words_proper_to_a_type_count_only_right_before_the_value():
+    """Review: in the 40-character window they hid SINs and phones that main found (PiiPolicy, inputs)"""
+    detector = PiiDetector()
+    assert types(detector, f"Employee Jean Tremblay {SIN}") == ["sin"]  # employers hold SINs
+    assert types(detector, f"Matricule de l'employé : {SIN}") == ["sin"]
+    assert types(detector, "Le membre Jean Tremblay, 514 555 0199") == ["phone"]
+    assert types(detector, f"Le client a confirmé, réponse {SIN}") == ["sin"]
+    for scope in ("window", "adjacent"):  # still lowered when adjacent (M18)
+        for text in (f"No client {SIN}", f"Customer no. {SIN}", f"Code de confirmation : {SIN.replace(' ', '')}"):
+            assert detector.scan(text, business_scope=scope) == [], (scope, text)
+
+
+def test_email_scan_is_linear_on_long_runs_without_at_sign():
+    import time
+
+    detector = PiiDetector(types=["email"])
+    for text in ("a" * 40_000, "a." * 20_000, "a@" + "b" * 40_000, "a@" + "b." * 20_000):
+        start = time.perf_counter()
+        detector.scan(text)
+        assert time.perf_counter() - start < 0.5  # about 2.4 s on main for 40,000 characters
+    assert types(detector, "écrivez à lea@exemple.ca.") == ["email"]
+    assert types(detector, "(x_lea.t+1@exemple.qc.ca)") == ["email"]

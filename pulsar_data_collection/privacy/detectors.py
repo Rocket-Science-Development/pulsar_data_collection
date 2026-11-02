@@ -78,7 +78,7 @@ class Recognizer:
     validate: Optional[Callable[[re.Match], bool]] = None
     requires_context: bool = False  # only reported when a context word is present (e.g. dates of birth)
     business_sensitive: bool = True  # lowered when a business word precedes
-    negative_words: tuple = ()  # words proper to this type announcing something else (e.g. "client" for a SIN)
+    negative_words: tuple = ()  # proper to this type, right before the value: something else ("client" for a SIN)
     weak_context_words: tuple = ()  # context words that an adjacent negative word overrides ("numéro de membre")
     negative_prefix: Optional[re.Pattern] = None  # a format cue just before the value (e.g. "#") lowers it
     adjacent_context: bool = False  # the context word must be immediately before (short values, e.g. a CVV)
@@ -212,10 +212,6 @@ _SIN_NEGATIVE = (
     "membre",
     "member",
     "confirmation",
-    "matricule",
-    "employé",
-    "employe",
-    "employee",
     "abonné",
     "abonne",
     "subscriber",
@@ -278,7 +274,8 @@ RECOGNIZERS = [
     Recognizer(
         "email",
         "[EMAIL]",
-        re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)*\.[A-Za-z]{2,}"),
+        # the lookbehind starts a match only at the start of a run: linear on long runs without "@"
+        re.compile(r"(?<![A-Za-z0-9._%+-])[A-Za-z0-9._%+-]+@[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)*\.[A-Za-z]{2,}"),
         0.95,
         business_sensitive=False,
         locale="any",
@@ -744,11 +741,14 @@ class PiiDetector:
                     continue
                 else:
                     confidence = base
-                    negatives = (BUSINESS_WORDS if r.business_sensitive else ()) + r.negative_words
+                    business = BUSINESS_WORDS if r.business_sensitive else ()
                     if business_scope == "adjacent":
-                        lowered_by_word = _adjacent(negatives, before)
+                        lowered_by_word = _adjacent(business, before)
                     else:
-                        lowered_by_word = bool(negatives) and _has(negatives, before)
+                        lowered_by_word = bool(business) and _has(business, before)
+                    # Words proper to a type count only right before the value, whatever the scope: "No client
+                    # 130 692 544" is a customer number, "Customer Jean Tremblay 130 692 544" may be a SIN
+                    lowered_by_word = lowered_by_word or _adjacent(r.negative_words, before)
                     if lowered_by_word or (r.negative_prefix is not None and r.negative_prefix.search(before)):
                         confidence = min(confidence, 0.3)
                 if r.type in ("phone", "sin", "credit_card") and AMOUNT_AFTER.match(text, match.end()):

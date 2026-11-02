@@ -382,9 +382,11 @@ locales and profiles.
 
 - **Context**: a word such as "NAS", "téléphone" or "passport" just before raises the confidence; a word announcing a
   business number ("dossier", "commande", "order", "invoice"...) lowers it below the threshold, and so does a currency
-  right after a number ("514 555 0199 $" is an amount). Some types also have words of their own: "client",
-  "customer", "membre", "confirmation", "matricule", "réservation"... before a number shaped like a SIN, and "membre",
-  "confirmation"... right before a phone number ("Numéro de membre 514-555-0123"); a SIN is never written after "#".
+  right after a number ("514 555 0199 $" is an amount). Some types also have words of their own, which count
+  only right before the value (possibly followed by "no", "n°", "#" or ":"): "client", "customer", "membre",
+  "confirmation", "réservation"... before a number shaped like a SIN ("No client 130 692 544"), and "membre",
+  "confirmation"... before a phone number ("Numéro de membre 514-555-0123"); a SIN is never written after "#".
+  "Customer Jean Tremblay 130 692 544" is still a SIN.
   Findings below `min_confidence` (0.5) are ignored. A RAMQ number in lower case gets 0.55 instead of 0.9.
 - **Tabular models**: `CaptureOptions(pii=PiiPolicy())` masks the text columns in `capture_data`, in the caller's
   thread, so raw values never reach the queue, the spool directory or the database; a `pii_count` column counts the
@@ -453,6 +455,8 @@ scripted conversations).
 - **Addresses**: the rules need a civic number and a street type ("rue", "avenue", "boul.", "Street", "Ave"...) and a
   capitalized street name; an address without a number, in lower case, or with an unusual street type is left to the
   model (`ModelPiiDetector`). Postal codes and cities are separate findings.
+- **Customer numbers**: "Customer 130-692-544" (the word right before, no name in between) is read as a customer
+  number and not reported; a SIN written that way is missed.
 
 ## Analysis results and capture statistics for dashboards
 

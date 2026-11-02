@@ -24,10 +24,15 @@ All notable changes to pulsar-data-collection. The format follows
   narrow rule creates no false leak.
 - A RAMQ number with dashes or in lower case is recognized (lower case at confidence 0.55 instead of 0.9); the date
   validation is unchanged. LP-02 (M17: recall 0.80 -> 1.00).
-- Words proper to a type: before a number shaped like a SIN, "client", "customer", "membre", "confirmation",
-  "matricule", "réservation"... lower it, and so does "#" right before; "membre", "confirmation"... right before a
-  phone number beat a generic "numéro". LP-02 (M18: SIN precision 0.81 -> 1.00 on the lab generator).
+- Words proper to a type, counted only right before the value whatever the scope: "client", "customer", "membre",
+  "confirmation", "réservation"... lower a number shaped like a SIN, and so does "#"; "membre", "confirmation"...
+  before a phone number beat a generic "numéro". Employee words are not among them (employers hold SINs). LP-02
+  (M18: SIN precision 0.81 -> 1.00 on the lab generator).
 - Context-word matching uses one compiled pattern per word list (LP-02 throughput about 2.7 times higher).
+
+### Fixed
+- The e-mail pattern starts a match only at the start of a run of local-part characters: a scan was quadratic on
+  long runs without "@" (40,000 characters took about 2.4 s), it is now linear (under 0.03 s).
 
 ## [0.9.0] - 2026-11-02
 

@@ -3,6 +3,37 @@
 All notable changes to pulsar-data-collection. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [Unreleased] - genai-detectors
+
+### Added
+- `InjectionDetector`: per-language alert thresholds (`threshold`, `thresholds`, `language`), `calibrate()` on a benign
+  A/A reference (returns the false-alarm rate and the recall it costs), `flag()`, `record()` (writes
+  `pulsar.detector.injection_flag`), `score_many()`, `calibrator`, `from_logits` (double-precision scores: the
+  single-precision ones saturate and tie near 1), `french_benign_calibration_set()`, `guess_language()` (M10, M11, M12).
+- `calibrate_threshold` (A/A order statistic, both directions) and `ScoreCalibrator` (isotonic or Platt), as the
+  scores are ranks, not probabilities (m12, m15).
+- `TextClassifierDetector` (any Hugging Face text classifier) and `ContentSafetyDetector`, a slot without a default
+  model (m13).
+- `ModelPiiDetector`: `device` (m14), per-label `thresholds`, overlapping windows (`window_words`, `overlap_words`)
+  so that entities beyond GLiNER's 384-word window are found (M14), batched model calls, `locales` and `profiles`
+  passed to the default `PiiDetector`, `scan(text, business_scope=...)` forwarded to rules that accept it.
+- `FaithfulnessScorer`: overlapping premise windows (`window_tokens`, `stride_tokens`) with the best window per
+  sentence (M20), `max_sentences` as a constructor parameter (`None` = all) and `aggregate="min"` (M21), lexical
+  shortcut for verbatim copies (`lexical_threshold`) and `max_claim_words` (M22), `details()` returning a
+  `FaithfulnessResult` (coverage, windows, truncation), `record()` (M19).
+- `CanaryProbe.preset()`, `planned_answers`, `required_answers()`, a warning under 480 answers (M23).
+- README: known limits of the detectors with the lab figures (M10-M14, M19-M23, m12-m15).
+
+### Changed
+- `FaithfulnessScorer` cuts the passages into windows by default: the former single premise was silently truncated at
+  512 tokens (64.9 % of RAGTruth premises), which is the defect; `window_tokens=None` restores it. Verbatim sentences
+  now score 1.0 (`lexical_threshold=None` restores the model score). Scores of long contexts rise.
+- `ModelPiiDetector` merges by default with `merge="enclosing"`: a model address holding a rule-found postal code or
+  phone number replaces them (it used to be dropped), and overlapping addresses are merged; `merge="rules"` restores
+  the former rule.
+- `CanaryProbe` defaults to 48 prompts x 10 answers (was 12 x 5, which did not detect a quantisation change);
+  `DEFAULT_PROMPTS` keeps the former 12 first; `CanaryProbe.preset("quick")` gives the former set.
+
 ## [0.9.0] - 2026-11-02
 
 ### Added

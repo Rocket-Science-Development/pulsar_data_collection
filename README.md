@@ -342,13 +342,114 @@ placebo-00002   ref_b placebo check_eligibility
 
 | Detector | Score | Default model |
 |---|---|---|
-| `InjectionDetector` | probability that a text is a prompt injection or a jailbreak | protectai/deberta-v3-base-prompt-injection-v2 (Apache 2.0) |
+| `InjectionDetector` | score that a text is a prompt injection or a jailbreak | protectai/deberta-v3-base-prompt-injection-v2 (Apache 2.0) |
 | `ModelPiiDetector` | rule-based findings plus names and street addresses | urchade/gliner_multi_pii-v1 (Apache 2.0) |
 | `FaithfulnessScorer` | share of the answer entailed by the retrieved passages (multilingual NLI) | MoritzLaurer/mDeBERTa-v3-base-xnli-multilingual-nli-2mil7 (MIT) |
+| `ContentSafetyDetector` | harmful content, from a classifier of your choice | none: pass `model` and its unsafe `positive_labels` |
 
 Any classifier with a `score()` method fits (e.g. Prompt Guard 2, under the Llama licence); `record_score(span, name,
-value)` writes it. `CanaryProbe` asks a fixed set of prompts several times and saves the answers (they are not user
-data) for `pulsar_metrics.genai.model_equality`.
+value)` writes it, and `TextClassifierDetector(model, name=..., positive_labels=[...])` wraps any Hugging Face text
+classifier. The scores are **ranks, not calibrated probabilities**: alert on a threshold fitted on a benign reference
+of the deployment (A/A), not on 0.5.
+
+```python
+from pulsar_data_collection.genai.detectors import (
+    FaithfulnessScorer, InjectionDetector, ModelPiiDetector, ScoreCalibrator, calibrate_threshold,
+    french_benign_calibration_set,
+)
+
+injection = InjectionDetector(from_logits=True, device="auto")  # double-precision scores, see below
+fit = injection.calibrate(french_benign_calibration_set(), language="fr", target_fpr=0.01, positives=known_fr_attacks)
+print(fit.threshold, fit.fit_fpr, fit.recall)  # the French threshold, and the French recall it costs
+injection.record(span, text)                   # pulsar.detector.injection and pulsar.detector.injection_flag
+
+pii = ModelPiiDetector(device="auto", thresholds={"street address": 0.3})  # windows of 250 words, overlap 50
+scorer = FaithfulnessScorer(max_sentences=None)
+result = scorer.record(span, answer, passages)  # faithfulness, _min, _coverage and _windows on the span
+threshold = calibrate_threshold(reference_scores, target_fpr=0.05, direction="low").threshold
+calibrated = ScoreCalibrator("isotonic").fit(scores, labels)  # with labelled data of the deployment
+```
+
+Parameters:
+
+- `InjectionDetector` and `TextClassifierDetector`: `model`, `device` (None = CPU, `"auto"`, `"cuda:0"`...),
+  `threshold` (default 0.5), `thresholds` (per language, e.g. `{"fr": ...}`), `language` (callable, default
+  `guess_language`, a French/English heuristic), `calibrator` (applied to the raw score), `from_logits` (default False).
+  `calibrate(benign, language, target_fpr, positives)` fits a threshold so that at most `target_fpr` of the benign
+  texts raise the alert, and returns a `ThresholdCalibration` (`threshold`, `fit_fpr`, `recall` on the given
+  positives, `sufficient`: False when fewer than 1/target_fpr - 1 benign texts are given). `flag(text, language=None)`
+  and `record(span, text)` apply the threshold of the text's language; `score_many(texts)` scores in batches.
+  `french_benign_calibration_set()` gives 154 synthetic benign French requests (5 kinds, imperatives such as
+  "Ouvrez-moi un dossier" or "Ignorez les détails..."): a starting point, to be replaced by the deployment's traffic.
+- `from_logits=True` computes the score from the logits in double precision. The pipeline's single-precision scores
+  saturate at 0.99999976: benign French imperatives and real attacks then tie, and no threshold separates them
+  (`calibrate` warns). On the default model, a French threshold fitted on half of the starter set kept 1.3 % false
+  alarms on the other half and caught 3 of 6 hand-written French attacks with `from_logits=True`, none without.
+- `ModelPiiDetector`: `device`, `thresholds` (per GLiNER label: `"person"`, `"street address"`, `"date of birth"`),
+  `window_words` and `overlap_words` (default 250 and 50: GLiNER reads at most 384 of its own tokens, punctuation
+  included), `merge` (`"enclosing"`, the default: an address that holds a rule-found postal code or phone number
+  replaces them, and is merged with overlapping rule-found addresses; `"rules"`: the model entity is dropped, as
+  before 0.10), `locales` and `profiles` (passed to the default `PiiDetector`), `batch_size`. `scan(text,
+  business_scope=...)` forwards `business_scope` to the rules detector when it accepts it.
+- `FaithfulnessScorer`: `window_tokens` and `stride_tokens` (default 400 and 300: the joined passages are cut into
+  overlapping windows and each sentence keeps its best window; `None` restores the single 512-token premise, silently
+  truncated), `max_sentences` (default 6, `None` = all), `lexical_threshold` (default 1.0: a sentence whose word
+  trigrams are all in the passages, i.e. a verbatim copy, is supported without the model; `None` disables),
+  `max_claim_words` (splits long sentences at commas and semicolons, default off), `aggregate` (`"mean"` or `"min"`).
+  `details(answer, passages)` returns a `FaithfulnessResult`: `score`, `min`, `sentences` (support per sentence),
+  `lexical`, `sentences_total`, `sentences_scored`, `coverage`, `premise_tokens`, `windows`, `truncated`.
+
+`CanaryProbe` asks a fixed set of prompts several times and saves the answers (they are not user data) for
+`pulsar_metrics.genai.model_equality`. Since 0.10 the default is 48 prompts x 10 answers (480 calls per run;
+`DEFAULT_PROMPTS`, whose first 12 are the former set). Presets: `CanaryProbe.preset("quick")` (12 x 5), `"standard"`
+(48 x 10) and `"thorough"` (48 x 20). A canary smaller than `required_answers("quantisation")` warns.
+
+| Change of the served model | Canary answers needed (lab) |
+|---|---|
+| other weights, other model family | about 60 (`required_answers("weights")`) |
+| same weights, other quantisation | about 480 (`required_answers("quantisation")`) |
+
+#### Known limits of the detectors (night lab, 2026-11-02)
+
+- **Injection recall (LI-01).** At 0.5, recall 0.414 [0.357-0.475] on deepset/prompt-injections (n = 662, 263
+  positives; English subset 0.345); 52 % of its positives score under 0.01. A threshold cannot recover attacks that
+  the model scores near 0: change `model`, or combine detectors.
+- **Benign prompts flagged (LI-01).** False-alarm rate 0.0935 [0.089-0.098] at 0.5 on 16 989 "regular" in-the-wild
+  prompts (TrustAIRLab; English 0.077, other languages 0.144), whose labels are noisy. Fit the threshold on the
+  deployment's benign traffic, and report the benign false-alarm rate with the alert.
+- **French imperatives (LI-02, LS-01).** Benign French agent requests flagged 151/1000 at 0.5, all of the "Ouvrez-moi
+  un dossier" kind (151/253, 0.60), against 0/256 in English; an absolute `injection > 0.5` alert fired in 10 A/A
+  windows out of 10. A French threshold fitted on a benign A/A reference (0.999994) brings the French false-alarm rate
+  down to 0.0105, but **French recall falls from 0.759 to 0.567**: a per-language threshold trades recall for quiet.
+- **Not calibrated (LI-01, LR-01).** Expected calibration error 0.237 (injection, deepset), 0.100 (injection,
+  TrustAIRLab), 0.209 (faithfulness, RAGTruth). On TrustAIRLab, injection scores in 0.9-1.0 held 45 % positives; on
+  RAGTruth, answers with a faithfulness score in 0.0-0.1 were faithful in 65 % of the cases. Use `ScoreCalibrator` with
+  labelled data, or `calibrate_threshold`.
+- **No content safety (LI-01).** Harmful requests without an injection wrapper (JailbreakBench) were flagged 0/100
+  [0-0.037] by `InjectionDetector`: `det_injection` does not cover harmful content. `ContentSafetyDetector` has no
+  default model, since none has been evaluated here for French and English.
+- **Addresses (LP-01).** Recall of rules + GLiNER at 0.5: 0.496 (English) and 0.639 (French addresses, France format).
+  Part of it was lost to the former merge rule (an address holding a postal code was dropped; it is kept with
+  `merge="enclosing"`). No threshold sweep was run: lower the `"street address"` threshold after measuring on your
+  own documents.
+- **Long documents (LP-01).** Before windows, names and addresses beyond GLiNER's 384-word window were never found
+  (recall 0.0, against 0.775 and 0.833 inside it). Windows without any person can produce generic false names ("je",
+  "le client"); a higher `"person"` threshold reduces them. GLiNER on CPU: p50 2.6 s per document, 0.14 s on a T4.
+- **Faithfulness ranking (LR-01).** Answer-level AUROC 0.616 on RAGTruth (n = 2700, 34.9 % hallucinated; QA 0.526,
+  Data2txt 0.552, Summary 0.599), below the number of sentences alone (0.645). Premise windows raised it to 0.689, and
+  the mean score of faithful answers from 0.485 to 0.669, on 400 answers (0.19 s per answer). The weakest-sentence
+  aggregate reached 0.675 over all sentences, still to be checked against a length-matched reference. Alert on window
+  means relative to an A/A reference rather than on an absolute level, and plug a RAG-specific checker through the
+  same `score(answer, context)` interface if needed.
+- **Sentence cap (LR-01).** 41.6 % of the RAGTruth answers have more than 6 sentences, and 15.6 % of the hallucinated
+  spans come after the 6th: use `max_sentences=None` (the cost grows with sentences x windows) and watch `coverage`.
+- **Length (LR-02).** Reference answers copied from the passage scored 0.292 on average (0.237 above 25 words): long
+  hypotheses are rarely entailed. The lexical shortcut fixes verbatim copies only. Paraphrases keep a level that falls
+  with length, so an alert on a window mean drifts when the length of the answers changes.
+- **Canary sample size (LM-01).** 12 x 5 detected a q4_K_M to q8_0 change in 20 % of the runs (llama3.2 3B; 40 % for
+  llama3.1 8B), 48 x 5 in 60 %, 48 x 10 in 5 runs out of 5; q4_K_M to fp16 at 12 x 10: 0 %. The repetitions came from
+  few, correlated batches (the lower 95 % bound of 5/5 is near 0.48), and 48 x 10 was never run against fp16: check
+  on your own model.
 
 ## Personal information
 

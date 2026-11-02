@@ -2,7 +2,7 @@
 name = "pulsar-data-collection"
 version = "0.10.0"
 description = "sdk enabling data collection from model serving code for our MPM solution"
-authors = [{ name = "Pulsar team", email = "pulsar@data-rs.io" }]
+authors = [{ name = "Développement Science Fusée inc.", email = "mlops@rocketscience.one" }]
 readme = "README.md"
 license = { text = "Apache-2.0" }
 requires-python = ">=3.12"

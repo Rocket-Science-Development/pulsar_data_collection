@@ -108,8 +108,19 @@ def test_aliases_from_other_sdks_are_normalized():
     assert record_type == "llm_call" and record["request_model"] == "granite3.3:2b" and record["input_tokens"] == 12
 
 
-def test_trace_without_local_root_is_assembled_after_timeout():
-    assembler = TrajectoryAssembler(trace_timeout_s=5)
+def test_agent_span_under_a_remote_parent_is_assembled_when_it_ends():
+    assembler = TrajectoryAssembler()
+    # the agent span's parent (e.g. an HTTP server span) lives in another process and never arrives here
+    tool = SpanView(1, 3, 2, "t", 0, 10, False, {sc.OPERATION: sc.OP_EXECUTE_TOOL, sc.TOOL_NAME: "search_programs"})
+    agent = SpanView(1, 2, 99, "a", 0, 20, False, {sc.OPERATION: sc.OP_INVOKE_AGENT, sc.AGENT_NAME: "x"}, parent_remote=True)
+    assert [r[0] for r in assembler.add(tool, now_ns=0)] == ["tool_call"]
+    ((record_type, run, _),) = assembler.add(agent, now_ns=1)
+    assert record_type == "agent_run" and run["tool_calls"] == 1 and run["incomplete"] is False
+    assert assembler.stats()["pending_traces"] == 0
+
+
+def test_former_behaviour_assembles_a_trace_without_local_root_after_timeout():
+    assembler = TrajectoryAssembler(trace_timeout_s=5, wait_for_root=False)
     # the agent span's parent (e.g. an HTTP server span) lives in another process and never arrives here
     tool = SpanView(1, 3, 2, "t", 0, 10, False, {sc.OPERATION: sc.OP_EXECUTE_TOOL, sc.TOOL_NAME: "search_programs"})
     agent = SpanView(1, 2, 99, "a", 0, 20, False, {sc.OPERATION: sc.OP_INVOKE_AGENT, sc.AGENT_NAME: "x"})

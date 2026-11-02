@@ -1,18 +1,23 @@
 """OpenTelemetry SpanExporter turning GenAI spans into Pulsar records written with Pulse."""
 
+import logging
+import threading
 import time
+from collections import deque
 from datetime import datetime, timezone
-from typing import Optional, Protocol, Sequence
+from typing import Any, Optional, Protocol, Sequence
 
 import pandas as pd
-from opentelemetry.sdk.trace import ReadableSpan
+from opentelemetry.sdk.trace import ReadableSpan, SpanProcessor
 from opentelemetry.sdk.trace.export import SpanExporter, SpanExportResult
 from opentelemetry.trace import StatusCode
 
 from ..models import CaptureOptions, DataWithPrediction, PulseParameters
 from ..pulse import Pulse
 from . import semconv as sc
-from .trajectory import SpanView, TrajectoryAssembler
+from .trajectory import OpenRun, SpanView, TrajectoryAssembler
+
+log = logging.getLogger(__name__)
 
 RECORD_TYPES = ("agent_run", "tool_call", "llm_call")
 
@@ -95,6 +100,7 @@ def span_view(span: ReadableSpan) -> SpanView:
         end_ns=span.end_time,
         status_error=span.status.status_code == StatusCode.ERROR,
         attributes=dict(span.attributes or {}),
+        parent_remote=bool(span.parent is not None and span.parent.is_remote),
     )
 
 
@@ -102,7 +108,8 @@ class PulsarSpanExporter(SpanExporter):
     """OpenTelemetry exporter: GenAI spans -> agent runs, tool calls and LLM calls -> sink (InfluxDB via Pulse)
 
     Only features are kept: prompts, responses and tool arguments are not written (arguments are hashed to detect
-    loops). Use with a BatchSpanProcessor so that the application thread never waits.
+    loops). Use with a BatchSpanProcessor so that the application thread never waits. Register `run_tracker()` as a
+    second span processor to report the runs that never end (`termination="incomplete"` after `max_run_s`).
 
     Parameters
     ----------
@@ -111,27 +118,147 @@ class PulsarSpanExporter(SpanExporter):
     allowed_tools : set of str, optional
         Tools the agent may call; others are counted as out-of-scope calls
     trace_timeout_s : float, optional
-        Inactivity after which a trace whose root span is not received is assembled anyway (default 30 s)
+        Only with `wait_for_root=False`: inactivity after which a trace whose root span is not received is assembled
+        anyway (default 30 s; this former behaviour lost the LLM and tool calls of the runs longer than 30 s)
+    wait_for_root, orphan_timeout_s, max_run_s, max_pending_traces : optional
+        Assembly of the traces, see TrajectoryAssembler
+    loop_window, loop_min_repeats, compliance, rules_version : optional
+        Agent run features, see TrajectoryAssembler
     """
 
-    def __init__(self, sink: RecordSink, allowed_tools: Optional[set] = None, trace_timeout_s: float = 30.0):
+    def __init__(
+        self,
+        sink: RecordSink,
+        allowed_tools: Optional[set] = None,
+        trace_timeout_s: float = 30.0,
+        *,
+        wait_for_root: bool = True,
+        orphan_timeout_s: Optional[float] = 3600.0,
+        max_run_s: Optional[float] = 600.0,
+        max_pending_traces: int = 10_000,
+        loop_window: int = 4,
+        loop_min_repeats: int = 2,
+        compliance: Any = None,
+        rules_version: Optional[str] = None,
+    ):
         self.sink = sink
-        self.assembler = TrajectoryAssembler(allowed_tools=allowed_tools, trace_timeout_s=trace_timeout_s)
+        self.assembler = TrajectoryAssembler(
+            allowed_tools=allowed_tools,
+            trace_timeout_s=trace_timeout_s,
+            max_pending_traces=max_pending_traces,
+            wait_for_root=wait_for_root,
+            orphan_timeout_s=orphan_timeout_s,
+            max_run_s=max_run_s,
+            loop_window=loop_window,
+            loop_min_repeats=loop_min_repeats,
+            compliance=compliance,
+            rules_version=rules_version,
+        )
+        self._lock = threading.Lock()
+        self._started: deque = deque()  # filled by OpenRunTracker.on_start without taking the lock
+
+    def _drain_started(self) -> None:
+        while self._started:
+            self.assembler.run_started(self._started.popleft())
 
     def export(self, spans: Sequence[ReadableSpan]) -> SpanExportResult:
         now = time.time_ns()
-        for span in spans:
-            for record in self.assembler.add(span_view(span), now_ns=now):
+        with self._lock:
+            self._drain_started()
+            for span in spans:
+                for record in self.assembler.add(span_view(span), now_ns=now):
+                    self.sink.write(*record)
+            for record in self.assembler.flush_idle(now):
                 self.sink.write(*record)
-        for record in self.assembler.flush_idle(now):
-            self.sink.write(*record)
         return SpanExportResult.SUCCESS
+
+    def check_open_runs(self, now_ns: Optional[int] = None) -> int:
+        """Write the `incomplete` records of the runs open for longer than `max_run_s`; return how many were written
+
+        Called periodically by `run_tracker()`, and on every export.
+        """
+        now = time.time_ns() if now_ns is None else now_ns
+        with self._lock:
+            self._drain_started()
+            records = self.assembler.flush_idle(now)
+            for record in records:
+                self.sink.write(*record)
+        return sum(1 for record in records if record[1].get("incomplete"))
+
+    def run_tracker(self, check_interval_s: Optional[float] = 10.0) -> "OpenRunTracker":
+        """Span processor that sees the agent spans start, so that a run that never ends is still reported"""
+        return OpenRunTracker(self, check_interval_s=check_interval_s)
+
+    def stats(self) -> dict:
+        """Assembly counters: partial_traces_dropped, partial_spans_dropped, incomplete_runs, compliance_errors,
+        pending_traces, open_runs"""
+        with self._lock:
+            self._drain_started()
+            return self.assembler.stats()
 
     def force_flush(self, timeout_millis: int = 30_000) -> bool:
         self.sink.flush()
         return True
 
     def shutdown(self) -> None:
-        for record in self.assembler.flush_all():
-            self.sink.write(*record)
+        with self._lock:
+            self._drain_started()
+            for record in self.assembler.flush_all():
+                self.sink.write(*record)
         self.sink.close()
+
+
+class OpenRunTracker(SpanProcessor):
+    """Span processor registering the start of the agent spans with a PulsarSpanExporter
+
+    The exporter only receives finished spans: a run blocked in a model call that never returns sends nothing. With
+    this processor, such a run is reported by an `agent_run` record (`termination="incomplete"`, `incomplete=True`,
+    `latency_s` = time open so far) once it has been open for `max_run_s`. `on_start` only appends to a queue: the
+    application thread never waits for the exporter. A background thread checks every `check_interval_s` seconds
+    (None: no thread; checks then happen on each export and on `exporter.check_open_runs()`).
+
+    Usage: `provider.add_span_processor(BatchSpanProcessor(exporter))`, then
+    `provider.add_span_processor(exporter.run_tracker())`.
+    """
+
+    def __init__(self, exporter: PulsarSpanExporter, check_interval_s: Optional[float] = 10.0):
+        self._exporter = exporter
+        self._stop = threading.Event()
+        self._thread = None
+        if check_interval_s:
+            self._thread = threading.Thread(target=self._loop, args=(check_interval_s,), name="pulsar-open-runs", daemon=True)
+            self._thread.start()
+
+    def _loop(self, interval_s: float) -> None:
+        while not self._stop.wait(interval_s):
+            try:
+                self._exporter.check_open_runs()
+            except Exception:  # noqa: BLE001 - the watchdog must survive a faulty sink
+                log.warning("checking the open agent runs failed", exc_info=True)
+
+    def on_start(self, span, parent_context=None) -> None:
+        attributes = span.attributes or {}
+        if attributes.get(sc.OPERATION) != sc.OP_INVOKE_AGENT:
+            return
+        parent = span.parent
+        self._exporter._started.append(
+            OpenRun(
+                trace_id=span.context.trace_id,
+                span_id=span.context.span_id,
+                parent_id=parent.span_id if parent is not None else None,
+                name=span.name,
+                start_ns=span.start_time,
+                attributes=dict(attributes),
+            )
+        )
+
+    def on_end(self, span) -> None:
+        pass
+
+    def shutdown(self) -> None:
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=5)
+
+    def force_flush(self, timeout_millis: int = 30_000) -> bool:
+        return True

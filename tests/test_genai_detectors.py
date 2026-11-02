@@ -1,3 +1,5 @@
+import pytest
+
 import pulsar_data_collection.genai.detectors as detectors
 from pulsar_data_collection.genai import CanaryProbe, FaithfulnessScorer, InjectionDetector, record_score
 
@@ -70,9 +72,10 @@ def test_canary_probe_collects_saves_and_loads(tmp_path):
             raise TimeoutError("dropped")
         return f"answer to {prompt[:10]}"
 
-    probe = CanaryProbe(prompts=["p1", "p2"], samples=3)
+    with pytest.warns(UserWarning, match="quantisation"):
+        probe = CanaryProbe(prompts=["p1", "p2"], samples=3)
     answers = probe.run(ask)
     assert sum(len(v) for v in answers.values()) == 5 and len(calls) == 6 and probe.failures == 1
     path = CanaryProbe.save(answers, tmp_path / "canary.json", model="llama3.2:3b", temperature=0.7)
     assert CanaryProbe.load(path) == answers
-    assert len(CanaryProbe().prompts) == 12
+    assert len(CanaryProbe.preset("quick").prompts) == 12

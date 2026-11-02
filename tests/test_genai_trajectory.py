@@ -139,12 +139,68 @@ def test_sub_agent_start_is_not_a_separate_open_run(pipeline):
     assert exporter.stats()["open_runs"] == 0 and len(sink.of("agent_run")) == 1
 
 
+def test_llm_calls_without_agent_never_make_a_fake_run():
+    # review: an LLM-only trace under a long-lived parent got an agent_run named "unknown"
+    assembler = TrajectoryAssembler(max_run_s=600)
+    assembler.add(chat(2, 0, 1, parent=10), now_ns=S)
+    assert assembler.flush_idle(now_ns=700 * S) == []
+    assert assembler.stats()["incomplete_runs"] == 0
+
+
+def test_completed_run_under_a_session_root_is_written_once():
+    # review: a finished agent run under a chat session span was written incomplete, then complete
+    assembler = TrajectoryAssembler(max_run_s=600)
+    assembler.add(chat(21, 1, 2, parent=20), now_ns=2 * S)
+    agent = SpanView(7, 20, 1, "invoke_agent", 0, 3 * S, False, {sc.OPERATION: sc.OP_INVOKE_AGENT, sc.AGENT_NAME: "bot"})
+    assembler.add(agent, now_ns=3 * S)
+    assert assembler.flush_idle(now_ns=700 * S) == []
+    session = SpanView(7, 1, None, "session", 0, 800 * S, False, {})
+    runs = [r for t, r, _ in assembler.add(session, now_ns=800 * S) if t == "agent_run"]
+    assert [(r["agent_name"], r["incomplete"], r["steps"]) for r in runs] == [("bot", False, 1)]
+
+
+def test_hung_run_is_reported_once_even_after_its_trace_is_given_up():
+    from pulsar_data_collection.genai.trajectory import OpenRun
+
+    assembler = TrajectoryAssembler(max_run_s=600, orphan_timeout_s=3600)
+    attrs = {sc.OPERATION: sc.OP_INVOKE_AGENT, sc.AGENT_NAME: "bot"}
+    assembler.run_started(OpenRun(7, 1, None, "invoke_agent bot", 0, attrs))
+    assembler.add(chat(2, 1, 2), now_ns=2 * S)
+    assert len(assembler.flush_idle(now_ns=700 * S)) == 1
+    assert assembler.flush_idle(now_ns=3700 * S) == []  # trace given up: the run is not reported again
+    assert assembler.flush_idle(now_ns=3800 * S) == []
+    stats = assembler.stats()
+    assert stats["incomplete_runs"] == 1 and stats["open_runs"] == 0 and not assembler._reported
+
+
+def test_hung_run_without_any_ended_span_is_forgotten_after_orphan_timeout():
+    from pulsar_data_collection.genai.trajectory import OpenRun
+
+    assembler = TrajectoryAssembler(max_run_s=600, orphan_timeout_s=3600)
+    assembler.run_started(OpenRun(7, 1, None, "a", 0, {sc.OPERATION: sc.OP_INVOKE_AGENT}))
+    assert len(assembler.flush_idle(now_ns=700 * S)) == 1
+    assert assembler.flush_idle(now_ns=3700 * S) == []
+    assert assembler.stats()["open_runs"] == 0 and not assembler._reported and not assembler._open_tree
+
+
+def test_sub_agent_below_an_intermediate_span_is_part_of_the_run(pipeline):
+    provider, tracer, sink, exporter = pipeline
+    provider.add_span_processor(exporter.run_tracker(check_interval_s=None))
+    with agent_span(tracer, "permit_assistant"):
+        with tool_span(tracer, "delegate"):  # a tool that starts a sub-agent
+            with agent_span(tracer, "document_checker"):
+                assert exporter.stats()["open_runs"] == 1
+    assert exporter.stats()["open_runs"] == 0 and len(sink.of("agent_run")) == 1
+    assert not exporter.assembler._open_tree
+
+
 def test_run_still_open_is_inferred_from_its_ended_spans_without_tracker():
     assembler = TrajectoryAssembler(max_run_s=60)
-    assembler.add(tool(3, "check_eligibility", 0, 5), now_ns=5 * S)
+    assembler.add(tool(3, "check_eligibility", 0, 5, **{sc.AGENT_NAME: "permit_assistant"}), now_ns=5 * S)
     assert assembler.flush_idle(now_ns=30 * S) == []
     ((record_type, run, _),) = assembler.flush_idle(now_ns=61 * S)
     assert record_type == "agent_run" and run["incomplete"] is True and run["tool_calls"] == 1
+    assert run["agent_name"] == "permit_assistant"
     assert assembler.flush_idle(now_ns=90 * S) == []
 
 

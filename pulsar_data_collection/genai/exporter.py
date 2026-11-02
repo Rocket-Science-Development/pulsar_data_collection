@@ -238,8 +238,8 @@ class OpenRunTracker(SpanProcessor):
 
     def on_start(self, span, parent_context=None) -> None:
         attributes = span.attributes or {}
-        if attributes.get(sc.OPERATION) != sc.OP_INVOKE_AGENT:
-            return
+        # every span start is queued (agent attributes only), so that a sub-agent below an intermediate span is known
+        agent = attributes.get(sc.OPERATION) == sc.OP_INVOKE_AGENT
         parent = span.parent
         self._exporter._started.append(
             OpenRun(
@@ -248,7 +248,7 @@ class OpenRunTracker(SpanProcessor):
                 parent_id=parent.span_id if parent is not None else None,
                 name=span.name,
                 start_ns=span.start_time,
-                attributes=dict(attributes),
+                attributes=dict(attributes) if agent else {},
             )
         )
 

@@ -472,6 +472,9 @@ class TrajectoryAssembler:
         self._first_start: dict[int, int] = {}
         self._open: dict[int, OpenRun] = {}  # span id -> open run (top-level agent span started, not ended)
         self._open_agents: dict[int, int] = {}  # span id -> trace id of every open agent span, sub-agents included
+        # span id -> (trace id, parent id) of the open agent spans and of the open spans below them, so that a sub-agent
+        # under an intermediate span (e.g. a tool that delegates) is recognised as part of the run
+        self._open_tree: dict[int, tuple] = {}
         self._reported: dict[int, set] = defaultdict(set)  # trace id -> runs already reported incomplete (span id/None)
         self._counters = Counter(partial_traces_dropped=0, partial_spans_dropped=0, incomplete_runs=0, compliance_errors=0)
 
@@ -480,17 +483,26 @@ class TrajectoryAssembler:
         return {**self._counters, "pending_traces": len(self._pending), "open_runs": len(self._open)}
 
     def run_started(self, run: OpenRun) -> None:
-        """Register an agent span that has just started (called by OpenRunTracker), to report it if it never ends"""
+        """Register a span that has just started (called by OpenRunTracker), to report its run if it never ends
+
+        Agent spans whose ancestors include no open agent span are top-level runs; other spans are kept only when they
+        are below an open agent span (to recognise the sub-agents started under them).
+        """
         attributes = sc.normalize(run.attributes)
-        if attributes.get(sc.OPERATION) != sc.OP_INVOKE_AGENT:
-            return
-        sub_agent = self._open_agents.get(run.parent_id) == run.trace_id
-        self._open_agents[run.span_id] = run.trace_id
-        if not sub_agent:
-            self._open[run.span_id] = OpenRun(run.trace_id, run.span_id, run.parent_id, run.name, run.start_ns, attributes)
-        for registry in (self._open, self._open_agents):
-            while len(registry) > self.max_pending_traces:
+        node = self._open_tree.get(run.parent_id) if run.parent_id is not None else None
+        under_agent = node is not None and node[0] == run.trace_id  # the tree only holds agent spans and their subtrees
+        if attributes.get(sc.OPERATION) == sc.OP_INVOKE_AGENT:
+            self._open_tree[run.span_id] = (run.trace_id, run.parent_id)
+            self._open_agents[run.span_id] = run.trace_id
+            if not under_agent:
+                self._open[run.span_id] = OpenRun(run.trace_id, run.span_id, run.parent_id, run.name, run.start_ns, attributes)
+        elif under_agent:
+            self._open_tree[run.span_id] = (run.trace_id, run.parent_id)
+        for registry, limit in ((self._open, self.max_pending_traces), (self._open_agents, self.max_pending_traces)):
+            while len(registry) > limit:
                 registry.pop(next(iter(registry)))
+        while len(self._open_tree) > 10 * self.max_pending_traces:
+            self._open_tree.pop(next(iter(self._open_tree)))
 
     def add(self, span: SpanView, now_ns: Optional[int] = None) -> list[tuple[str, dict, int]]:
         """Return the records completed by this span, as (record_type, record, end_time_ns)"""
@@ -500,9 +512,10 @@ class TrajectoryAssembler:
             records.append(("llm_call", llm_call_record(span), span.end_ns))
         elif span.operation == sc.OP_EXECUTE_TOOL:
             records.append(("tool_call", tool_call_record(span, self.allowed_tools), span.end_ns))
-        elif span.operation == sc.OP_INVOKE_AGENT:
+        if span.operation == sc.OP_INVOKE_AGENT:
             self._open.pop(span.span_id, None)
             self._open_agents.pop(span.span_id, None)
+        self._open_tree.pop(span.span_id, None)
 
         trace_id = span.trace_id
         self._pending.setdefault(trace_id, []).append(span)
@@ -527,13 +540,34 @@ class TrajectoryAssembler:
         if timeout is not None:
             idle = [t for t, seen in self._last_seen.items() if now_ns - seen >= timeout]
             records += [record for trace_id in idle for record in self._assemble(trace_id, partial=True)]
+        self._prune(now_ns)
         return records
+
+    def _prune(self, now_ns: int) -> None:
+        """Forget the hung runs already reported once `orphan_timeout_s` has passed, and the reports of forgotten traces"""
+        if self.orphan_timeout_ns is not None:
+            for run in list(self._open.values()):
+                hung = now_ns - run.start_ns >= self.orphan_timeout_ns
+                if hung and run.span_id in self._reported.get(run.trace_id, ()):
+                    self._drop_open(run.trace_id)
+        live = set(self._pending) | {run.trace_id for run in self._open.values()}
+        for trace_id in [t for t in self._reported if t not in live]:
+            del self._reported[trace_id]
+
+    def _drop_open(self, trace_id: int) -> None:
+        """Stop tracking the open spans of a trace that is given up"""
+        for registry in (self._open, self._open_agents):
+            for span_id in [k for k, v in registry.items() if (v.trace_id if isinstance(v, OpenRun) else v) == trace_id]:
+                del registry[span_id]
+        for span_id in [k for k, (t, _) in self._open_tree.items() if t == trace_id]:
+            del self._open_tree[span_id]
 
     def overdue_runs(self, now_ns: int, max_run_ns: Optional[int] = None, infer: bool = True) -> list[tuple[str, dict, int]]:
         """One `incomplete` agent_run for each run open for longer than `max_run_s` and not reported yet
 
-        Runs registered by `run_started` are known from their start; with `infer`, a trace whose root has not arrived
-        `max_run_s` after the start of its first ended span is reported too (from the spans received so far).
+        Runs registered by `run_started` are known from their start. With `infer`, a trace whose root has not arrived
+        `max_run_s` after the start of its first ended span is reported too, from the ended spans that carry an agent
+        name (gen_ai.agent.name) and are not below an agent span already received; never from LLM or tool calls alone.
         """
         limit = self.max_run_ns if max_run_ns is None else max_run_ns
         if limit is None:
@@ -547,18 +581,27 @@ class TrajectoryAssembler:
             records.append(self._incomplete_record(root, descendants, key=run.span_id, now_ns=now_ns))
         if not infer:
             return records
-        # traces whose agent span start was not seen (no OpenRunTracker): known from the spans that already ended
+        # without OpenRunTracker, an open run is inferred only from ended spans that carry an agent name and do not
+        # belong to an agent span already received (whose run is complete, e.g. under a long-lived session root)
         open_traces = {run.trace_id for run in self._open.values()}
         for trace_id, spans in list(self._pending.items()):
             if trace_id in open_traces or None in self._reported.get(trace_id, ()):
                 continue
             start = self._first_start.get(trace_id, now_ns)
-            if now_ns - start < limit or not any(s.operation for s in spans):
+            if now_ns - start < limit:
                 continue
-            name = next((s.attributes.get(sc.AGENT_NAME) for s in spans if s.attributes.get(sc.AGENT_NAME)), None) or "unknown"
+            by_id = {s.span_id: s for s in spans}
+            covered = set()
+            for s in spans:
+                if s.operation == sc.OP_INVOKE_AGENT and not self._has_agent_ancestor(s, by_id):
+                    covered |= {s.span_id, *(d.span_id for d in self._descendants(s, spans))}
+            loose = [s for s in spans if s.span_id not in covered]
+            name = next((s.attributes.get(sc.AGENT_NAME) for s in loose if s.attributes.get(sc.AGENT_NAME)), None)
+            if not name:
+                continue  # no agent identity: never synthesize a run
             attributes = {sc.OPERATION: sc.OP_INVOKE_AGENT, sc.AGENT_NAME: name}
             root = SpanView(trace_id, 0, None, name, start, now_ns, False, attributes)
-            records.append(self._incomplete_record(root, list(spans), key=None, now_ns=now_ns))
+            records.append(self._incomplete_record(root, loose, key=None, now_ns=now_ns))
         return records
 
     def flush_all(self, now_ns: Optional[int] = None) -> list[tuple[str, dict, int]]:
@@ -568,6 +611,7 @@ class TrajectoryAssembler:
         records += [record for trace_id in list(self._pending) for record in self._assemble(trace_id, partial=True)]
         self._open.clear()
         self._open_agents.clear()
+        self._open_tree.clear()
         self._reported.clear()
         return records
 
@@ -610,6 +654,8 @@ class TrajectoryAssembler:
             trace = subtree
         else:
             self._forget(trace_id)
+            if partial:
+                self._drop_open(trace_id)
         by_id = {s.span_id: s for s in trace}
         records, covered = [], set()
         for span in trace:

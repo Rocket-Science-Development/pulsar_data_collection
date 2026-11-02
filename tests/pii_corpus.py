@@ -33,7 +33,15 @@ def phone(rng):
 def ramq(rng):
     letters = "".join(rng.choice("ABCDEFGHIJKLMNOPRSTVW") for _ in range(4))
     month = rng.randint(1, 12) + rng.choice([0, 50])
-    return f"{letters} {rng.randint(40, 99):02d}{month:02d} {rng.randint(1, 28):02d}{rng.randint(10, 99)}"
+    compact = f"{letters}{rng.randint(40, 99):02d}{month:02d}{rng.randint(1, 28):02d}{rng.randint(10, 99)}"
+    return rng.choice(
+        [
+            f"{compact[:4]} {compact[4:8]} {compact[8:]}",
+            compact,
+            f"{compact[:4]}-{compact[4:8]}-{compact[8:]}",  # with dashes
+            f"{compact[:4].lower()} {compact[4:8]} {compact[8:]}",  # letters in lower case
+        ]
+    )
 
 
 def postal(rng):
@@ -71,7 +79,7 @@ POSITIVE = [
     ("sin", sin, ["Mon NAS est le {}.", "My SIN is {}.", "Numéro d'assurance sociale : {}", "{} (NAS)"]),
     ("credit_card", card, ["Payez avec la carte {}.", "Card number {} please", "Visa {}"]),
     ("phone", phone, ["Appelez-moi au {}.", "Call me at {}", "Mon cellulaire : {}", "Joignez-moi au {} demain."]),
-    ("ramq", ramq, ["Carte RAMQ : {}", "Mon numéro d'assurance maladie est {}.", "Health card {}"]),
+    ("ramq", ramq, ["Carte RAMQ : {}", "Mon numéro d'assurance maladie est {}.", "Health card {}", "C'est {} sur ma carte."]),
     ("postal_code", postal, ["J'habite au {} à Montréal.", "Code postal : {}", "Address postal code {}"]),
     ("email", email, ["Écrivez-moi à {}.", "Contact: {}", "Mon courriel est {}"]),
     ("date_of_birth", dob, ["Je suis né le {}.", "Date de naissance : {}", "DOB {}"]),
@@ -92,6 +100,13 @@ NEGATIVE = [
     "Version 2.3.4567 publiée le 12/03/2025.",
     "Le vol AC870 part à 21 h 05.",
     "ISBN 978-2-7604-1234-5",
+    # Luhn-valid numbers shaped like a SIN, announced by a word proper to another identifier
+    "No client 130 692 544, merci.",
+    "Customer no. 130 692 544, thank you.",
+    "Code de confirmation : 130692544",
+    "Confirmation number 130692544",
+    "Votre réservation #130692544 est confirmée.",
+    "Numéro de membre 514-555-0123",
 ]
 # Ambiguous by design, masked on purpose: a 16-digit number with a card prefix and a valid checksum is treated as a
 # card even after a business word (privacy first); these are reported apart, not counted as errors.

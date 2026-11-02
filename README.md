@@ -427,20 +427,40 @@ data) for `pulsar_metrics.genai.model_equality`.
 
 `pulsar_data_collection.privacy` detects personal information with **validated rules** (checksums, valid dates,
 issuer prefixes, context words) for Canada, in French and English, and **masks it before anything is written**.
-Findings carry the type, the position and a confidence, never the value.
+Other countries and financial identifiers are recognized on request. Findings carry the type, the position and a
+confidence, never the value.
 
 | Type | Label | Validation |
 |---|---|---|
 | `sin` (social insurance number) | `[SIN]` | 9 digits, Luhn checksum, first digit issued |
-| `ramq` (Québec health insurance number) | `[RAMQ]` | 4 letters + 8 digits, valid month (women: +50) and day |
+| `ramq` (Québec health insurance number) | `[RAMQ]` | 4 letters + 8 digits (spaces, dashes or none; any case), valid month (women: +50) and day |
 | `credit_card` | `[CREDIT_CARD]` | 13–19 digits, Luhn, issuer prefix |
 | `email`, `phone` (North American), `postal_code` (Canada) | `[EMAIL]`, `[PHONE]`, `[POSTAL_CODE]` | format |
 | `drivers_licence_qc`, `passport` (Canada) | `[DRIVERS_LICENCE]`, `[PASSPORT]` | format; a passport needs a context word |
 | `date_of_birth` | `[DATE_OF_BIRTH]` | valid date **and** a context word ("né le", "date of birth"...) |
 
+Opt-in, with `PiiDetector(locales=..., profiles=...)` or `PiiPolicy(locales=[...], profiles=[...])`:
+
+| Option | Types | Validation |
+|---|---|---|
+| `locales=("ca", "us")` | `ssn_us` (`[SSN]`) | 3-2-4 digits, never-issued ranges rejected; 9 plain digits only after "SSN" |
+| `locales=("ca", "fr")` | `phone` (French), `nir_fr` (`[NIR]`, sécurité sociale) | format; NIR key (97 − number mod 97), Corsica 2A/2B |
+| `locales=("ca", "uk")` | `phone` (UK), `nino_uk` (`[NINO]`, National Insurance) | format, excluded prefixes |
+| `locales=("ca", "intl")` | `phone` (E.164, "+33 1 23 45 67 89"), `passport`, `drivers_licence` (`[DRIVERS_LICENCE]`) | 8–15 digits; passports and licences of any country only after a context word |
+| `profiles=("finance",)` | `iban`, `bic`, `bank_account`, `bank_routing`, `card_security_code` (`[IBAN]`, `[BIC]`, `[BANK_ACCOUNT]`, `[BANK_ROUTING]`, `[CVV]`) | IBAN mod 97; BIC country code and a context word ("SWIFT", "BIC"); account, transit, institution and routing numbers after a context word ("numéro de compte", "transit", "routing"...), ABA checksum (with `us`), Canadian cheque order transit-institution-account; a CVV only right after its name |
+| `profiles=("address",)` | `street_address` (`[ADDRESS]`) | civic number and street type: "1234, boul. Saint-Laurent Ouest, app. 3", "12 rue de la Paix", "55 Maple Street", "100 King St W, Suite 200" |
+
+`TYPES` lists the types on by default, `ALL_TYPES` every type; a type named in `types=[...]` is on whatever the
+locales and profiles.
+
 - **Context**: a word such as "NAS", "téléphone" or "passport" just before raises the confidence; a word announcing a
   business number ("dossier", "commande", "order", "invoice"...) lowers it below the threshold, and so does a currency
-  right after a number ("514 555 0199 $" is an amount). Findings below `min_confidence` (0.5) are ignored.
+  right after a number ("514 555 0199 $" is an amount). Some types also have words of their own, which count
+  only right before the value (possibly followed by "no", "n°", "#" or ":"): "client", "customer", "membre",
+  "confirmation", "réservation"... before a number shaped like a SIN ("No client 130 692 544"), and "membre",
+  "confirmation"... before a phone number ("Numéro de membre 514-555-0123"); a SIN is never written after "#".
+  "Customer Jean Tremblay 130 692 544" is still a SIN.
+  Findings below `min_confidence` (0.5) are ignored. A RAMQ number in lower case gets 0.55 instead of 0.9.
 - **Tabular models**: `CaptureOptions(pii=PiiPolicy())` masks the text columns in `capture_data`, in the caller's
   thread, so raw values never reach the queue, the spool directory or the database; a `pii_count` column counts the
   findings per row. `PiiPolicy(action="flag")` only counts.
@@ -449,10 +469,14 @@ Findings carry the type, the position and a confidence, never the value.
   **leak** is personal information in an output that the user did not provide in the same session. The
   `agent_run`, `llm_call` and `tool_call` records gain `pii_<role>_count` and `pii_<role>_types` (`input`, `context`,
   `output`, `leak`), only when a session recorded something. The values given by the user stay in memory for the
-  session only.
+  session only. In outputs, a business word lowers a finding only when it is **right before the value**
+  (`output_business_scope="adjacent"`, default): "Votre dossier 130 692 544 est en traitement" is not a leak, "Le
+  dossier voisin indique aussi 130 692 544" is. `output_business_scope="window"` restores the 40-character window,
+  which hid every leak of an agent that mentions files. `PiiDetector.scan(text, business_scope="adjacent")` gives the
+  same rule outside a session.
 - Measured on a synthetic French and English corpus (fictitious values with valid checksums, plus business numbers
   that must not be detected): precision and recall of 1.00 for every type. The corpus is ours: real text will have
-  misses and false positives, and names and street addresses are not covered by rules.
+  misses and false positives, and names are not covered by rules.
 
 ```python
 import pandas as pd
@@ -482,6 +506,30 @@ Mon NAS est [SIN], écrivez à [EMAIL]. Dossier 450123456.
 1                     RAS   41000          0
 [Finding(type='phone', start=44, end=56, confidence=0.6)]
 ```
+
+### Known limits
+
+Measured by the night lab of 2026-11-02 (LP-01: 800 synthetic financial documents per language, from
+gretelai/synthetic_pii_finance_multilingual; LP-02: 100,000 generated sentences with 30 % hard negatives, 5,000
+scripted conversations).
+
+- **LP-02, after the fixes** (same generator and seed, rerun on the new rules): precision and recall 1.00 for `sin`,
+  `ramq`, `postal_code` and `phone` (were 0.811, 0.803, 1.00 and 0.896); leak counts exact in 5,000 of 5,000
+  conversations (5,006 of 5,006 leaks, were 2,381; with "dossier" in the output, 2,493 of 2,493, were 0). About
+  38,000 sentences per second on one core of a workstation (14,000 with the previous rules on the same machine).
+  The generator's hard negatives are all Luhn-valid (about 10 % of random 9-digit identifiers are), so real precision
+  differs; a Luhn-valid number with no context word at all is still reported as a SIN at 0.6.
+- **LP-01, rules only, before the fixes**: phone recall 0.325 (EN) and 0.029 (FR), passport, US SSN and driver's
+  licence 0.0, credit card 0.667 (EN) and 0.318 (FR), financial identifiers (IBAN, BBAN, SWIFT/BIC, routing numbers)
+  0 to 0.24, street addresses 0.0 (0.496 EN and 0.639 FR with `ModelPiiDetector`). The new locales, the "finance"
+  profile and the "address" profile target these gaps but are off by default and were not re-measured on that corpus;
+  some of its synthetic phone and card numbers are invalid, and rejecting them is correct. Customer and employee
+  identifiers, IP addresses, PINs and passwords have no type.
+- **Addresses**: the rules need a civic number and a street type ("rue", "avenue", "boul.", "Street", "Ave"...) and a
+  capitalized street name; an address without a number, in lower case, or with an unusual street type is left to the
+  model (`ModelPiiDetector`). Postal codes and cities are separate findings.
+- **Customer numbers**: "Customer 130-692-544" (the word right before, no name in between) is read as a customer
+  number and not reported; a SIN written that way is missed.
 
 ## Analysis results and capture statistics for dashboards
 

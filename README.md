@@ -313,8 +313,8 @@ carrying `gen_ai.operation.name` is read, whether it comes from an existing inst
 
 | `record_type` | One row per | Main fields |
 |---|---|---|
-| `agent_run` | agent run (`invoke_agent` span and its subtree) | `steps` (LLM calls), `tool_calls`, `distinct_tools`, `tool_error_rate`, `repeated_calls`, `loop_detected`, `out_of_scope_calls`, `delegation_depth`, `input_tokens`, `output_tokens`, `latency_s`, `termination`, `task_success`, `first_tool`, `tool_sequence`, `request_model`, `prompt_version` |
-| `tool_call` | `execute_tool` span | `tool_name`, `error`, `latency_s`, `out_of_scope` |
+| `agent_run` | agent run (`invoke_agent` span and its subtree) | `steps` (LLM calls), `tool_calls`, `distinct_tools`, `tool_error_rate`, `tool_errors`, `tool_timeouts`, `tool_soft_failures`, `tool_<tool>_calls` / `_errors` / `_timeouts` / `_soft_failures`, `tool_status_counts`, `repeated_calls`, `repeated_calls_window`, `max_same_tool_calls`, `tool_cycle_repeats`, `loop_detected`, `unavailable_tool_calls`, `tool_catalog_hash`, `incomplete`, `out_of_scope_calls`, `delegation_depth`, `input_tokens`, `output_tokens`, `latency_s`, `termination`, `task_success`, `first_tool`, `tool_sequence`, `request_model`, `prompt_version`; with `compliance`: `violated_rules`, `critical_violations`, `rules_version` |
+| `tool_call` | `execute_tool` span | `tool_name`, `error`, `status`, `timeout`, `soft_failure`, `latency_s`, `out_of_scope` |
 | `llm_call` | `chat` span | `request_model`, `response_model`, `provider`, `temperature`, `input_tokens`, `output_tokens`, `finish_reason`, `latency_s`, `error` |
 
 Only features are stored: prompts, responses and tool arguments are **not** written (arguments are hashed in memory to
@@ -351,9 +351,67 @@ provider.shutdown()  # at exit: assembles pending traces and closes the Pulse in
 Notes:
 - The GenAI conventions are at the "Development" stage: the attribute names read by Pulsar are pinned in
   `genai/semconv.py`, and aliases used by other SDKs (`llm.model_name`, `llm.token_count.prompt`...) are normalized.
-- An agent run is assembled when its trace's root span ends; if the root lives in another process (HTTP server span),
-  after `trace_timeout_s` without new span. Sub-agents are part of the run (`delegation_depth`).
+- An agent run is assembled when its local root span ends: the trace's root, or a span whose parent lives in another
+  process (HTTP server span). A trace is **never** assembled before its root arrives, however long the run takes.
+  Sub-agents are part of the run (`delegation_depth`).
 - Read a record type back with `|> filter(fn: (r) => r["record_type"] == "agent_run")`.
+
+### Long, stuck and failing runs
+
+```python
+exporter = PulsarSpanExporter(
+    PulseSink(params, options),
+    allowed_tools={"search_programs", "check_eligibility", "compute_amount"},
+    max_run_s=600,  # a run still open after 10 min is reported as incomplete (default)
+)
+provider.add_span_processor(BatchSpanProcessor(exporter))
+provider.add_span_processor(exporter.run_tracker())  # sees agent spans start: a run that never ends is still reported
+
+with agent_span(tracer, "permit_assistant", available_tools=[t["function"]["name"] for t in TOOL_SCHEMAS]):
+    with tool_span(tracer, "check_eligibility", arguments=args) as span:
+        output = check_eligibility(**args)
+        record_tool_result(span, output, validator=lambda out: isinstance(out.get("eligible"), bool))
+
+exporter.stats()  # {"partial_traces_dropped": 0, "partial_spans_dropped": 0, "incomplete_runs": 0, ...}
+```
+
+| Situation | What is written |
+|---|---|
+| Run longer than 30 s | The complete run, when its root ends. Former behaviour (`wait_for_root=False`): the trace was assembled after `trace_timeout_s` of inactivity, without its root, and the run lost its LLM and tool calls (`tool_calls=0`, `tool_sequence="none"`). |
+| Run that never ends (model generating for minutes, agent stuck in a loop) | One `agent_run` with `termination="incomplete"`, `incomplete=True`, `latency_s` = time open so far and the calls received so far, after `max_run_s` (default 600 s); the complete record follows if the run ends. With `run_tracker()` the run is known from its start, even when no span ever ends; without it, only from ended spans that carry `gen_ai.agent.name` and are not below an agent span already received (never from LLM or tool calls alone). A hung run is reported once, then forgotten after `orphan_timeout_s`. |
+| Trace whose root never arrives | Given up after `orphan_timeout_s` without new span (default 3600 s), or when more than `max_pending_traces` (10,000) traces wait; counted in `stats()["partial_traces_dropped"]` and `["partial_spans_dropped"]`; agent runs found inside are marked `incomplete=True`. Runs under a long-lived local root (a chat session span) wait for it: lower `orphan_timeout_s` (e.g. 300 s) for chat-style roots, or end the session span per turn. |
+| Tool timeouts and errors | Per tool: `tool_<tool>_calls`, `tool_<tool>_errors`, `tool_<tool>_timeouts`, `tool_<tool>_soft_failures` (every tool of `allowed_tools` and of the catalogue is written, 0 when not called). Per run: `tool_errors`, `tool_timeouts`, `max_tool_error_rate`, `tool_status_counts` (`"ok=3,timeout=2"`). A failed call is a `timeout` when its `error.type` names one (`TimeoutError`, `ReadTimeout`...). `tool_call` records carry `status`, `timeout` and `soft_failure`. |
+| Tool that answers but returns nothing usable | `record_tool_result(span, output, status=None, valid=None, validator=None)` sets `pulsar.tool.status` (by default the `status` key of a dict output) and `pulsar.tool.output_valid`. The statuses `retry`, `invalid`, `empty`, `partial`, `garbage` and invalid outputs are soft failures: `tool_soft_failures`, `soft_failure_rate`, `tool_<tool>_soft_failures`. The output itself is never written. |
+| Loops | `repeated_calls` keeps its meaning (consecutive calls identical byte for byte). `repeated_calls_window`: calls whose **normalized** tool and arguments (JSON parsed, keys sorted, `36000` = `36000.0` = `"36000"`, strings trimmed and lower-cased) appeared among the `loop_window` (4) previous calls; `loop_detected` is True from `loop_min_repeats` (2) such calls, so ping-pong A>B>A>B and type variations are loops. `max_same_tool_calls` and `tool_cycle_repeats` (longest repetition of a block of 2 or 3 tools) are counts, not verdicts: the same tool called with other identifiers can be legitimate, test them against a reference. |
+| Removed or added tool | With `agent_span(..., available_tools=[...])` (`pulsar.agent.available_tools`): `tool_catalog_size` and `tool_catalog_hash`, which changes with the catalogue from the first run; with `allowed_tools`, `catalog_missing_tools` and `missing_tools`. `unavailable_tool_calls`: calls to a tool outside the catalogue, or with status `unavailable`, `unknown_tool` or `not_found`. |
+
+### Rule violations in `agent_run`
+
+`PulsarSpanExporter(..., compliance=monitor, rules_version="2026-11")` checks every run when it is assembled and adds
+`violated_rules` (rule ids, comma-separated, `"none"`), `violations`, `critical_violations` (rules with
+`severity="critical"`) and `rules_version` (default: `monitor.version`). `compliance` is a
+`pulsar_metrics.genai.ComplianceMonitor` (pulsar-metrics is not a dependency: any object with `violations(trace)`
+fits) or a callable `trace -> violated rule ids`; the trace is the list of the tools called, as
+`trace_from(tool_sequence)` rebuilds it. A rule set that raises never stops the collection
+(`stats()["compliance_errors"]`). Without `compliance`, the fields are absent.
+
+### Known limits (night lab, 2026-11-02)
+
+- `loop_detected` changed meaning (non-consecutive window, normalized arguments): it now flags the ping-pong and type
+  variations that the lab found invisible (ping-pong x 6 and `36000` / `36000.0` / `"36000"` x 4 gave
+  `loop_detected=False`). Its rate on unchanged runs has not been re-measured (0 loops on 1196 A/A runs with the former
+  definition).
+- A tool returning junk with status `retry` is visible only if the application records it (`record_tool_result` or
+  `pulsar.tool.status`): Pulsar never reads tool outputs. In the lab, 100 % of the 56 eligibility runs of the "garbage"
+  mode had `tool_error_rate` 0.
+- Per-tool counters are features, not alerts: the per-tool test (Fisher or binomial against a reference; p = 0.0013
+  from 10 % of check_eligibility calls in timeout, 2/8 against 0/199) belongs to pulsar-metrics. The run-level
+  `tool_error_rate` (0.10 to 0.27 against 0.074) was never flagged in windows of 30 runs.
+- A removed tool is a configuration change only when the catalogue is recorded (`available_tools`); otherwise it is
+  seen through `first_tool` and `task_success`, from about half of the runs affected.
+- The exporter only receives finished spans: without `run_tracker()`, a run blocked in its first model call (about
+  37,000 tokens over 9 minutes in the lab) stays invisible until it ends. Also cap `max_tokens` and set a client
+  timeout without retry in the agent.
 
 ### Counterfactual probes
 

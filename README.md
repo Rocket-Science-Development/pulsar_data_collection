@@ -334,6 +334,22 @@ placebo-00003   ref_a placebo check_eligibility
 placebo-00002   ref_b placebo check_eligibility
 ```
 
+### Detectors and canary set
+
+`pulsar_data_collection.genai.detectors` scores each run in-process; only the scores reach the spans
+(`pulsar.detector.<name>`) and the records (`det_<name>`, maximum over the run). Local open models, installed with the
+`detectors` extra (`pip install "pulsar-data-collection[detectors]"`):
+
+| Detector | Score | Default model |
+|---|---|---|
+| `InjectionDetector` | probability that a text is a prompt injection or a jailbreak | protectai/deberta-v3-base-prompt-injection-v2 (Apache 2.0) |
+| `ModelPiiDetector` | rule-based findings plus names and street addresses | urchade/gliner_multi_pii-v1 (Apache 2.0) |
+| `FaithfulnessScorer` | share of the answer entailed by the retrieved passages (multilingual NLI) | MoritzLaurer/mDeBERTa-v3-base-xnli-multilingual-nli-2mil7 (MIT) |
+
+Any classifier with a `score()` method fits (e.g. Prompt Guard 2, under the Llama licence); `record_score(span, name,
+value)` writes it. `CanaryProbe` asks a fixed set of prompts several times and saves the answers (they are not user
+data) for `pulsar_metrics.genai.model_equality`.
+
 ## Personal information
 
 `pulsar_data_collection.privacy` detects personal information with **validated rules** (checksums, valid dates,

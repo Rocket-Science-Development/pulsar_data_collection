@@ -8,9 +8,24 @@ from typing import Callable, Optional
 
 import pandas as pd
 
+from .exceptions import StorageRejectedError
 from .spool import Spool
 
 logger = logging.getLogger("pulsar_data_collection")
+
+
+def _by_columns(batch: list) -> list:
+    """Concatenate the frames that share the same columns, keeping the others apart
+
+    Concatenating frames whose columns differ fills the gaps with NaN: an integer or boolean column then becomes float
+    or object, and the storage refuses it against the type it already holds. Records with optional fields (agent
+    records without task_success, for instance) are therefore written in one write per set of columns.
+    """
+    groups = {}
+    for frame in batch:
+        groups.setdefault(tuple(frame.columns), []).append(frame)
+    return [pd.concat(frames, ignore_index=True) if len(frames) > 1 else frames[0] for frames in groups.values()]
+
 
 WriteFunction = Callable[[pd.DataFrame, dict], None]
 
@@ -57,6 +72,7 @@ class BackgroundWriter:
             "spooled_rows": 0,
             "replayed_rows": 0,
             "dropped_rows": 0,
+            "rejected_rows": 0,
             "write_errors": 0,
             "last_error": None,
         }
@@ -127,8 +143,8 @@ class BackgroundWriter:
                 self._busy = bool(batch)
                 stopping = self._stopping and not self._queue
             try:
-                if batch:
-                    self._write_or_fallback(pd.concat(batch, ignore_index=True))
+                for frame in _by_columns(batch):
+                    self._write_or_fallback(frame)
                 self._replay_spool()
             except Exception:  # noqa: BLE001 - the writer thread must never die
                 logger.exception("Unexpected error in the capture writer")
@@ -145,6 +161,9 @@ class BackgroundWriter:
             return
         try:
             self._write(frame, self._meta)
+        except StorageRejectedError as error:
+            self._record_rejection(len(frame), error)
+            return
         except Exception as error:  # noqa: BLE001
             self._record_failure(error)
             self._fallback(frame, str(error))
@@ -161,6 +180,10 @@ class BackgroundWriter:
             frame, meta = self._spool.load(path)
             try:
                 self._write(frame, meta)
+            except StorageRejectedError as error:
+                path.unlink()  # replaying it would fail forever
+                self._record_rejection(len(frame), error)
+                continue
             except Exception as error:  # noqa: BLE001
                 self._record_failure(error)
                 return
@@ -186,6 +209,14 @@ class BackgroundWriter:
             self._stats["write_errors"] += 1
             self._stats["last_error"] = f"{type(error).__name__}: {error}"
         logger.warning("Write to storage failed (%s); next attempt in %.0f s", error, delay)
+
+    def _record_rejection(self, rows: int, error: Exception) -> None:
+        """Rows the storage refused (possibly partly written): counted, never spooled nor retried; the storage is up"""
+        with self._condition:
+            self._stats["rejected_rows"] += rows
+            self._stats["write_errors"] += 1
+            self._stats["last_error"] = f"{type(error).__name__}: {error}"
+        logger.error("%d rows rejected by the storage, not retried: %s", rows, error)
 
     def _record_success(self, rows: int, counter: str) -> None:
         with self._condition:

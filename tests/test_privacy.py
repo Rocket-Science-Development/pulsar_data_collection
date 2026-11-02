@@ -110,7 +110,7 @@ def test_agent_records_carry_counts_and_types_never_values():
     assert run_record["pii_output_count"] == 1 and run_record["pii_leak_count"] == 1
     assert run_record["pii_leak_types"] == "phone"
     llm_record = sink.of("llm_call")[0]
-    assert llm_record["pii_leak_count"] == 1 and "pii_input_count" not in llm_record
+    assert llm_record["pii_leak_count"] == 1 and llm_record["pii_input_count"] == 0  # every role, 0 when absent
     serialized = json.dumps(sink.records, default=str)
     for value in ("lea@exemple.ca", "130 692 544", "418 555 0142"):
         assert value not in serialized

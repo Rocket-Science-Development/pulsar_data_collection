@@ -8,7 +8,7 @@ from .config import factories
 from .exceptions import StorageUnavailableError
 from .models import CaptureOptions, DataWithPrediction, PulseParameters
 from .spool import Spool
-from .writer import BackgroundWriter
+from .writer import BackgroundWriter, SharedWriter, Target
 
 logger = logging.getLogger("pulsar_data_collection")
 
@@ -22,7 +22,7 @@ class Pulse:
     so a slow or unavailable database does not slow down predictions. See CaptureOptions.
     """
 
-    def __init__(self, data: PulseParameters, options: Optional[CaptureOptions] = None):
+    def __init__(self, data: PulseParameters, options: Optional[CaptureOptions] = None, writer: Optional[SharedWriter] = None):
         """
         Initializing Pulse class instance
 
@@ -35,6 +35,10 @@ class Pulse:
 
         options : CaptureOptions, optional
         How the data is written (background or sync, queue size, spool directory...)
+
+        writer : SharedWriter, optional
+        Writer shared with other Pulse instances (background mode); `options.shared_writer=True` uses the process-wide
+        SharedWriter.default()
 
         Raises
         ------
@@ -51,13 +55,24 @@ class Pulse:
         factory = factories.get(data.storage_engine)
         self.storage_engine = factory.get_database_actions()
         login = {**data.login, "timeout_s": self.options.write_timeout_s}
+        if writer is None and self.options.shared_writer and self.options.mode == "background":
+            writer = SharedWriter.default()
+        self._shared = (
+            writer is not None and self.options.mode == "background" and hasattr(self.storage_engine, "make_shared_connection")
+        )
         try:
-            self.db_connection = self.storage_engine.make_connection(**login)
+            if self._shared:
+                self.db_connection = self.storage_engine.make_shared_connection(**login)
+            else:
+                self.db_connection = self.storage_engine.make_connection(**login)
         except StorageUnavailableError as error:
             if self.options.mode == "sync" or self.options.strict_startup:
                 raise
             logger.warning("Storage engine unavailable at startup, capturing anyway: %s", error)
-            self.db_connection = self.storage_engine.create_client(**login)
+            if self._shared:
+                self.db_connection = self.storage_engine.create_shared_client(**login)
+            else:
+                self.db_connection = self.storage_engine.create_client(**login)
         self.additional_tags = data.additional_tags
         self.params = self.storage_engine.create_param_dict(client=self.db_connection, **data.model_dump())
         self._write_params = {key: value for key, value in self.params.items() if key != "client"}
@@ -67,17 +82,63 @@ class Pulse:
         self._last_time = None
         self._time_lock = threading.Lock()
         if self.options.mode == "background":
-            self._writer = BackgroundWriter(
-                write=self._write,
-                meta=self._write_params,
-                max_queue_rows=self.options.max_queue_rows,
-                max_batch_rows=self.options.max_batch_rows,
-                flush_interval_s=self.options.flush_interval_s,
-                max_retry_delay_s=self.options.max_retry_delay_s,
-                spool=Spool(self.options.spool_dir) if self.options.spool_dir else None,
+            options = self.options
+            spool = None
+            if options.spool_dir:
+                spool = Spool(
+                    options.spool_dir,
+                    max_bytes=options.spool_max_bytes,
+                    eviction=options.spool_eviction,
+                    compression=options.spool_compression,
+                )
+            target = self._target()
+            if writer is not None:
+                self._writer = writer.register(
+                    target,
+                    self._write_params,
+                    max_queue_rows=options.max_queue_rows,
+                    spool=spool,
+                    durability=options.durability,
+                    replay_max_rows_per_s=options.replay_max_rows_per_s,
+                )
+            else:
+                self._writer = BackgroundWriter(
+                    write=None,
+                    meta=self._write_params,
+                    max_queue_rows=options.max_queue_rows,
+                    max_batch_rows=options.max_batch_rows,
+                    flush_interval_s=options.flush_interval_s,
+                    max_retry_delay_s=options.max_retry_delay_s,
+                    spool=spool,
+                    target=target,
+                    concurrency=options.write_concurrency,
+                    probe_interval_s=options.probe_interval_s,
+                    durability=options.durability,
+                    replay_max_rows_per_s=options.replay_max_rows_per_s,
+                )
+
+    def _target(self) -> Target:
+        """Line protocol (requests shared with the other Pulse of the same client and bucket) when the storage engine
+        supports it, frame by frame otherwise"""
+        engine, client = self.storage_engine, self.db_connection
+        ping = (lambda: engine.ping(client)) if hasattr(engine, "ping") else None
+        supports = getattr(engine, "supports_lines", None)
+        if supports is not None and supports():
+            bucket = self._write_params["bucket_name"]
+            return Target(
+                encode=lambda frame, meta: engine.serialize_frame(frame, **meta),
+                send=lambda lines: engine.write_lines(client, bucket, lines),
+                ping=ping,
+                key=(id(client), bucket),
             )
+        return Target(write_frame=self._write, ping=ping)
 
     def _write(self, frame, write_params: dict):
+        supports = getattr(self.storage_engine, "supports_lines", None)
+        if supports is not None and supports():
+            lines = self.storage_engine.serialize_frame(frame, **write_params)
+            self.storage_engine.write_lines(self.db_connection, write_params["bucket_name"], lines)
+            return
         self.storage_engine.write_frame(client=self.db_connection, frame=frame, **write_params)
 
     def capture_data(self, data: DataWithPrediction):
@@ -94,11 +155,16 @@ class Pulse:
             # masked here, in the caller's thread: raw values never reach the queue nor the spool directory
             data_points = self.options.pii.apply(data_points)
             predictions = self.options.pii.apply(predictions, count=False)
-        frame = self._unique_times(self.storage_engine.prepare_frame(data_points, predictions, data.timestamp))
+        frame = self._unique_times(self._prepare(data_points, predictions, data.timestamp))
         if self._writer is None:
             self._write(frame, self._write_params)
         else:
             self._writer.submit(frame)
+
+    def _prepare(self, data_points, predictions, timestamp):
+        if self.options.row_spacing_ns == 1_000:  # default: works with storage engines of older signatures too
+            return self.storage_engine.prepare_frame(data_points, predictions, timestamp)
+        return self.storage_engine.prepare_frame(data_points, predictions, timestamp, row_spacing_ns=self.options.row_spacing_ns)
 
     def _unique_times(self, frame):
         """Shift a batch so that its timestamps follow the previous batch of this Pulse
@@ -121,7 +187,8 @@ class Pulse:
         return self._writer.flush(timeout_s) if self._writer and not self._closed else True
 
     def stats(self) -> dict:
-        """Completeness counters: captured, written, spooled, replayed and dropped rows, write errors, queue size
+        """Completeness counters: captured, written, spooled, replayed, dropped, rejected and uncertain rows, write errors
+        and timeouts, queue size and lag, spool size, write latency
 
         Still available after close(), with the final values.
         """
@@ -136,7 +203,10 @@ class Pulse:
         self._closed = True
         if self._writer is not None:
             self._writer.close(timeout_s)
-        self.db_connection.close()
+        if self._shared:
+            self.storage_engine.release_connection(self.db_connection)
+        else:
+            self.db_connection.close()
 
     def __enter__(self):
         return self

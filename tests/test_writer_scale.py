@@ -620,3 +620,143 @@ def test_process_health_uses_psutil_when_installed():
     pytest.importorskip("psutil")
     health = process_health()
     assert health["rss_bytes"] > 0 and ("open_fds" in health or "open_handles" in health)
+
+
+# ---------------------------------------------------------------------------------------------------------- review fixes
+def _lines(frame, meta):
+    if "bad" in frame.columns:
+        raise TypeError("cannot serialize")
+    return [f"m v={x} {k}" for k, x in enumerate(frame.iloc[:, 0])]
+
+
+def test_an_unencodable_batch_only_rejects_its_own_rows():
+    sent = []
+    writer = SharedWriter(flush_interval_s=0.05, concurrency=1)
+    target = dict(encode=_lines, send=sent.extend, ping=lambda: True, key="k")
+    healthy = writer.register(Target(**target), {})
+    poisoned = writer.register(Target(**target), {})
+    healthy.submit(pd.DataFrame({"a": range(5)}))
+    poisoned.submit(pd.DataFrame({"bad": range(3)}))
+    assert writer.flush(5)
+    a, b = healthy.stats(), poisoned.stats()
+    writer.close()
+    assert a["written_rows"] == 5 and a["dropped_rows"] == 0 and a["storage_available"]  # no back-off
+    assert b["rejected_rows"] == 3 and "cannot serialize" in b["last_error"] and len(sent) == 5
+
+
+def test_an_unencodable_spooled_batch_is_set_aside_and_newer_ones_replayed(tmp_path):
+    spool = Spool(tmp_path)
+    spool.save(pd.DataFrame({"bad": [1.0, 2.0]}), {})
+    time.sleep(0.01)
+    spool.save(pd.DataFrame({"a": [1.0, 2.0, 3.0]}), {})
+    sent = []
+    writer = SharedWriter(flush_interval_s=0.05, concurrency=1)
+    channel = writer.register(Target(encode=_lines, send=sent.extend, ping=lambda: True, key="k2"), {}, spool=spool)
+    deadline = time.monotonic() + 5
+    while spool.files() and time.monotonic() < deadline:
+        time.sleep(0.05)
+    stats = channel.stats()
+    writer.close()
+    assert stats["replayed_rows"] == 3 and stats["rejected_rows"] == 2 and stats["storage_available"]
+    assert len(list(tmp_path.glob("*.bad"))) == 1 and spool.size_bytes() == 0
+
+
+def test_a_refused_write_ahead_copy_keeps_the_batch_in_memory_without_counting_a_loss(tmp_path):
+    written = []
+    spool = Spool(tmp_path, max_bytes=50, eviction="drop_newest")
+    from pulsar_data_collection.writer import BackgroundWriter
+
+    writer = BackgroundWriter(lambda f, m: written.append(len(f)), {}, 1000, 1000, 0.05, 1, spool=spool, durability="wal")
+    writer.submit(pd.DataFrame({"a": range(10)}))
+    assert writer.flush(5)
+    stats = writer.stats()
+    writer.close()
+    assert written == [10] and stats["written_rows"] == 10 and stats["dropped_rows"] == 0
+    assert stats["memory_only_rows"] == 10
+
+
+def test_a_failed_write_of_rows_partly_without_write_ahead_copy_counts_what_is_on_disk(tmp_path):
+    one = len(frame_to_json(pd.DataFrame({"a": np.arange(10.0)}), {}).encode())
+    spool = Spool(tmp_path, max_bytes=one + 20)  # room for one write-ahead copy only
+
+    def down(frame, meta):
+        raise ConnectionError("down")
+
+    writer = SharedWriter(flush_interval_s=0.3, concurrency=1, probe_interval_s=None)
+    channel = writer.register(Target(write_frame=down), {}, spool=spool, durability="wal")
+    channel.submit(pd.DataFrame({"a": np.arange(10.0)}))  # with a copy
+    channel.submit(pd.DataFrame({"a": np.arange(10.0, 20.0)}))  # spool full: memory only
+    assert channel.flush(5)
+    stats = channel.stats()
+    writer.close()
+    on_disk = sum(len(spool.load(p)[0]) for p in spool.files())
+    assert stats["memory_only_rows"] == 10
+    assert stats["spooled_rows"] == on_disk  # used to count 20 spooled with 10 on disk
+    assert stats["spooled_rows"] + stats["dropped_rows"] == stats["captured_rows"] == 20
+
+
+def test_write_ahead_copies_never_evict_spooled_batches(tmp_path):
+    frame = pd.DataFrame({"a": np.arange(10.0)})
+    spool = Spool(tmp_path, max_bytes=len(frame_to_json(frame, {}).encode()) + 10)
+    kept = spool.save(frame, {})
+    assert spool.save(frame, {}, wal=True) is None
+    assert kept.exists() and spool.evicted_rows == 0
+
+
+def test_files_being_replayed_are_not_evicted(tmp_path):
+    frame = pd.DataFrame({"a": np.arange(10.0)})
+    spool = Spool(tmp_path, max_bytes=len(frame_to_json(frame, {}).encode()) + 10)
+    replayed = spool.save(frame, {})
+    assert spool.hold(replayed)
+    assert spool.save(frame, {}) is None  # the only evictable file is held: the new batch is refused
+    assert replayed.exists() and spool.evicted_rows == 10
+    spool.release([replayed])
+    assert spool.save(frame, {}) is not None and not replayed.exists()
+
+
+def test_set_aside_lowers_the_spool_size(tmp_path):
+    spool = Spool(tmp_path)
+    path = spool.save(pd.DataFrame({"a": [1.0]}), {})
+    assert spool.size_bytes() > 0
+    spool.set_aside(path)
+    assert spool.size_bytes() == 0 and spool.files() == [] and len(list(tmp_path.glob("*.bad"))) == 1
+
+
+def test_a_replay_rate_below_one_row_per_second_still_replays():
+    writer = SharedWriter(flush_interval_s=1, concurrency=1)
+    channel = writer.register(Target(write_frame=lambda f, m: None), {}, replay_max_rows_per_s=0.5)
+    t0 = channel._replay_at
+    assert channel.replay_allowance(t0 + 0.5, 100) == 0
+    assert channel.replay_allowance(t0 + 3.0, 100) >= 1  # used to stay at 0 forever
+    writer.close()
+
+
+def test_rows_are_resolved_when_preparing_a_write_fails(monkeypatch):
+    writer = SharedWriter(flush_interval_s=0.05, concurrency=1)
+    channel = writer.register(Target(write_frame=lambda f, m: None), {})
+    calls = []
+
+    def broken(taken, replay=False):
+        calls.append(1)
+        raise RuntimeError("bug")
+
+    monkeypatch.setattr(writer, "_jobs", broken)
+    channel.submit(pd.DataFrame({"a": range(4)}))
+    assert channel.flush(5)  # used to wait forever: pending_rows stayed at 4
+    stats = channel.stats()
+    writer.close()
+    assert calls and channel.pending_rows == 0 and stats["dropped_rows"] == 4
+
+
+def test_an_older_success_does_not_clear_a_newer_back_off():
+    writer = SharedWriter(flush_interval_s=1, concurrency=2)
+    channel = writer.register(Target(write_frame=lambda f, m: None), {})
+    endpoint = channel.endpoint
+    started = endpoint.generation  # request A starts
+    unit = type("U", (), {"channel": channel})()
+    writer._record_failure([unit], ConnectionError("down"), False)  # request B, started later, fails
+    writer._record_success(endpoint, started)  # request A succeeds afterwards
+    assert endpoint.retry_at > time.monotonic()
+    writer._record_success(endpoint, endpoint.generation)
+    assert endpoint.retry_at == 0.0
+    writer.close()

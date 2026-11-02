@@ -123,6 +123,7 @@ class _Endpoint:
         self.retry_at = 0.0
         self.next_probe = 0.0
         self.probing = False
+        self.generation = 0  # incremented by every failure: an older success must not clear a newer back-off
 
 
 @dataclass
@@ -212,6 +213,7 @@ class Channel:
             "uncertain_rows": 0,
             "write_errors": 0,
             "write_timeouts": 0,
+            "memory_only_rows": 0,
             "last_error": None,
             "last_write_ms": None,
             "max_write_ms": None,
@@ -228,6 +230,9 @@ class Channel:
             if self.closed:
                 raise RuntimeError("writer channel is closed")
             self._stats["captured_rows"] += rows
+            if self.durability == "wal" and wal is None:  # spool full: this batch is kept in memory only
+                self._stats["memory_only_rows"] += rows
+                logger.warning("Spool full: batch of %d rows kept in memory only (no write-ahead copy)", rows)
             if rows > self.max_queue_rows:
                 if wal is not None:  # kept on disk, replayed later
                     self.spool.promote(wal)
@@ -310,7 +315,7 @@ class Channel:
         if self.replay_max_rows_per_s is None:
             return wanted
         rate = self.replay_max_rows_per_s
-        self._replay_budget = min(rate, self._replay_budget + (now - self._replay_at) * rate)
+        self._replay_budget = min(max(rate, 1.0), self._replay_budget + (now - self._replay_at) * rate)
         self._replay_at = now
         return int(self._replay_budget) if self._replay_budget >= 1 else 0
 
@@ -478,7 +483,13 @@ class SharedWriter:
                 stopping = self._stopping and not self._queued_rows
             try:
                 if taken:
-                    self._dispatch(self._jobs(taken))
+                    try:
+                        jobs = self._jobs(taken)
+                    except Exception:  # noqa: BLE001 - never leave taken rows unresolved
+                        logger.exception("Unexpected error while preparing a write")
+                        self._abandon(taken)
+                    else:
+                        self._dispatch(jobs)
                 self._probe_endpoints()
                 self._replay_spools()
             except Exception:  # noqa: BLE001 - the writer thread must never die
@@ -504,7 +515,9 @@ class SharedWriter:
             frames = [e.frame for e in entries]
             frame = pd.concat(frames, ignore_index=True) if len(frames) > 1 else frames[0]
             files = [e.wal for e in entries if e.wal is not None]
-            top = _Unit(channel, frame, meta, [len(f) for f in frames], replay=replay, files=files)
+            # whole only if its files hold all its rows: otherwise a fallback saves the rows instead of promoting
+            whole = not files or len(files) == len(entries)
+            top = _Unit(channel, frame, meta, [len(f) for f in frames], replay=replay, files=files, whole=whole)
             tops.append(top)
             parts = split_mixed_objects(frame)
             if len(parts) == 1:
@@ -523,6 +536,24 @@ class SharedWriter:
             jobs[-1].tops.extend(tops)  # cleaned once every job of this batch is over (jobs run in order per batch)
         return jobs
 
+    def _abandon(self, taken: list) -> None:
+        """Entries that cannot be written: spooled if possible, otherwise dropped, and always resolved"""
+        for channel, entry in taken:
+            size = len(entry.frame)
+            try:
+                self._fallback(
+                    _Unit(channel, entry.frame, entry.meta, [size], files=[entry.wal] if entry.wal else []),
+                    "unexpected writer error",
+                )
+            except Exception:  # noqa: BLE001
+                logger.exception("Rows lost after an unexpected writer error")
+                with self._condition:
+                    channel._stats["dropped_rows"] += size
+            finally:
+                with self._condition:
+                    channel.pending_rows -= size
+                    self._condition.notify_all()
+
     def _dispatch(self, jobs: list) -> None:
         if self._executor is None or len(jobs) == 0:
             for job in jobs:
@@ -535,7 +566,10 @@ class SharedWriter:
                 while self._inflight >= self.concurrency:
                     self._condition.wait(0.05)
                 self._inflight += 1
-            self._executor.submit(self._run_job_async, job, batch)
+            try:
+                self._executor.submit(self._run_job_async, job, batch)
+            except RuntimeError:  # executor shut down: run it here, so that its rows are resolved
+                self._run_job_async(job, batch)
 
     def _run_job_async(self, job: "_Job", batch: "_Batch") -> None:
         try:
@@ -621,18 +655,47 @@ class SharedWriter:
         else:
             target.write_frame(units[0].frame, units[0].meta)
 
+    def _encodable(self, units: list) -> list:
+        """Encode each unit on its own: rows that cannot be serialized are refused, never blamed on the storage"""
+        if not units[0].channel.target.lines:
+            return units
+        good = []
+        for unit in units:
+            try:
+                unit.encoded()
+            except Exception as error:  # noqa: BLE001 - e.g. non-string column names
+                self._unencodable(unit, error)
+            else:
+                good.append(unit)
+        return good
+
+    def _unencodable(self, unit: _Unit, error: Exception) -> None:
+        with self._condition:
+            unit.channel._stats["write_errors"] += 1
+            unit.channel._stats["last_error"] = f"{type(error).__name__}: {error}"
+        if unit.replay and unit.whole and unit.files and unit.channel.spool is not None:
+            for path in unit.files:  # kept for inspection, never replayed again
+                unit.channel.spool.set_aside(path)
+            unit.files = []
+        self._reject(unit, unit.rows, error)
+
     def _attempt(self, units: list) -> None:
         endpoint = units[0].channel.endpoint
         if not self._available(endpoint):
             for unit in units:
                 self._fallback(unit, "storage unavailable")
             return
+        units = self._encodable(units)
+        if not units:
+            return
+        with self._condition:
+            generation = endpoint.generation
         started = time.perf_counter()
         try:
             self._send(units)
         except StorageRejectedError as error:
             self._timing(units, started)
-            self._rejected(units, error)
+            self._rejected(units, error, generation)
             return
         except Exception as error:  # noqa: BLE001
             self._timing(units, started)
@@ -642,16 +705,16 @@ class SharedWriter:
                 self._fallback(unit, str(error), uncertain=uncertain)
             return
         self._timing(units, started)
-        self._record_success(endpoint)
+        self._record_success(endpoint, generation)
         for unit in units:
             self._count(unit, unit.rows)
 
-    def _rejected(self, units: list, error: StorageRejectedError) -> None:
+    def _rejected(self, units: list, error: StorageRejectedError, generation: int) -> None:
         with self._condition:
             for channel in {id(u.channel): u.channel for u in units}.values():
                 channel._stats["write_errors"] += 1
                 channel._stats["last_error"] = f"{type(error).__name__}: {error}"
-        self._record_success(units[0].channel.endpoint)  # the storage answered: it is up
+        self._record_success(units[0].channel.endpoint, generation)  # the storage answered: it is up
         if len(units) > 1:  # several channels or groups: the refused rows cannot be attributed, write them one by one
             for unit in units:
                 self._attempt([unit])
@@ -725,6 +788,7 @@ class SharedWriter:
         endpoint = units[0].channel.endpoint
         with self._condition:
             endpoint.failures += 1
+            endpoint.generation += 1
             delay = min(2 ** (endpoint.failures - 1), self.max_retry_delay_s)
             endpoint.retry_at = time.monotonic() + delay
             endpoint.next_probe = time.monotonic() + (self.probe_interval_s or delay)
@@ -735,8 +799,10 @@ class SharedWriter:
                 channel._stats["last_error"] = f"{type(error).__name__}: {error}"
         logger.warning("Write to storage failed (%s); next attempt in %.0f s", error, delay)
 
-    def _record_success(self, endpoint: _Endpoint) -> None:
+    def _record_success(self, endpoint: _Endpoint, generation: int) -> None:
         with self._condition:
+            if endpoint.generation != generation:  # a request started later failed: keep its back-off
+                return
             if endpoint.failures:
                 logger.info("Storage available again")
             endpoint.failures = 0
@@ -762,19 +828,28 @@ class SharedWriter:
         if allowance <= 0:
             return False
         taken, rows = [], 0
-        for path in channel.spool.files():
+        spool = channel.spool
+        for path in spool.files():
             if rows >= min(allowance, self.max_batch_rows):
                 break
+            if not spool.hold(path):  # evicted meanwhile
+                continue
             try:
-                frame, meta = channel.spool.load(path)
+                frame, meta = spool.load(path)
             except Exception:  # noqa: BLE001 - unreadable file: set aside, never retried
                 logger.exception("Spool file %s cannot be read: renamed .bad", path.name)
-                path.replace(path.with_name(path.name + ".bad"))
+                spool.set_aside(path)
                 continue
             taken.append((path, frame, meta))
             rows += len(frame)
         if not taken:
             return False
+        try:
+            return self._replay_taken(channel, taken, rows)
+        finally:
+            spool.release([path for path, _, _ in taken])
+
+    def _replay_taken(self, channel: Channel, taken: list, rows: int) -> bool:
         channel.replay_spent(rows)
         groups: dict = {}
         for path, frame, meta in taken:

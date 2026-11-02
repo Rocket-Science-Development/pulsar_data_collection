@@ -99,6 +99,7 @@ class Spool:
         self.evicted_files = 0
         self.recovered_files = 0
         self._lock = threading.Lock()
+        self._held: set = set()  # files being replayed: never evicted
         self._recover()
         self._bytes = sum(self._size(p) for p in self.files())
 
@@ -162,13 +163,15 @@ class Spool:
     def save(self, frame: pd.DataFrame, meta: dict, wal: bool = False) -> Optional[Path]:
         """Save a batch (atomic: a crash never leaves a half-written batch under its final name)
 
-        Returns None when the batch was refused because the spool is full (eviction="drop_newest").
+        Returns None when the batch was refused because the spool is full. A spooled batch refused that way is counted in
+        `evicted_rows`; a write-ahead copy (`wal=True`) is never saved at the expense of spooled batches and its refusal
+        is not counted: the batch stays in memory only, the caller keeps track of it.
         """
         data = frame_to_json(frame, meta).encode("utf-8")
         if self.compression == "gzip":
             data = gzip.compress(data, compresslevel=1)
         suffix = (WAL_SUFFIXES if wal else SPOOL_SUFFIXES)[1 if self.compression == "gzip" else 0]
-        if not self._make_room(len(data), len(frame)):
+        if not self._make_room(len(data), len(frame), wal=wal):
             return None
         path = self.directory / f"{time.time_ns()}_{uuid.uuid4().hex[:8]}_{len(frame)}r{suffix}"
         temporary = path.with_name(path.name[: -len(suffix)] + ".tmp")
@@ -176,17 +179,26 @@ class Spool:
         temporary.replace(path)
         return path
 
-    def _make_room(self, size: int, rows: int) -> bool:
+    def _refuse(self, rows: int) -> bool:
+        self.evicted_rows += rows
+        self.evicted_files += 1
+        logger.warning("Spool full (%d bytes): new batch of %d rows dropped", self.max_bytes, rows)
+        return False
+
+    def _make_room(self, size: int, rows: int, wal: bool = False) -> bool:
         with self._lock:
             if self.max_bytes is None or self._bytes + size <= self.max_bytes:
                 self._bytes += size
                 return True
-            if self.eviction == "drop_newest" or size > self.max_bytes:
-                self.evicted_rows += rows
-                self.evicted_files += 1
-                logger.warning("Spool full (%d bytes): new batch of %d rows dropped", self.max_bytes, rows)
+            if wal:  # a write-ahead copy never evicts spooled batches
                 return False
-            for path in self.files():
+            if self.eviction == "drop_newest" or size > self.max_bytes:
+                return self._refuse(rows)
+            evictable = [p for p in self.files() if p not in self._held]
+            needed = self._bytes + size - self.max_bytes
+            if sum(self._size(p) for p in evictable) < needed:
+                return self._refuse(rows)
+            for path in evictable:
                 if self._bytes + size <= self.max_bytes:
                     break
                 evicted = self.rows(path)
@@ -214,3 +226,29 @@ class Spool:
         with self._lock:
             self._bytes -= self._size(path)
             path.unlink(missing_ok=True)
+            self._held.discard(path)
+
+    def hold(self, path: Path) -> bool:
+        """Protect a file from eviction while it is replayed; False if it no longer exists"""
+        with self._lock:
+            if not path.exists():
+                return False
+            self._held.add(path)
+            return True
+
+    def release(self, paths) -> None:
+        with self._lock:
+            for path in paths:
+                self._held.discard(path)
+
+    def set_aside(self, path: Path) -> Path:
+        """Rename an unusable batch `.bad`: kept for inspection, never replayed, no longer counted in the spool size"""
+        target = path.with_name(path.name + ".bad")
+        with self._lock:
+            self._bytes -= self._size(path)
+            self._held.discard(path)
+            try:
+                path.replace(target)
+            except OSError as error:
+                logger.warning("Spool: %s cannot be set aside: %s", path.name, error)
+        return target

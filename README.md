@@ -196,7 +196,8 @@ pulse.close()  # at shutdown: writes (or spools) what is still queued
 `pulse.stats()` returns `captured_rows`, `written_rows`, `spooled_rows`, `replayed_rows`, `dropped_rows`,
 `rejected_rows`, `uncertain_rows`, `write_errors`, `write_timeouts`, `last_error`, `queued_rows`, `writer_lag_s` (age
 of the oldest queued batch), `last_write_ms` / `max_write_ms` (request latency), `spool_files`, `spool_bytes`,
-`spool_evicted_rows` and `storage_available`. Once everything is flushed, `written_rows + spooled_rows + dropped_rows +
+`spool_evicted_rows`, `memory_only_rows` (`durability="wal"` batches kept in memory only because the spool was
+full) and `storage_available`. Once everything is flushed, `written_rows + spooled_rows + dropped_rows +
 rejected_rows + uncertain_rows = captured_rows`, and spooled rows end up in `replayed_rows` (or `rejected_rows`); any
 `dropped_rows` (which includes `spool_evicted_rows`) is a measured gap in the monitoring data. Errors and drops are also
 logged (logger `pulsar_data_collection`).
@@ -238,7 +239,8 @@ and `write_concurrency` of its options are replaced by those of the writer. `pul
 | `"wal"` (needs `spool_dir`) | none: each batch is written to `spool_dir` before `capture_data()` returns, deleted once stored, replayed at the next start | one file write per capture (no fsync: an OS crash or a power loss can still lose the last batches) |
 
 At startup the spool also recovers what a crash left: complete `.tmp` files become spooled batches, incomplete ones are
-deleted, write-ahead copies are replayed. A spool directory belongs to one Pulse of one process at a time.
+deleted, write-ahead copies are replayed. A spool directory belongs to one Pulse of one process at a time. A spooled batch that can no longer be read or serialized is renamed `.bad`
+and counted in `rejected_rows`.
 
 ### Throughput (measured)
 

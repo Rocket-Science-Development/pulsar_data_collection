@@ -54,6 +54,13 @@ All notable changes to pulsar-data-collection. The format follows
   in `uncertain_rows` without it (M32).
 - A capture larger than `max_queue_rows` keeps only its newest rows; the others are dropped and counted (m20).
 - A spool `.tmp` file left by a crash is recovered at startup when complete, deleted otherwise (m24).
+- Review fixes: a batch that cannot be serialized (e.g. integer column names) only rejects its own rows, without
+  backing off the shared destination nor dropping the other models' rows; a spooled batch in that case is renamed
+  `.bad` (no longer counted in the spool size) instead of blocking the replay. A write-ahead copy refused by a full
+  spool no longer counts as an eviction (the batch is kept in memory only, `memory_only_rows`) and never evicts spooled
+  batches; files being replayed are never evicted; a failed write of rows partly without write-ahead copy counts only
+  what reaches the disk. A replay rate below 1 row/s replays; rows taken by the writer are always resolved after an
+  unexpected error; with several requests in flight, an older success no longer clears a newer back-off.
 
 ## [0.9.0] - 2026-11-02
 

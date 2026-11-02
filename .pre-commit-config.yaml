@@ -21,6 +21,10 @@ repos:
       - id: bandit
         args: ["-c", "pyproject.toml"]
         additional_dependencies: ["bandit[toml]"]
+  - repo: https://github.com/kynan/nbstripout
+    rev: 0.9.1
+    hooks:
+      - id: nbstripout
   - repo: https://github.com/gitleaks/gitleaks
     rev: v8.21.2
     hooks:

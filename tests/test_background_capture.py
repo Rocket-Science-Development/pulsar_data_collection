@@ -13,7 +13,7 @@ import pytest
 
 import pulsar_data_collection.pulse as pulse_module
 from pulsar_data_collection.database_connectors.influxdb import InfluxdbActions
-from pulsar_data_collection.exceptions import StorageConfigurationError, StorageUnavailableError
+from pulsar_data_collection.exceptions import StorageConfigurationError, StorageRejectedError, StorageUnavailableError
 from pulsar_data_collection.models import CaptureOptions, DataWithPrediction, PulseParameters
 from pulsar_data_collection.pulse import Pulse
 from pulsar_data_collection.spool import frame_from_json, frame_to_json
@@ -33,6 +33,7 @@ class FakeActions(InfluxdbActions):
     def __init__(self):
         self.delay_s = 0.0
         self.down = False
+        self.reject = False
         self.startup_error = None
         self.frames = []
         self.lock = threading.Lock()
@@ -49,6 +50,8 @@ class FakeActions(InfluxdbActions):
         time.sleep(self.delay_s)
         if self.down:
             raise ConnectionError("storage down")
+        if self.reject:
+            raise StorageRejectedError("field type conflict")
         with self.lock:
             self.frames.append((frame.copy(), write_params))
 
@@ -276,3 +279,31 @@ def test_concurrent_captures_keep_unique_timestamps(fake):
         for t in threads:
             t.join()
     assert len(fake.written()) == 200 and fake.written()["_time"].is_unique
+
+
+def test_rejected_rows_are_counted_not_retried(fake, tmp_path):
+    # the storage refuses the data itself (e.g. a field type conflict): retrying can never succeed
+    fake.reject = True
+    pulse = Pulse(PARAMS, fast_options(spool_dir=tmp_path))
+    pulse.capture_data(capture(1))
+    assert pulse.flush(5)
+    stats = pulse.stats()
+    assert stats["rejected_rows"] == 10 and stats["spooled_rows"] == 0 and stats["storage_available"]
+    assert "StorageRejectedError" in stats["last_error"] and list(tmp_path.glob("*.json")) == []
+    fake.reject = False
+    pulse.capture_data(capture(2))  # the next batches are written normally, without waiting for a backoff
+    pulse.close()
+    assert pulse.stats()["written_rows"] == 10
+
+
+def test_a_rejected_spooled_batch_is_discarded(fake, tmp_path):
+    fake.down = True
+    pulse = Pulse(PARAMS, fast_options(spool_dir=tmp_path))
+    pulse.capture_data(capture(1))
+    assert pulse.flush(5) and len(list(tmp_path.glob("*.json"))) == 1
+    fake.down, fake.reject = False, True
+    deadline = time.monotonic() + 5
+    while list(tmp_path.glob("*.json")) and time.monotonic() < deadline:
+        time.sleep(0.05)
+    pulse.close(timeout_s=1)
+    assert list(tmp_path.glob("*.json")) == [] and pulse.stats()["rejected_rows"] == 10

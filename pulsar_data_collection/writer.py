@@ -8,6 +8,7 @@ from typing import Callable, Optional
 
 import pandas as pd
 
+from .exceptions import StorageRejectedError
 from .spool import Spool
 
 logger = logging.getLogger("pulsar_data_collection")
@@ -57,6 +58,7 @@ class BackgroundWriter:
             "spooled_rows": 0,
             "replayed_rows": 0,
             "dropped_rows": 0,
+            "rejected_rows": 0,
             "write_errors": 0,
             "last_error": None,
         }
@@ -145,6 +147,9 @@ class BackgroundWriter:
             return
         try:
             self._write(frame, self._meta)
+        except StorageRejectedError as error:
+            self._record_rejection(len(frame), error)
+            return
         except Exception as error:  # noqa: BLE001
             self._record_failure(error)
             self._fallback(frame, str(error))
@@ -161,6 +166,10 @@ class BackgroundWriter:
             frame, meta = self._spool.load(path)
             try:
                 self._write(frame, meta)
+            except StorageRejectedError as error:
+                path.unlink()  # replaying it would fail forever
+                self._record_rejection(len(frame), error)
+                continue
             except Exception as error:  # noqa: BLE001
                 self._record_failure(error)
                 return
@@ -186,6 +195,14 @@ class BackgroundWriter:
             self._stats["write_errors"] += 1
             self._stats["last_error"] = f"{type(error).__name__}: {error}"
         logger.warning("Write to storage failed (%s); next attempt in %.0f s", error, delay)
+
+    def _record_rejection(self, rows: int, error: Exception) -> None:
+        """Rows the storage refused (possibly partly written): counted, never spooled nor retried; the storage is up"""
+        with self._condition:
+            self._stats["rejected_rows"] += rows
+            self._stats["write_errors"] += 1
+            self._stats["last_error"] = f"{type(error).__name__}: {error}"
+        logger.error("%d rows rejected by the storage, not retried: %s", rows, error)
 
     def _record_success(self, rows: int, counter: str) -> None:
         with self._condition:

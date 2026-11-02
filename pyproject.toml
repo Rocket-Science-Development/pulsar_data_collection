@@ -1,6 +1,6 @@
 [project]
 name = "pulsar-data-collection"
-version = "0.8.0"
+version = "0.9.0"
 description = "sdk enabling data collection from model serving code for our MPM solution"
 authors = [{ name = "Pulsar team", email = "pulsar@data-rs.io" }]
 readme = "README.md"
@@ -18,6 +18,13 @@ Homepage = "https://github.com/Rocket-Science-Development/pulsar_data_collection
 [project.optional-dependencies]
 genai = [
     "opentelemetry-sdk>=1.30",
+]
+detectors = [
+    "transformers>=4.40,<5",
+    "torch>=2.2",
+    "gliner>=0.2",
+    "sentencepiece>=0.2",
+    "protobuf>=4",
 ]
 
 [dependency-groups]

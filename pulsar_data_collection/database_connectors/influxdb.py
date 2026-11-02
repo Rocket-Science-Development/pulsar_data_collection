@@ -6,7 +6,7 @@ from influxdb_client.client.write_api import SYNCHRONOUS, PointSettings
 from influxdb_client.rest import ApiException
 from urllib3.exceptions import HTTPError
 
-from ..exceptions import StorageConfigurationError, StorageUnavailableError
+from ..exceptions import StorageConfigurationError, StorageRejectedError, StorageUnavailableError
 from .database_actions import DatabaseActions, DatabaseActionsFactory
 
 DEFAULT_TIMEOUT_S = 10.0
@@ -90,12 +90,17 @@ class InfluxdbActions(DatabaseActions):
         """Synchronous write; raises on failure (bounded by the client timeout, no hidden retries)"""
         point_settings = PointSettings(**{key: str(value) for key, value in tags.items()})
         with client.write_api(write_options=SYNCHRONOUS, point_settings=point_settings) as write_api:
-            write_api.write(
-                bucket=bucket_name,
-                record=frame,
-                data_frame_measurement_name=data_frame_measurement_name,
-                data_frame_timestamp_column=data_frame_timestamp_column,
-            )
+            try:
+                write_api.write(
+                    bucket=bucket_name,
+                    record=frame,
+                    data_frame_measurement_name=data_frame_measurement_name,
+                    data_frame_timestamp_column=data_frame_timestamp_column,
+                )
+            except ApiException as e:
+                if e.status in (400, 422):  # the data itself is refused (field type conflict...): never retryable
+                    raise StorageRejectedError(f"InfluxDB rejected the batch ({e.status}): {e.body}") from e
+                raise
 
     def write_data(self, **kwargs):
         """Write one capture synchronously; raises on failure

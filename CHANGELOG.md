@@ -14,6 +14,9 @@ All notable changes to pulsar-data-collection. The format follows
 ### Fixed
 - A batch the storage refuses (HTTP 400 / 422, e.g. a field type conflict) is counted in `rejected_rows` and never
   retried nor spooled; it used to be retried forever while blocking the backoff.
+- The background writer no longer concatenates frames whose columns differ (one write per set of columns): the
+  gaps became NaN, turning integer or boolean fields (e.g. `task_success`, absent for some agent runs) into floats or
+  strings that InfluxDB rejected. Found during the S3/S4 campaign.
 - Agent records written with a `PiiSession` carry every role (`pii_<role>_count` = 0 when absent), so that a batch never
   mixes integers and missing values, which InfluxDB received as floats and rejected against the stored integers.
 

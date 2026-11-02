@@ -307,3 +307,26 @@ def test_a_rejected_spooled_batch_is_discarded(fake, tmp_path):
         time.sleep(0.05)
     pulse.close(timeout_s=1)
     assert list(tmp_path.glob("*.json")) == [] and pulse.stats()["rejected_rows"] == 10
+
+
+def test_frames_with_different_columns_are_not_mixed(fake):
+    # an optional boolean field (task_success) absent from some records must not turn into NaN / object
+    pulse = Pulse(PARAMS, fast_options(flush_interval_s=0.5))
+    with_flag = DataWithPrediction(
+        data_points=pd.DataFrame({"x": [1.0], "ok": [True]}),
+        predictions=pd.DataFrame({"y_pred": [1]}),
+        timestamp=START,
+        features_names=["x", "ok"],
+    )
+    without = DataWithPrediction(
+        data_points=pd.DataFrame({"x": [2.0]}),
+        predictions=pd.DataFrame({"y_pred": [0]}),
+        timestamp=START + timedelta(seconds=1),
+        features_names=["x"],
+    )
+    pulse.capture_data(with_flag)
+    pulse.capture_data(without)
+    pulse.close()
+    frames = [f for f, _ in fake.frames]
+    assert len(frames) == 2 and all(not f.isna().any().any() for f in frames)
+    assert frames[0]["ok"].dtype == bool

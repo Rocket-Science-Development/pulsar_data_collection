@@ -3,6 +3,41 @@
 All notable changes to pulsar-data-collection. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [Unreleased] - genai-tracing
+
+### Added
+- `agent_run`: per-tool counters `tool_<tool>_calls` / `_errors` / `_timeouts` / `_soft_failures` (every tool of
+  `allowed_tools` and of the catalogue written, 0 when not called), `tool_errors`, `tool_timeouts`,
+  `tool_soft_failures`, `soft_failure_rate`, `max_tool_error_rate`, `tool_status_counts` (lab M27, M28).
+  `tool_call`: `status`, `timeout`, `soft_failure`. A failed call is a timeout when its `error.type` names one.
+- `record_tool_result(span, output, status, valid, validator)`: records `pulsar.tool.status` and
+  `pulsar.tool.output_valid` without writing the output; `retry`, `invalid`, `empty`, `partial`, `garbage` and invalid
+  outputs are soft failures (M28).
+- `agent_span(..., available_tools=[...])` (`pulsar.agent.available_tools`): `tool_catalog_size`, `tool_catalog_hash`,
+  `catalog_missing_tools`, `missing_tools`; `unavailable_tool_calls` for calls outside the catalogue or with status
+  `unavailable` / `unknown_tool` / `not_found` (M30).
+- `repeated_calls_window`, `max_same_tool_calls`, `tool_cycle_repeats`; parameters `loop_window` (4) and
+  `loop_min_repeats` (2) (M29).
+- `compliance` and `rules_version` parameters (a pulsar-metrics `ComplianceMonitor`, duck-typed, or a callable):
+  `violated_rules`, `violations`, `critical_violations`, `rules_version` in `agent_run`. No dependency on pulsar-metrics
+  (C3, data-collection side).
+- `OpenRunTracker` / `exporter.run_tracker()`: span processor seeing agent spans start. A run open for longer than
+  `max_run_s` (600 s) is reported once by an `agent_run` with `termination="incomplete"` and `incomplete=True`; without
+  the tracker, from the first ended span of its trace. `exporter.check_open_runs()` (M25).
+- `agent_run.incomplete` (False for complete runs); `exporter.stats()` / `assembler.stats()`: `partial_traces_dropped`,
+  `partial_spans_dropped`, `incomplete_runs`, `compliance_errors`, `pending_traces`, `open_runs` (M24).
+- `SpanView.parent_remote`, filled from the OpenTelemetry span: a span under a remote parent is a local root.
+
+### Changed
+- **A trace is no longer assembled before its root arrives** (`wait_for_root=True`, new default). The former default
+  assembled a trace after `trace_timeout_s` (30 s) of inactivity even without its root: every run longer than 30 s lost
+  its LLM and tool calls in silence (`tool_calls=0`, lab M24). A trace without root is now given up after
+  `orphan_timeout_s` (3600 s) or on `max_pending_traces` overflow, and counted. `wait_for_root=False` restores the
+  former behaviour. An agent span under a remote parent is assembled as soon as it ends (it used to wait 30 s).
+- **`loop_detected`** now counts the calls whose normalized tool and arguments (`36000` = `36000.0` = `"36000"`) appeared
+  among the 4 previous calls, True from 2 such calls; it used to see only consecutive calls identical byte for byte, so
+  ping-pong and type variations were never flagged (M29). `repeated_calls` keeps its former meaning.
+
 ## [0.9.0] - 2026-11-02
 
 ### Added

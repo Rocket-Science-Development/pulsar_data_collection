@@ -803,7 +803,10 @@ uv run ruff check . && uv run black --check .
 uv run bandit -c pyproject.toml -r pulsar_data_collection
 ```
 
-The integration tests need a running Docker engine. Continuous integration runs lint, bandit and the tests on
+The integration tests need a running Docker engine. The tests of the shared writer against a real InfluxDB
+(`tests/test_writer_influxdb.py`) run only when `PULSAR_TEST_INFLUX_URL`, `PULSAR_TEST_INFLUX_TOKEN`,
+`PULSAR_TEST_INFLUX_ORG` and `PULSAR_TEST_INFLUX_BUCKET` point at an instance you own; they are skipped otherwise.
+Continuous integration runs lint, bandit and the tests on
 Python 3.12 to 3.15 with pandas 3, plus Python 3.12 with pandas 2, for every pull request; tests are required to pass. Pushing a tag builds and publishes the
 package.
 

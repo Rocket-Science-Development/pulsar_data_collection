@@ -27,6 +27,7 @@ Supported storage: **InfluxDB 2.x** (tested with 2.6.1). The storage layer is a 
 - [How data is stored](#how-data-is-stored)
 - [LLM applications and agents (OpenTelemetry GenAI)](#llm-applications-and-agents-opentelemetry-genai)
 - [Personal information](#personal-information)
+- [Analysis results for dashboards](#analysis-results-and-capture-statistics-for-dashboards)
 - [API reference](#api-reference)
 - [Analyzing the collected data with pulsar-metrics](#analyzing-the-collected-data-with-pulsar-metrics)
 - [Development](#development)
@@ -392,6 +393,28 @@ Mon NAS est [SIN], écrivez à [EMAIL]. Dossier 450123456.
 1                     RAS   41000          0
 [Finding(type='phone', start=44, end=56, confidence=0.6)]
 ```
+
+## Analysis results and capture statistics for dashboards
+
+The analyses of pulsar-metrics return `MetricResults` in memory. `ResultsSink` writes them to InfluxDB, in one
+measurement (`pulsar_results`, one point per result), so that dashboards can show verdicts with their intervals;
+`StatsReporter` publishes the counters of a Pulse (`pulsar_capture_stats`) every few seconds.
+
+| Tags | Fields |
+|---|---|
+| `metric_type`, `metric_name`, `feature_name`, `group`, `reference_group`, `test_type`, plus the caller's (`model_id`, `campaign`...) | `metric_value`, `ci_low`, `ci_high`, `threshold_low` / `threshold_high`, `n`, `e_value`, `status` (1 = drift or disparity established, 0 = none, -1 = inconclusive), `suppressed`, `method`, extra numeric fields such as `p_adjusted` or `confirmed` |
+
+```python
+from pulsar_data_collection.results import ResultsSink, StatsReporter
+
+with ResultsSink(url, token, org, bucket) as sink:
+    sink.write_results(analyzer.get_result(), tags={"model_id": "credit_model", "model_version": "1.0"})
+    with StatsReporter(pulse, sink, interval_s=10):  # a failed report never disturbs the capture
+        ...  # serve predictions
+```
+
+The Grafana dashboards built on these measurements are in
+[pulsar_demo/observability](https://github.com/Rocket-Science-Development/pulsar_demo/tree/main/observability).
 
 ## API reference
 

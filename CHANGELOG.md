@@ -3,6 +3,14 @@
 All notable changes to pulsar-data-collection. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.8.0] - 2026-11-01
+
+### Added
+- `pulsar_data_collection.results.ResultsSink`: writes analysis results (pulsar-metrics `MetricResults` or dicts) to
+  the `pulsar_results` measurement, one point per result, with the three-way verdict as a number (`status`), the
+  interval, the size and the caller's tags; and Pulse counters to `pulsar_capture_stats`.
+- `StatsReporter`: publishes the counters of a Pulse periodically (background thread), never disturbing the capture.
+
 ## [0.7.0] - 2026-11-01
 
 ### Added

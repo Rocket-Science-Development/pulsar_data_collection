@@ -1,7 +1,7 @@
 [
   {
     "schema_version": "pulsar.evidence/1",
-    "evidence_id": "80b98e32c4735e5a91351f6d6d7baa794fad07251f6d75606bdcdf87518091f4",
+    "evidence_id": "be44b09ce116aff389010f982a60524be5e6495f8dcbb2db063d5b6318ca12e1",
     "system_id": "SYS-EXAMPLE-001",
     "model_id": "credit_model",
     "model_version": "1.0",
@@ -26,6 +26,7 @@
       "method": null
     },
     "window": {
+      "id": null,
       "start": "2026-10-26T00:00:00Z",
       "end": "2026-10-26T08:19:00Z",
       "n_rows": 500
@@ -77,7 +78,7 @@
   },
   {
     "schema_version": "pulsar.evidence/1",
-    "evidence_id": "7483974224ee355559486d71d52023cdc99042fe369ca3c4197ff4e92da44f51",
+    "evidence_id": "69ac70c54bc16ca8b9a8af39b30d6df3c09a5c9af76eeafc7583c180831f0fa8",
     "system_id": "SYS-EXAMPLE-001",
     "model_id": "credit_model",
     "model_version": "1.0",
@@ -102,6 +103,7 @@
       "method": null
     },
     "window": {
+      "id": null,
       "start": "2026-10-26T00:00:00Z",
       "end": "2026-10-26T08:19:00Z",
       "n_rows": 500
@@ -154,7 +156,7 @@
   },
   {
     "schema_version": "pulsar.evidence/1",
-    "evidence_id": "5dffb4bfd1443a5757f0eb2591e2f2b5ed24dc8a179d155678976d0df1cebcb1",
+    "evidence_id": "c5b6059b24fc7d2d9f5f6dd0209e6bd8db25ad78cc8b80c541cd9baec7ece292",
     "system_id": "SYS-EXAMPLE-001",
     "model_id": "credit_model",
     "model_version": "1.0",
@@ -179,6 +181,7 @@
       "method": null
     },
     "window": {
+      "id": null,
       "start": "2026-10-26T00:00:00Z",
       "end": "2026-10-26T08:19:00Z",
       "n_rows": 500
@@ -228,7 +231,7 @@
   },
   {
     "schema_version": "pulsar.evidence/1",
-    "evidence_id": "98dfbe786016c59672d3cb04817f00534785ea55992228aae433dbdee2c828eb",
+    "evidence_id": "499089f7481176e465075c3807fef292da48550bf03742d233e22f7316f3fd07",
     "system_id": "SYS-EXAMPLE-002",
     "model_id": "assistant",
     "model_version": "2026.10",
@@ -253,6 +256,7 @@
       "method": "MMD^2 (unbiased), Gaussian mixture kernel, widths x median distance 3.93; permutation p-value 0.0050; reference 80 texts"
     },
     "window": {
+      "id": null,
       "start": "2026-10-26T00:00:00Z",
       "end": "2026-11-01T23:59:59Z",
       "n_rows": 80
@@ -306,7 +310,7 @@
   },
   {
     "schema_version": "pulsar.evidence/1",
-    "evidence_id": "e82bf7c74bcb6340169a7c36a7fbdadf82acdeeffd4f59dd23fa0b9e966cde59",
+    "evidence_id": "ec34bf68f1f9db13f19b3f4fef507ea293fe81b9cf1af5bb6db7ccebc4a6056c",
     "system_id": "SYS-EXAMPLE-002",
     "model_id": "assistant",
     "model_version": "2026.10",
@@ -331,6 +335,7 @@
       "method": "(!create_file U authenticate) | G !create_file [critical; rules rules-v1]; 1 violating runs; Wilson"
     },
     "window": {
+      "id": null,
       "start": "2026-10-26T00:00:00Z",
       "end": "2026-11-01T23:59:59Z",
       "n_rows": 41
@@ -377,7 +382,8 @@
       "run_name": null
     },
     "details": {
-      "test_type": "fixed"
+      "test_type": "fixed",
+      "rules_version": "rules-v1"
     }
   }
 ]

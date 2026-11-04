@@ -369,7 +369,7 @@ carrying `gen_ai.operation.name` is read, whether it comes from an existing inst
 
 | `record_type` | One row per | Main fields |
 |---|---|---|
-| `agent_run` | agent run (`invoke_agent` span and its subtree) | `steps` (LLM calls), `tool_calls`, `distinct_tools`, `tool_error_rate`, `tool_errors`, `tool_timeouts`, `tool_soft_failures`, `tool_<tool>_calls` / `_errors` / `_timeouts` / `_soft_failures`, `tool_status_counts`, `repeated_calls`, `repeated_calls_window`, `max_same_tool_calls`, `tool_cycle_repeats`, `loop_detected`, `unavailable_tool_calls`, `tool_catalog_hash`, `incomplete`, `out_of_scope_calls`, `delegation_depth`, `input_tokens`, `output_tokens`, `latency_s`, `termination`, `task_success`, `first_tool`, `tool_sequence`, `request_model`, `prompt_version`; with `compliance`: `violated_rules`, `critical_violations`, `rules_version` |
+| `agent_run` | agent run (`invoke_agent` span and its subtree) | `steps` (LLM calls), `tool_calls`, `distinct_tools`, `tool_error_rate`, `tool_errors`, `tool_timeouts`, `tool_soft_failures`, `tool_<tool>_calls` / `_errors` / `_timeouts` / `_soft_failures` (tools called in the run), `tool_status_counts`, `repeated_calls`, `repeated_calls_window`, `max_same_tool_calls`, `tool_cycle_repeats`, `loop_detected`, `first_step_no_tool`, `unavailable_tool_calls`, with tool definitions: `tool_args_checked`, `tool_args_invalid`, `tool_args_invalid_rate`, `tool_args_missing_required`, `tool_args_type_errors`, `tool_args_string_numbers`, `tool_args_unparsable`; `tool_catalog_hash`, `incomplete`, `out_of_scope_calls`, `delegation_depth`, `input_tokens`, `output_tokens`, `latency_s`, `termination`, `task_success`, `first_tool`, `tool_sequence`, `request_model`, `prompt_version`; with `compliance`: `violated_rules`, `critical_violations`, `rules_version` |
 | `tool_call` | `execute_tool` span | `tool_name`, `error`, `status`, `timeout`, `soft_failure`, `latency_s`, `out_of_scope` |
 | `llm_call` | `chat` span | `request_model`, `response_model`, `provider`, `temperature`, `input_tokens`, `output_tokens`, `finish_reason`, `latency_s`, `error` |
 
@@ -423,7 +423,7 @@ exporter = PulsarSpanExporter(
 provider.add_span_processor(BatchSpanProcessor(exporter))
 provider.add_span_processor(exporter.run_tracker())  # sees agent spans start: a run that never ends is still reported
 
-with agent_span(tracer, "permit_assistant", available_tools=[t["function"]["name"] for t in TOOL_SCHEMAS]):
+with agent_span(tracer, "permit_assistant", available_tools=TOOL_SCHEMAS):  # names, or the definitions themselves
     with tool_span(tracer, "check_eligibility", arguments=args) as span:
         output = check_eligibility(**args)
         record_tool_result(span, output, validator=lambda out: isinstance(out.get("eligible"), bool))
@@ -436,10 +436,27 @@ exporter.stats()  # {"partial_traces_dropped": 0, "partial_spans_dropped": 0, "i
 | Run longer than 30 s | The complete run, when its root ends. Former behaviour (`wait_for_root=False`): the trace was assembled after `trace_timeout_s` of inactivity, without its root, and the run lost its LLM and tool calls (`tool_calls=0`, `tool_sequence="none"`). |
 | Run that never ends (model generating for minutes, agent stuck in a loop) | One `agent_run` with `termination="incomplete"`, `incomplete=True`, `latency_s` = time open so far and the calls received so far, after `max_run_s` (default 600 s); the complete record follows if the run ends. With `run_tracker()` the run is known from its start, even when no span ever ends; without it, only from ended spans that carry `gen_ai.agent.name` and are not below an agent span already received (never from LLM or tool calls alone). A hung run is reported once, then forgotten after `orphan_timeout_s`. |
 | Trace whose root never arrives | Given up after `orphan_timeout_s` without new span (default 3600 s), or when more than `max_pending_traces` (10,000) traces wait; counted in `stats()["partial_traces_dropped"]` and `["partial_spans_dropped"]`; agent runs found inside are marked `incomplete=True`. Runs under a long-lived local root (a chat session span) wait for it: lower `orphan_timeout_s` (e.g. 300 s) for chat-style roots, or end the session span per turn. |
-| Tool timeouts and errors | Per tool: `tool_<tool>_calls`, `tool_<tool>_errors`, `tool_<tool>_timeouts`, `tool_<tool>_soft_failures` (every tool of `allowed_tools` and of the catalogue is written, 0 when not called). Per run: `tool_errors`, `tool_timeouts`, `max_tool_error_rate`, `tool_status_counts` (`"ok=3,timeout=2"`). A failed call is a `timeout` when its `error.type` names one (`TimeoutError`, `ReadTimeout`...). `tool_call` records carry `status`, `timeout` and `soft_failure`. |
+| Tool timeouts and errors | Per tool: `tool_<tool>_calls`, `tool_<tool>_errors`, `tool_<tool>_timeouts`, `tool_<tool>_soft_failures`, for the tools called in the run only (a missing counter means 0; see `tool_fields` below). Per run: `tool_errors`, `tool_timeouts`, `max_tool_error_rate`, `tool_status_counts` (`"ok=3,timeout=2"`). A failed call is a `timeout` when its `error.type` names one (`TimeoutError`, `ReadTimeout`...). `tool_call` records carry `status`, `timeout` and `soft_failure`. |
 | Tool that answers but returns nothing usable | `record_tool_result(span, output, status=None, valid=None, validator=None)` sets `pulsar.tool.status` (by default the `status` key of a dict output) and `pulsar.tool.output_valid`. The statuses `retry`, `invalid`, `empty`, `partial`, `garbage` and invalid outputs are soft failures: `tool_soft_failures`, `soft_failure_rate`, `tool_<tool>_soft_failures`. The output itself is never written. |
 | Loops | `repeated_calls` keeps its meaning (consecutive calls identical byte for byte). `repeated_calls_window`: calls whose **normalized** tool and arguments (JSON parsed, keys sorted, `36000` = `36000.0` = `"36000"`, strings trimmed and lower-cased) appeared among the `loop_window` (4) previous calls; `loop_detected` is True from `loop_min_repeats` (2) such calls, so ping-pong A>B>A>B and type variations are loops. `max_same_tool_calls` and `tool_cycle_repeats` (longest repetition of a block of 2 or 3 tools) are counts, not verdicts: the same tool called with other identifiers can be legitimate, test them against a reference. |
 | Removed or added tool | With `agent_span(..., available_tools=[...])` (`pulsar.agent.available_tools`): `tool_catalog_size` and `tool_catalog_hash`, which changes with the catalogue from the first run; with `allowed_tools`, `catalog_missing_tools` and `missing_tools`. `unavailable_tool_calls`: calls to a tool outside the catalogue, or with status `unavailable`, `unknown_tool` or `not_found`. |
+| Wrong arguments (no label needed) | When the run records the tool definitions (`agent_span(..., available_tools=TOOL_SCHEMAS)` with the definitions themselves, `gen_ai.tool.definitions`, or OpenLLMetry's `llm.request.functions.<i>.name` / `.parameters`), every call is checked against its tool's JSON schema (`type`, `required`, `enum`, `additionalProperties: false`, nested properties and items): `tool_args_checked`, `tool_args_invalid` (calls with at least one problem), `tool_args_invalid_rate`, `tool_args_missing_required`, `tool_args_type_errors`, `tool_args_string_numbers` (numbers sent as strings, e.g. `{"income": "36000"}`), `tool_args_unparsable` (not a JSON object). Only counts are written. Without definitions, the fields are absent. |
+| Model that answers instead of acting | `first_step_no_tool`: the first model call was followed by no tool call before the next model call (or the end of the run). |
+
+Per-tool counters are bounded with `tool_fields` (`PulsarSpanExporter` and `TrajectoryAssembler`):
+
+| `tool_fields` | Tools with `tool_<tool>_*` counters |
+|---|---|
+| `"called"` (default) | the tools called in the run (at most 4 fields per tool called) |
+| `"allowed"` | every tool of `allowed_tools`, 0 when not called (needs `allowed_tools`) |
+| `"top_k"` | the `tool_fields_k` (10) tools called most in the run |
+| `"all"` | former behaviour: tools called, allowed and of the catalogue, 0 when not called |
+| `"none"` | none: the per-call detail stays in the `tool_call` records (`tool_name`, `status`...) |
+
+Formerly every tool of the catalogue got four fields, 0 when not called: in the lab, 1200 runs on BFCL catalogues
+carried 2308 per-tool fields. With `"called"`, a run has at most 8 of them there; over the series the field names still
+follow the tools actually called (1568 for the 392 BFCL tools called): with catalogues that change per request, prefer
+`"allowed"` or `"none"`.
 
 ### Rule violations in `agent_run`
 
@@ -449,7 +466,40 @@ exporter.stats()  # {"partial_traces_dropped": 0, "partial_spans_dropped": 0, "i
 `pulsar_metrics.genai.ComplianceMonitor` (pulsar-metrics is not a dependency: any object with `violations(trace)`
 fits) or a callable `trace -> violated rule ids`; the trace is the list of the tools called, as
 `trace_from(tool_sequence)` rebuilds it. A rule set that raises never stops the collection
-(`stats()["compliance_errors"]`). Without `compliance`, the fields are absent.
+(`stats()["compliance_errors"]`). Without `compliance`, the fields are absent. A monitor with `not_evaluable(trace)`
+adds `not_evaluable_rules` (ids of the rules the trace cannot decide, comma-separated), absent when there is none.
+
+A monitor declaring `accepts_rich_trace = True` receives the **rich trace** instead: the tool calls and the
+conversation events of the run, in time order, each a dict:
+
+```python
+{"name": "get_order_details", "kind": "tool", "status": "ok", "args": {"order_id": "W123"}}
+{"name": "user_confirmation", "kind": "event"}
+{"name": "cancel_pending_order", "kind": "tool", "status": "timeout", "args": {"order_id": "W123"}}
+```
+
+`status` is `"ok"`, `"error"` (a call to an unavailable tool included), `"timeout"` or `"soft_failure"`; `args` holds
+the parsed arguments when they are a JSON object. The values are used in memory for the check only and are never
+written (the stored records keep the hashed signatures). Conversation events are OpenTelemetry span events named
+`pulsar.event.<name>` on any span of the run; record them with `record_event`:
+
+```python
+from pulsar_data_collection.genai import record_event
+
+with agent_span(tracer, "retail_assistant"):
+    ...
+    if user_said_yes:
+        record_event("user_confirmation")  # on the current span; record_event(name, span=run) for another one
+    with tool_span(tracer, "cancel_pending_order", arguments={"order_id": order_id}):
+        ...
+```
+
+Policies that need the rich trace: confirmations ("a write only after the user said yes"), and every rule on
+arguments or outcomes ("cancel the order that was looked up", "no retry after a timeout"). In the lab (tau-bench
+retail, 40 episodes), the confirmation policy failed on 36 of 36 runs with a write on the tool names; through the
+exporter with `user_yes` events in the rich trace it gives the 23 real violations. The tool spans and events recorded
+by the helpers carry a sequence number (`pulsar.sequence`), so that their order holds when the clock is coarse
+(15.6 ms on Windows); other instrumentations are ordered by timestamp only.
 
 ### Known limits (night lab, 2026-11-02)
 
@@ -479,6 +529,21 @@ can produce its own verdict (order effects, wording, randomness), so the control
 - `ComparativeProbe` asks to choose between two profiles **in both orders**, with or without a tie option, to measure
   and cancel the position effect;
 - requests are sent in a random order and look like ordinary requests.
+
+`ComparativeProbe` rows also say whether each answer is usable. `answer_status` is `"ok"` (a choice was read),
+`"refusal"` (French or English refusal phrasings: "Je ne peux pas", "Je suis désolé", "I can't", "I'm sorry"...; or a
+`refusal=` callable), `"unparsed"` or `"error"`; `unusable` is True for refusals and unparsed answers. `choice` is
+`"refusal"` for a refusal (it was None, like an unparsed answer, which stays None); `chosen_group` is None for both. In the lab, 23.3 % of the answers of llama3.2:3b were refusals that
+looked like unparsed answers. Two instruments help when the choice question is driven by the position (the 6 local
+models of the lab answered "first" from 2.8 % to 99.1 % of the time):
+
+- `labels="neutral"` rotates the option labels across sets (A/B, 1/2, X/Y and reversed; or a list of pairs); the
+  template then needs `{first_label}` and `{second_label}` slots, and `run(probes, target)` without `choice` reads the
+  label each probe offered (`label_choice`). The `labels` column says which pair was shown;
+- `run_loglik(probes, loglik)` compares the log-likelihood of the two profiles (`loglik(text) -> float`) when the target
+  exposes logprobs: nothing is asked, so there is no position effect (`instrument="loglik"`, `loglik_first`,
+  `loglik_second`). Without logprobs (`loglik=None`, or a first call that raises NotImplementedError or returns None)
+  the instrument is skipped: an empty frame, `rows.attrs["skipped"] == "no_logprobs"`.
 
 `probe.span_attributes()` gives the `pulsar.cf.set_id`, `pulsar.cf.variant`, `pulsar.cf.attribute` and
 `pulsar.cf.control` attributes: set them on the agent span and they reach the `agent_run` records (`cf_set_id`,

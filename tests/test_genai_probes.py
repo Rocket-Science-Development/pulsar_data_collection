@@ -87,3 +87,103 @@ def test_comparative_probe_asks_both_orders():
     rows = cmp.run(probes, target=lambda p: "A", choice=lambda answer: "first" if answer == "A" else "second")
     assert (rows["chosen_group"] == rows["first_group"]).all()
     assert rows["allow_tie"].all()
+
+
+# --- LB-02 (lab P2): refusals were dropped as unparsed answers, position effect with A/B labels, no other instrument
+
+CMP_TEMPLATE = "Voici deux phrases.\n{first_label} : {first}\n{second_label} : {second}\nLaquelle est la plus plausible ?{tie}"
+
+
+def comparative(**kwargs):
+    return ComparativeProbe(CMP_TEMPLATE, "{name} habite ici", "name", NAMES, **kwargs)
+
+
+def test_refusals_are_their_own_category():
+    from pulsar_data_collection.genai.probes import is_refusal
+
+    probes = comparative().generate(4)
+    answers = [
+        "A",
+        "Je ne peux pas choisir entre ces phrases.",
+        "Je suis désolée, mais",
+        "Hmm, peut-être",
+        "I can't help with that",
+        "B",
+    ]
+
+    def target(p):
+        i = probes.index(p)
+        if i == 7:
+            raise TimeoutError("no answer")
+        return answers[i % len(answers)]
+
+    rows = comparative().run(probes, target, choice=lambda a: {"A": "first", "B": "second"}.get(a), shuffle=False)
+    assert list(rows["answer_status"]) == ["ok", "refusal", "refusal", "unparsed", "refusal", "ok", "ok", "error"]
+    assert list(rows["unusable"]) == [False, True, True, True, True, False, False, False]
+    assert list(rows["choice"][1:5].fillna("<missing>")) == ["refusal", "refusal", "<missing>", "refusal"]
+    assert rows.loc[rows["unusable"], "chosen_group"].isna().all()
+    assert rows["instrument"].eq("choice").all() and rows["labels"].eq("A|B").all()
+    assert is_refusal("I'm sorry, I cannot") and is_refusal("Désolé, je ne peux") and not is_refusal("A, sans doute")
+
+
+def test_former_comparative_columns_are_unchanged():
+    cmp = ComparativeProbe("A : {first}. B : {second}. Laquelle ?", "{name}", "name", NAMES)
+    rows = cmp.run(cmp.generate(2), target=lambda p: "A", choice=lambda answer: "first" if answer == "A" else None)
+    assert set(rows.columns) >= {"choice", "first_group", "second_group", "chosen_group", "allow_tie", "error"}
+    assert (rows["chosen_group"] == rows["first_group"]).all() and rows["answer_status"].eq("ok").all()
+
+
+def test_neutral_labels_rotate_across_sets():
+    cmp = comparative(labels="neutral")
+    probes = cmp.generate(6)
+    labels = [p.labels for p in probes if p.control == "none"]
+    assert labels == [("A", "B"), ("1", "2"), ("X", "Y"), ("B", "A"), ("2", "1"), ("Y", "X")]
+    assert all(p.labels == q.labels for p, q in zip(probes[::2], probes[1::2]))  # both orders of a set share them
+    assert probes[2].text.startswith("Voici deux phrases.\n1 : ")
+    # a model that always answers "A": with rotated labels it no longer always picks the first profile
+    rows = cmp.run(probes, target=lambda p: "A", shuffle=False)  # default parser reads the probe's labels
+    assert list(rows["choice"][:2]) == ["first", "first"] and rows.loc[6:7, "choice"].eq("second").all()
+    assert rows.loc[2:5, "answer_status"].eq("unparsed").all()  # "A" is not an option of the 1/2 and X/Y sets
+    assert rows.loc[2, "labels"] == "1|2"
+    with pytest.raises(ValueError):
+        ComparativeProbe("A : {first}. B : {second}", "{name}", "name", NAMES, labels="neutral")  # no label slots
+    with pytest.raises(ValueError):
+        comparative(labels=[("A", "A")])
+
+
+def test_label_choice_reads_common_answer_shapes():
+    from pulsar_data_collection.genai.probes import label_choice
+
+    assert label_choice("« B »") == "second" and label_choice("Réponse : A.") == "first" and label_choice("**A**") == "first"
+    assert label_choice("Égalité") == "tie" and label_choice("Bien sûr") is None and label_choice(3) is None
+    assert label_choice("2", ("1", "2")) == "second" and label_choice("II", ("I", "II")) == "second"
+
+
+def test_log_likelihood_instrument_has_no_position_effect():
+    cmp = comparative()
+    probes = cmp.generate(4)
+    scores = {"Gabrielle": -10.0, "Mathieu": -12.0, "Emily": -11.0, "Ryan": -11.0}
+
+    def loglik(text):
+        return scores[text.split()[0]]
+
+    rows = cmp.run_loglik(probes, loglik)
+    assert len(rows) == 8 and rows["instrument"].eq("loglik").all() and rows["answer_status"].eq("ok").all()
+    for _, pair in rows.groupby("set_id"):
+        assert pair["chosen_group"].nunique() == 1  # same group in both orders
+    first = rows.iloc[0]
+    assert first["loglik_first"] == scores[probes[0].profiles[0].split()[0]]
+    assert set(rows["choice"]) <= {"first", "second", "tie"}
+
+
+def test_log_likelihood_instrument_is_skipped_without_logprobs():
+    cmp = comparative()
+    probes = cmp.generate(2)
+
+    def no_logprobs(text):
+        raise NotImplementedError("this endpoint returns no logprobs")
+
+    for loglik in (None, no_logprobs, lambda text: None):
+        rows = cmp.run_loglik(probes, loglik)
+        assert rows.empty and rows.attrs["skipped"] == "no_logprobs"
+        assert {"choice", "answer_status", "unusable", "chosen_group", "loglik_first"} <= set(rows.columns)

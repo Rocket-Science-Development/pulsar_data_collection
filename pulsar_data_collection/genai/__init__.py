@@ -14,7 +14,7 @@ from .detectors import (
     record_score,
 )
 from .exporter import ListSink, OpenRunTracker, PulsarSpanExporter, PulseSink
-from .instrument import agent_span, llm_span, record_llm_response, record_tool_result, tool_span
+from .instrument import agent_span, llm_span, record_event, record_llm_response, record_tool_result, tool_span
 from .probes import ComparativeProbe, CounterfactualProbe, Probe
 from .semconv import SCHEMA_VERSION
 from .trajectory import TrajectoryAssembler
@@ -41,6 +41,7 @@ __all__ = [
     "french_benign_calibration_set",
     "guess_language",
     "llm_span",
+    "record_event",
     "record_llm_response",
     "record_score",
     "record_tool_result",

@@ -62,32 +62,19 @@ def test_an_injection_after_the_horizon_is_scored_with_sliding_windows(injection
     default = InjectionDetector()
     with pytest.warns(UserWarning, match="cut to its first 510"):
         details = default.score_details(text)
-    assert (
-        details.score == pytest.approx(0.01)
-        and details.truncated
-        and details.windows == 1
-    )
+    assert details.score == pytest.approx(0.01) and details.truncated and details.windows == 1
     assert details.n_tokens == 2009 and details.tokens_seen == 510
     with warnings.catch_warnings():
         warnings.simplefilter("error")  # warned once per detector
         assert default.score(text) == pytest.approx(0.01)
-        assert (
-            not InjectionDetector().score_details(INJECTION).truncated
-        )  # a short text: no warning
+        assert not InjectionDetector().score_details(INJECTION).truncated  # a short text: no warning
 
     sliding = InjectionDetector(long_text="sliding")
     with warnings.catch_warnings():
         warnings.simplefilter("error")  # nothing is cut: no warning
         result = sliding.score_details(text)
-        assert (
-            result.score == pytest.approx(0.99)
-            and not result.truncated
-            and result.windows == 5
-        )
-        assert (
-            result.tokens_seen == result.n_tokens == 2009
-            and max(result.window_scores) == result.raw
-        )
+        assert result.score == pytest.approx(0.99) and not result.truncated and result.windows == 5
+        assert result.tokens_seen == result.n_tokens == 2009 and max(result.window_scores) == result.raw
         assert sliding.score(text) == pytest.approx(0.99)
         assert sliding.score_many(["", text, INJECTION]) == [
             0.0,
@@ -104,9 +91,7 @@ def test_an_injection_after_the_horizon_is_scored_with_sliding_windows(injection
 def test_an_injection_across_a_window_edge_is_read_whole(injection):
     """The windows overlap by `overlap_tokens`: a payload cut by one window edge is whole in the next window"""
     words = [f"word{i}" for i in range(1500)]
-    words[507:507] = (
-        INJECTION.split()
-    )  # across the end of the first window (510 tokens)
+    words[507:507] = INJECTION.split()  # across the end of the first window (510 tokens)
     detector = InjectionDetector(long_text="sliding")
     assert detector.score(" ".join(words)) == pytest.approx(0.99)
     no_overlap = InjectionDetector(long_text="sliding", overlap_tokens=0)
@@ -163,9 +148,7 @@ class NoRules:
 @pytest.fixture
 def token_gliner(monkeypatch):
     TokenGliner.instances.clear()
-    monkeypatch.setitem(
-        sys.modules, "gliner", types.SimpleNamespace(GLiNER=TokenGliner)
-    )
+    monkeypatch.setitem(sys.modules, "gliner", types.SimpleNamespace(GLiNER=TokenGliner))
     return TokenGliner
 
 
@@ -176,21 +159,12 @@ def test_names_at_the_end_of_long_texts_are_found_with_token_windows(token_gline
     text = " ".join(f"mot{i}," for i in range(430)) + " Signé : Tremblay."
     detector = ModelPiiDetector(rules=NoRules())
     found = detector.scan(text)
-    assert isinstance(found, PiiScan) and [text[f.start : f.end] for f in found] == [
-        "Tremblay"
-    ]
-    assert (
-        found.truncated_windows == 0
-        and found.windows == len(detector.windows(text)) == 3
-    )
-    assert all(
-        len(GLINER_TOKENS.findall(text[s:e])) <= 384 for s, e in detector.windows(text)
-    )
+    assert isinstance(found, PiiScan) and [text[f.start : f.end] for f in found] == ["Tremblay"]
+    assert found.truncated_windows == 0 and found.windows == len(detector.windows(text)) == 3
+    assert all(len(GLINER_TOKENS.findall(text[s:e])) <= 384 for s, e in detector.windows(text))
     assert detector.window_tokens == 384 and detector.max_len == 384
 
-    words = ModelPiiDetector(
-        rules=NoRules(), window_words=250, overlap_words=50
-    )  # the windows up to 0.10
+    words = ModelPiiDetector(rules=NoRules(), window_words=250, overlap_words=50)  # the windows up to 0.10
     with pytest.warns(UserWarning, match="max_len of 384"):
         legacy = words.scan(text)
     assert list(legacy) == [] and legacy.truncated_windows == 2 and legacy.windows == 2
@@ -214,14 +188,8 @@ def test_scan_many_batches_the_short_texts(token_gliner):
         5,
         3,
     ]  # the 5 short texts in one call, then the 3 windows of the long one
-    assert [list(r) for r in many] == [
-        list(detector.scan(t)) for t in short + ["", long]
-    ]
-    assert (
-        all(isinstance(r, PiiScan) for r in many)
-        and many[-1].windows == 3
-        and many[-2].windows == 0
-    )
+    assert [list(r) for r in many] == [list(detector.scan(t)) for t in short + ["", long]]
+    assert all(isinstance(r, PiiScan) for r in many) and many[-1].windows == 3 and many[-2].windows == 0
     assert [Finding("person_name", 20, 28, 0.9)] == list(many[1])
 
 
@@ -237,9 +205,7 @@ def diluting_nli_pipeline(task, model, device=None, **kwargs):
 
     def one(pair):
         premise = pair["text"].lower().replace(",", " ").replace(".", " ").split()
-        supported = all(
-            w in premise for w in pair["text_pair"].lower().replace(".", " ").split()
-        )
+        supported = all(w in premise for w in pair["text_pair"].lower().replace(".", " ").split())
         score = 0.9 * min(1.0, 30 / len(premise)) if supported else 0.02
         return [
             {"label": "entailment", "score": score},
@@ -262,39 +228,19 @@ def test_support_does_not_depend_on_where_the_evidence_falls_with_sentence_premi
     than in the short last window (end); premises cut at sentence boundaries give the same support at both ends
     """
     monkeypatch.setattr(detectors, "_pipeline", diluting_nli_pipeline)
-    filler = " ".join(
-        f"Sentence {i} of the annual report describes another regional office."
-        for i in range(70)
-    )
+    filler = " ".join(f"Sentence {i} of the annual report describes another regional office." for i in range(70))
     start, end = [FACT + " " + filler], [filler + " " + FACT]
     tokens = FaithfulnessScorer(lexical_threshold=None)
-    assert (
-        tokens.score(CLAIM, end) - tokens.score(CLAIM, start) > 0.1
-    )  # the limit: support depends on the window
+    assert tokens.score(CLAIM, end) - tokens.score(CLAIM, start) > 0.1  # the limit: support depends on the window
 
     sentences = FaithfulnessScorer(lexical_threshold=None, premise_split="sentences")
     at_start, at_end = sentences.details(CLAIM, start), sentences.details(CLAIM, end)
-    assert (
-        at_start.score > 0.8
-        and at_end.score > 0.8
-        and abs(at_start.score - at_end.score) < 0.05
-    )
-    assert at_start.windows == 70 and at_start.premise_tokens == len(
-        (FACT + " " + filler).split()
-    )
-    assert (
-        sentences._nli.calls[-1] == 4
-    )  # the 4 groups closest to the claim, not all 70
-    assert sentences.score(CLAIM, [filler]) == pytest.approx(
-        0.02
-    )  # absent evidence stays unsupported
-    every = FaithfulnessScorer(
-        lexical_threshold=None, premise_split="sentences", top_k_premises=None
-    )
-    assert (
-        every.score(CLAIM, end) == pytest.approx(at_end.score)
-        and every._nli.calls[-1] == 70
-    )
+    assert at_start.score > 0.8 and at_end.score > 0.8 and abs(at_start.score - at_end.score) < 0.05
+    assert at_start.windows == 70 and at_start.premise_tokens == len((FACT + " " + filler).split())
+    assert sentences._nli.calls[-1] == 4  # the 4 groups closest to the claim, not all 70
+    assert sentences.score(CLAIM, [filler]) == pytest.approx(0.02)  # absent evidence stays unsupported
+    every = FaithfulnessScorer(lexical_threshold=None, premise_split="sentences", top_k_premises=None)
+    assert every.score(CLAIM, end) == pytest.approx(at_end.score) and every._nli.calls[-1] == 70
     with pytest.raises(ValueError):
         FaithfulnessScorer(premise_split="paragraphs")
     with pytest.raises(ValueError):
@@ -309,9 +255,7 @@ def test_a_long_sentence_group_is_cut_into_token_windows(monkeypatch):
         stride_tokens=5,
         premise_sentences=1,
     )
-    groups = scorer.premise_groups(
-        ["one two three four five six seven eight nine ten eleven twelve. Short one."]
-    )
+    groups = scorer.premise_groups(["one two three four five six seven eight nine ten eleven twelve. Short one."])
     assert groups == [
         "one two three four five six seven eight nine ten",
         "six seven eight nine ten eleven twelve.",
@@ -332,9 +276,7 @@ def test_models_run_in_float32_on_the_cpu_and_take_a_dtype(monkeypatch):
         seen.append({"device": device, "dtype": dtype, **kwargs})
         return lambda *a, **k: None
 
-    def old_pipeline(
-        task, model=None, device=None, torch_dtype=None, **kwargs
-    ):  # transformers < 4.56
+    def old_pipeline(task, model=None, device=None, torch_dtype=None, **kwargs):  # transformers < 4.56
         seen.append({"device": device, "torch_dtype": torch_dtype})
         return lambda *a, **k: None
 
@@ -357,26 +299,16 @@ def test_models_run_in_float32_on_the_cpu_and_take_a_dtype(monkeypatch):
         ("cpu", "float32"),
         (0, "float16"),
     ]
-    assert (
-        seen[0]["top_k"] is None
-        and seen[0]["truncation"]
-        and seen[0]["max_length"] == 512
-    )
+    assert seen[0]["top_k"] is None and seen[0]["truncation"] and seen[0]["max_length"] == 512
     transformers.pipeline = old_pipeline
     FaithfulnessScorer()
     assert seen[-1] == {"device": None, "torch_dtype": "float32"}
 
     class Gliner(TokenGliner):
         def parameters(self):
-            return iter(
-                [types.SimpleNamespace(dtype="float16")]
-            )  # a half-precision checkpoint
+            return iter([types.SimpleNamespace(dtype="float16")])  # a half-precision checkpoint
 
     monkeypatch.setitem(sys.modules, "gliner", types.SimpleNamespace(GLiNER=Gliner))
     assert ModelPiiDetector(rules=NoRules())._model.dtypes == ["float32"]
-    assert ModelPiiDetector(rules=NoRules(), device="cuda:0")._model.dtypes == [
-        None
-    ]  # moved, dtype kept
-    assert ModelPiiDetector(
-        rules=NoRules(), device="cuda:0", dtype="float16"
-    )._model.dtypes == [None, "float16"]
+    assert ModelPiiDetector(rules=NoRules(), device="cuda:0")._model.dtypes == [None]  # moved, dtype kept
+    assert ModelPiiDetector(rules=NoRules(), device="cuda:0", dtype="float16")._model.dtypes == [None, "float16"]

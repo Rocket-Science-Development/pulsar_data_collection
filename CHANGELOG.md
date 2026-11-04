@@ -3,6 +3,73 @@
 All notable changes to pulsar-data-collection. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.11.0] - 2026-11-04
+
+Changes recommended by the scalability rerun and the P2 lab of 3 November 2026 (N1, N3, M32, m18, m19, SC-09,
+LA-01, LA-02, LB-02).
+
+### Added
+
+**Writing and spool**
+
+- `encode_lines()`: line protocol built column by column, with the same lines as the influxdb-client serializer (still
+  used for unusual frames). A 50-row frame encodes in 0.9 ms instead of 5.3 ms; a `SharedWriter` at 100 models drains
+  24.8k rows/s instead of 5.9k (local measurement), as fast as private writers (N1, N3).
+- `StorageWriteUncertainError`, parent of `StorageWriteTimeoutError` and of the new `StorageConnectionResetError`.
+- README: choosing private writers or `SharedWriter`, the per-process ceiling, the loss window on kill -9
+  (`max_queue_rows` plus one batch) and `durability="wal"`, `spool_compression="gzip"`, and the recommended
+  `replay_max_rows_per_s` (2 to 6 times the Pulse's live rate; the default stays unlimited).
+
+**Detectors (SC-09)**
+
+- `InjectionDetector` / `TextClassifierDetector`: `score_details(text)` returns a `ClassifierScore` (`n_tokens`,
+  `tokens_seen`, `windows`, `truncated`, `window_scores`); `long_text="sliding"` (opt-in) scores long texts on
+  overlapping windows of the horizon minus 8 tokens (score = maximum; refit thresholds in that mode); `horizon`, `windows()`.
+- `dtype=` on every detector; `FaithfulnessScorer` also passes `**pipeline_kwargs`.
+- `ModelPiiDetector`: `window_tokens` / `overlap_tokens` (GLiNER tokens); `scan()` returns a `PiiScan` (a list) with
+  `windows` and `truncated_windows`; `scan_many(texts)` batches short texts (2.3x on CPU).
+- `FaithfulnessScorer(premise_split="sentences", premise_sentences=2, top_k_premises=4)` (opt-in): each sentence is
+  judged against the closest groups of sentences, so its support no longer depends on where the evidence sits.
+
+**Agents and probes (LA-01, LA-02, LB-02)**
+
+- `tool_fields="called" | "allowed" | "top_k" | "all" | "none"` and `tool_fields_k` on `TrajectoryAssembler`,
+  `PulsarSpanExporter` and `agent_run_record`.
+- Label-free quality fields: `tool_args_checked`, `tool_args_invalid`, `tool_args_invalid_rate`,
+  `tool_args_missing_required`, `tool_args_type_errors`, `tool_args_string_numbers`, `tool_args_unparsable` (arguments
+  checked against the tool JSON schemas from `gen_ai.tool.definitions`, `agent_span(available_tools=<definitions>)` or
+  `llm.request.functions.*`), and `first_step_no_tool`.
+- Rich compliance trace for monitors declaring `accepts_rich_trace = True`: tool calls with their parsed arguments and
+  status, and conversation events `pulsar.event.<name>` recorded with `record_event()`, in time order
+  (`pulsar.sequence`, also set by the `OpenRunTracker` on the tool spans of other instrumentations, breaks timestamp
+  ties). Argument values are never written. `not_evaluable_rules` when the monitor
+  exposes `not_evaluable`.
+- `ComparativeProbe`: `answer_status`, `unusable`, `labels`, `instrument` columns; `refusal=` (default `is_refusal`,
+  French and English); neutral label rotation (`labels="neutral"`, `label_choice()`); `run_loglik(probes, loglik)`,
+  skipped cleanly without logprobs.
+
+### Changed
+
+- `agent_run` writes per-tool counters only for the tools called in the run (`tool_fields="called"`); a missing counter
+  means 0. Before, every catalogue tool got four fields even at 0 (2308 fields for 580 tools); `"all"` restores it.
+- `ComparativeProbe` records a refusal as `choice="refusal"` (it was `None`).
+- Models load in float32 on CPU when no dtype is given (the NLI of `FaithfulnessScorer`, stored in float16, is about
+  10x faster, scores unchanged to about 1e-4); the checkpoint dtype is kept on GPU.
+- `ModelPiiDetector` windows default to 384/96 GLiNER tokens instead of 250/50 words; `window_words` is still accepted.
+- `InjectionDetector` / `TextClassifierDetector` warn once per instance when they truncate a text.
+- A write whose connection is cut after sending counts in `uncertain_rows` (or the spool), not in `dropped_rows`; in
+  sync mode it raises `StorageConnectionResetError` instead of urllib3's `ProtocolError`. `write_timeouts` counts only
+  timeouts.
+
+### Fixed
+
+- A field whose name is part of the timestamp column's name (`time`, `e`) made the whole batch rejected, and columns
+  such as `_t` were dropped.
+- Spool file names are strictly increasing within a process: with a coarse clock, `drop_oldest` could evict a recent
+  batch and replay did not follow capture order.
+- `ModelPiiDetector`'s 250-word windows exceeded GLiNER's 384 tokens, so the end of long texts was never read; its
+  docstring said "384 words".
+
 ## [0.10.0] - 2026-11-02
 
 Fixes for the limits confirmed by the night lab of 2 November 2026: C3 (data-collection side), C4, M10 to M25,

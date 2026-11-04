@@ -15,6 +15,7 @@ from opentelemetry.trace import StatusCode
 from ..models import CaptureOptions, DataWithPrediction, PulseParameters
 from ..pulse import Pulse
 from . import semconv as sc
+from .instrument import next_sequence
 from .trajectory import OpenRun, SpanView, TrajectoryAssembler
 
 log = logging.getLogger(__name__)
@@ -101,6 +102,12 @@ def span_view(span: ReadableSpan) -> SpanView:
         status_error=span.status.status_code == StatusCode.ERROR,
         attributes=dict(span.attributes or {}),
         parent_remote=bool(span.parent is not None and span.parent.is_remote),
+        # only the conversation events are kept (pulsar.event.<name>), without their attributes
+        events=[
+            (event.name[len(sc.EVENT_PREFIX) :], event.timestamp, (event.attributes or {}).get(sc.SEQUENCE))
+            for event in span.events or ()
+            if event.name.startswith(sc.EVENT_PREFIX) and len(event.name) > len(sc.EVENT_PREFIX)
+        ],
     )
 
 
@@ -122,8 +129,9 @@ class PulsarSpanExporter(SpanExporter):
         anyway (default 30 s; this former behaviour lost the LLM and tool calls of the runs longer than 30 s)
     wait_for_root, orphan_timeout_s, max_run_s, max_pending_traces : optional
         Assembly of the traces, see TrajectoryAssembler
-    loop_window, loop_min_repeats, compliance, rules_version : optional
-        Agent run features, see TrajectoryAssembler
+    loop_window, loop_min_repeats, compliance, rules_version, tool_fields, tool_fields_k : optional
+        Agent run features, see TrajectoryAssembler. `tool_fields` (default "called") bounds the per-tool counters
+        to the tools called in each run; "all" restores the former counters for every tool of the catalogue.
     """
 
     def __init__(
@@ -140,6 +148,8 @@ class PulsarSpanExporter(SpanExporter):
         loop_min_repeats: int = 2,
         compliance: Any = None,
         rules_version: Optional[str] = None,
+        tool_fields: str = "called",
+        tool_fields_k: int = 10,
     ):
         self.sink = sink
         self.assembler = TrajectoryAssembler(
@@ -153,6 +163,8 @@ class PulsarSpanExporter(SpanExporter):
             loop_min_repeats=loop_min_repeats,
             compliance=compliance,
             rules_version=rules_version,
+            tool_fields=tool_fields,
+            tool_fields_k=tool_fields_k,
         )
         self._lock = threading.Lock()
         self._started: deque = deque()  # filled by OpenRunTracker.on_start without taking the lock
@@ -238,6 +250,11 @@ class OpenRunTracker(SpanProcessor):
 
     def on_start(self, span, parent_context=None) -> None:
         attributes = span.attributes or {}
+        if sc.SEQUENCE not in attributes and (
+            attributes.get(sc.OPERATION) == sc.OP_EXECUTE_TOOL or str(span.name).startswith(sc.OP_EXECUTE_TOOL)
+        ):
+            # tool spans of other instrumentations get the same order number as tool_span and record_event
+            span.set_attribute(sc.SEQUENCE, next_sequence())
         # every span start is queued (agent attributes only), so that a sub-agent below an intermediate span is known
         agent = attributes.get(sc.OPERATION) == sc.OP_INVOKE_AGENT
         parent = span.parent

@@ -240,7 +240,7 @@ def test_per_tool_error_and_timeout_counts(pipeline):
     assert run["tool_check_eligibility_calls"] == 4
     assert run["tool_check_eligibility_errors"] == 2 and run["tool_check_eligibility_timeouts"] == 2
     assert run["tool_search_programs_calls"] == 1 and run["tool_search_programs_errors"] == 0
-    assert run["tool_compute_amount_calls"] == 0  # allowed tools are always written
+    assert "tool_compute_amount_calls" not in run  # only the tools called get counters (tool_fields="called")
     assert run["tool_timeouts"] == 2 and run["tool_errors"] == 2 and run["max_tool_error_rate"] == pytest.approx(0.5)
     assert run["tool_status_counts"] == "ok=3,timeout=2"
     timeouts = [t for t in sink.of("tool_call") if t["timeout"]]
@@ -435,3 +435,237 @@ def test_llm_helpers_still_feed_the_run(pipeline):
             record_llm_response(call, input_tokens=3, output_tokens=1)
     (run,) = sink.of("agent_run")
     assert run["steps"] == 1 and run["tool_errors"] == 0 and run["tool_status_counts"] == "none"
+
+
+# --- LA-01 (lab P2): the agent_run schema grew with the tool catalogue (2308 per-tool fields for 580 tools)
+
+COUNTER_SUFFIXES = ("calls", "errors", "timeouts", "soft_failures")
+RUN_TOTALS = {"tool_calls", "tool_errors", "tool_timeouts", "tool_soft_failures", "tool_args_type_errors"}
+
+
+def per_tool_keys(run):
+    return {k for k in run if k.startswith("tool_") and k.endswith(COUNTER_SUFFIXES)} - RUN_TOTALS
+
+
+def counters(*tools):
+    return {f"tool_{t}_{c}" for t in tools for c in COUNTER_SUFFIXES}
+
+
+def test_per_tool_counters_do_not_grow_with_the_catalogue():
+    catalogue = [f"tool_{i:03d}" for i in range(580)]
+    calls = [tool(3, "tool_007", 0, 1), tool(4, "tool_042", 1, 2, error="ValueError")]
+    assembler = TrajectoryAssembler(allowed_tools=set(catalogue[:50]))
+    run = run_of(assembler, calls, **{sc.AVAILABLE_TOOLS: catalogue})
+    assert per_tool_keys(run) == counters("tool_007", "tool_042")
+    assert run["tool_tool_042_errors"] == 1 and run["max_tool_error_rate"] == 1.0 and run["tool_catalog_size"] == 580
+    former = TrajectoryAssembler(allowed_tools=set(catalogue[:50]), tool_fields="all")
+    assert len(per_tool_keys(run_of(former, calls, **{sc.AVAILABLE_TOOLS: catalogue}))) == 4 * 580  # kept as an option
+
+
+def test_per_tool_counter_modes():
+    calls = [tool(3, "check_eligibility", 0, 1), tool(4, "check_eligibility", 1, 2), tool(5, "search_programs", 2, 3)]
+    allowed = run_of(TrajectoryAssembler(allowed_tools=ALLOWED, tool_fields="allowed"), calls)
+    assert per_tool_keys(allowed) == counters(*ALLOWED) and allowed["tool_compute_amount_calls"] == 0
+    top = run_of(TrajectoryAssembler(tool_fields="top_k", tool_fields_k=1), calls)
+    assert per_tool_keys(top) == counters("check_eligibility")
+    none = run_of(TrajectoryAssembler(tool_fields="none"), calls)
+    assert per_tool_keys(none) == set() and none["tool_calls"] == 3
+    with pytest.raises(ValueError):
+        TrajectoryAssembler(tool_fields="allowed")  # needs allowed_tools
+    with pytest.raises(ValueError):
+        TrajectoryAssembler(tool_fields="every")
+
+
+# --- LA-01 (lab P2): without labels, a 3b -> 8b model change was invisible; argument quality moved (854 vs 150)
+
+SCHEMAS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "compute_amount",
+            "description": "not recorded",
+            "parameters": {
+                "type": "object",
+                "properties": {"income": {"type": "integer"}, "region": {"type": "string", "enum": ["qc", "on"]}},
+                "required": ["income"],
+            },
+        },
+    },
+    {"name": "search_programs", "parameters": {"type": "object", "properties": {"topic": {"type": "string"}}}},
+]
+
+
+def test_arguments_are_checked_against_the_tool_schemas(pipeline):
+    _, tracer, sink, _ = pipeline
+    with agent_span(tracer, "permit_assistant", available_tools=SCHEMAS):
+        for arguments in (
+            {"income": 36000, "region": "qc"},  # valid
+            {"income": "36000"},  # number sent as a string
+            {"region": "qc"},  # required argument missing
+            {"income": 36000, "region": "bc"},  # outside the enum
+            "{not json",
+        ):
+            with tool_span(tracer, "compute_amount", arguments=arguments):
+                pass
+        with tool_span(tracer, "search_programs", arguments={"topic": 3}):  # wrong type
+            pass
+        with tool_span(tracer, "check_eligibility", arguments={"id": 1}):  # no schema: not checked
+            pass
+    (run,) = sink.of("agent_run")
+    assert run["tool_args_checked"] == 6 and run["tool_args_invalid"] == 5
+    assert run["tool_args_invalid_rate"] == pytest.approx(5 / 6)
+    assert run["tool_args_string_numbers"] == 1 and run["tool_args_type_errors"] == 2
+    assert run["tool_args_missing_required"] == 1 and run["tool_args_unparsable"] == 1
+    assert run["tool_catalog_size"] == 2  # the names are still recorded from the definitions
+    assert all("36000" not in str(v) for r in sink.of("tool_call") + [run] for v in r.values())  # values never written
+
+
+def test_tool_schemas_from_openllmetry_attributes_and_absent_without_definitions():
+    assembler = TrajectoryAssembler()
+    llm = chat(2, 0, 1)
+    llm.attributes["llm.request.functions.0.name"] = "compute_amount"
+    llm.attributes["llm.request.functions.0.parameters"] = '{"type": "object", "required": ["income"]}'
+    assembler.add(llm)
+    run = run_of(assembler, [tool(3, "compute_amount", 1, 2, arguments="{}")])
+    assert run["tool_args_checked"] == 1 and run["tool_args_missing_required"] == 1
+    plain = run_of(TrajectoryAssembler(), [tool(3, "compute_amount", 0, 1)])
+    assert not any(k.startswith("tool_args_") for k in plain)
+
+
+def test_first_step_without_tool_call():
+    no_tool = TrajectoryAssembler()
+    no_tool.add(chat(2, 0, 1))
+    assert run_of(no_tool, [])["first_step_no_tool"] is True
+    with_tool = TrajectoryAssembler()
+    for span in (chat(2, 0, 1), tool(3, "check_eligibility", 1, 2), chat(4, 2, 3)):
+        with_tool.add(span)
+    assert run_of(with_tool, [])["first_step_no_tool"] is False
+    late_tool = TrajectoryAssembler()
+    for span in (chat(2, 0, 1), chat(3, 1, 2), tool(4, "check_eligibility", 2, 3)):
+        late_tool.add(span)
+    assert run_of(late_tool, [])["first_step_no_tool"] is True
+
+
+# --- LA-02 (lab P2): the confirmation policy could not be checked on tool names alone, nor rules on arguments
+
+
+class RichMonitor:
+    """Monitor declaring accepts_rich_trace: keeps what it receives"""
+
+    accepts_rich_trace = True
+    version = "rich-v1"
+    rules = [SimpleNamespace(id="confirm-before-cancel", severity="critical")]
+
+    def __init__(self):
+        self.traces = []
+
+    def violations(self, trace):
+        self.traces.append(trace)
+        names = [e["name"] for e in trace]
+        if "cancel_order" in names and "user_confirmation" not in names[: names.index("cancel_order")]:
+            return ["confirm-before-cancel"]
+        return []
+
+
+def test_rich_trace_has_events_arguments_and_status_in_time_order():
+    from pulsar_data_collection.genai import record_event
+
+    monitor = RichMonitor()
+    sink = ListSink()
+    provider = TracerProvider()
+    provider.add_span_processor(SimpleSpanProcessor(PulsarSpanExporter(sink, compliance=monitor)))
+    tracer = provider.get_tracer("t")
+    with agent_span(tracer, "retail"):
+        with tool_span(tracer, "get_order", arguments={"order_id": "W123"}):
+            pass
+        record_event("user_confirmation", answer_kind="yes")  # on the agent span, between the two calls
+        try:
+            with tool_span(tracer, "cancel_order", arguments={"order_id": "W123", "reason": "no longer needed"}):
+                raise TimeoutError("timed out")
+        except TimeoutError:
+            pass
+        with tool_span(tracer, "notify", arguments="not json") as span:
+            span.add_event("unrelated")  # not a pulsar.event.*: ignored
+    provider.shutdown()
+    (trace,) = monitor.traces
+    assert trace == [
+        {"name": "get_order", "kind": "tool", "status": "ok", "args": {"order_id": "W123"}},
+        {"name": "user_confirmation", "kind": "event"},
+        {"name": "cancel_order", "kind": "tool", "status": "timeout", "args": {"order_id": "W123", "reason": "no longer needed"}},
+        {"name": "notify", "kind": "tool", "status": "ok"},
+    ]
+    (run,) = sink.of("agent_run")
+    assert run["violated_rules"] == "none" and run["rules_version"] == "rich-v1"
+    assert run["tool_sequence"] == "get_order>cancel_order>notify"  # events are not tools
+    assert all("W123" not in str(v) and "no longer" not in str(v) for _, r, _ in sink.records for v in r.values())
+
+
+def test_rich_trace_flags_a_write_without_confirmation():
+    monitor = RichMonitor()
+    run = run_of(TrajectoryAssembler(compliance=monitor), [tool(3, "cancel_order", 0, 1, arguments='{"order_id": "W1"}')])
+    assert run["violated_rules"] == "confirm-before-cancel" and run["critical_violations"] == 1
+    assert monitor.traces[0] == [{"name": "cancel_order", "kind": "tool", "status": "ok", "args": {"order_id": "W1"}}]
+
+
+def test_monitor_without_rich_trace_still_receives_tool_names():
+    seen = []
+
+    def rules(trace):
+        seen.append(trace)
+        return []
+
+    assembler = TrajectoryAssembler(compliance=rules)
+    agent = root(100)
+    agent.events = [("user_confirmation", int(0.5 * S))]
+    assembler.add(tool(3, "get_order", 0, 1))
+    assembler.add(tool(4, "cancel_order", 1, 2))
+    assembler.add(agent)
+    assert seen == [["get_order", "cancel_order"]]
+
+
+def test_rules_the_trace_cannot_decide_are_stored():
+    class Monitor(FakeMonitor):
+        def not_evaluable(self, trace):
+            return ["confirm-before-write"] if "create_file" in trace else []
+
+    run = run_of(TrajectoryAssembler(compliance=Monitor()), [tool(3, "create_file", 0, 1)])
+    assert run["not_evaluable_rules"] == "confirm-before-write"
+    assert "not_evaluable_rules" not in run_of(TrajectoryAssembler(compliance=Monitor()), [tool(3, "search", 0, 1)])
+    assert "not_evaluable_rules" not in run_of(TrajectoryAssembler(compliance=FakeMonitor()), [tool(3, "create_file", 0, 1)])
+
+
+def test_tool_spans_of_other_instrumentations_keep_their_order_on_a_frozen_clock(monkeypatch):
+    """Review: on a coarse clock, a tool span without pulsar.sequence sorted before every event of the same tick"""
+    import opentelemetry.sdk.trace as sdk_trace
+
+    from pulsar_data_collection.genai import record_event
+
+    monkeypatch.setattr(sdk_trace, "time_ns", lambda: 10**9)
+    monitor = RichMonitor()
+    provider = TracerProvider()
+    exporter = PulsarSpanExporter(ListSink(), compliance=monitor)
+    provider.add_span_processor(exporter.run_tracker(check_interval_s=None))
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+    tracer = provider.get_tracer("t")
+    with agent_span(tracer, "retail"):
+        record_event("e0")
+        with tool_span(tracer, "a"):
+            pass
+        with tracer.start_as_current_span("execute_tool c", attributes={sc.OPERATION: sc.OP_EXECUTE_TOOL, sc.TOOL_NAME: "c"}):
+            pass
+        record_event("e1")
+    provider.shutdown()
+    # the frozen clock makes the run look overdue (an early incomplete record): the finished run is the last trace
+    assert [e["name"] for e in monitor.traces[-1]] == ["e0", "a", "c", "e1"]
+
+
+def test_a_monitor_returning_trace_elements_never_writes_arguments():
+    """Review: violated_rules took str() of whatever the monitor returned, arguments included"""
+
+    class Leaky(RichMonitor):
+        def violations(self, trace):
+            return list(trace)
+
+    assembler = TrajectoryAssembler(compliance=Leaky())
+    run = run_of(assembler, [tool(3, "cancel_order", 0, 1, arguments='{"order_id": "W1"}')])
+    assert "W1" not in str(run) and assembler.stats()["compliance_errors"] == 1

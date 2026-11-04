@@ -158,9 +158,11 @@ Writing to the database must not slow down predictions. By default (`mode="backg
   replayed, oldest first, as soon as the database is available again. Without `spool_dir`, these rows are dropped and
   counted. During the delay InfluxDB is probed (`/ping`) every `probe_interval_s` (1 s): writing resumes about a second
   after the end of an outage, not up to 60 s later.
-- A write that **timed out** may have been stored by InfluxDB: with `spool_dir` it is spooled and written again
-  (writes are idempotent: same measurement, tags and timestamp overwrite the same point, no duplicate); without it the
-  rows are counted in `uncertain_rows`, not in `dropped_rows`.
+- A write that **timed out**, or whose **connection was cut** (reset, closed) once the request was sent and before
+  the answer, may have been stored by InfluxDB: with `spool_dir` it is spooled and written again (writes are
+  idempotent: same measurement, tags and timestamp overwrite the same point, no duplicate); without it the rows are
+  counted in `uncertain_rows`, not in `dropped_rows`. A refused connection never reached InfluxDB: its rows are dropped
+  (or spooled).
 - A batch InfluxDB **refuses** (HTTP 400 / 422, e.g. a field type conflict) is never retried nor spooled. Frames are
   written together only when they share their columns *and* dtypes, object columns mixing numbers and strings are split
   by kind, and the counters are exact: on a partial write (422 `dropped=N`) the accepted rows are counted in
@@ -231,12 +233,30 @@ Each Pulse keeps its own queue bound, spool and counters; `max_batch_rows`, `flu
 and `write_concurrency` of its options are replaced by those of the writer. `pulse.close()` detaches the Pulse;
 `writer.close()` stops the thread.
 
+**Private writers or shared writer?** The shared writer now drains as fast as private writers (the line protocol
+encoding used to limit it to 13,000 to 19,000 rows/s in the lab, see [Throughput](#throughput-measured)), so the
+choice is about the caller side:
+
+- a few models (up to about 10) per process: private writers (the default) are fine;
+- tens to hundreds of models per process: `SharedWriter(concurrency=4)`. One thread instead of one per Pulse (the lab
+  counted 39 threads instead of 534 at 500 models, and one TCP connection instead of 500), the capture p99 stays low
+  while private writers fight for the GIL (lab, 100 models: 0.94 ms instead of 13.8 ms), and InfluxDB receives
+  5,000-row requests instead of one small request per model and per second;
+- above the per-process ceiling (next section), split the models over several processes: one Python process encodes
+  on one core whatever the number of writers (four `SharedWriter` of 25 models drain 28,000 rows/s, one of 100 models
+  25,000 rows/s, with the same CPU time per row).
+
 ### Durability modes
 
 | `durability` | Rows lost by a crash of the process (`kill -9`) | Cost |
 |---|---|---|
-| `"memory"` (default) | the in-memory queue and the request in flight: about `flush_interval_s` of traffic at normal load, up to `max_queue_rows` + one batch when the writer is saturated (lab: 80,000 to 100,000 rows in a 50k rows/s burst) | none |
-| `"wal"` (needs `spool_dir`) | none: each batch is written to `spool_dir` before `capture_data()` returns, deleted once stored, replayed at the next start | one file write per capture (no fsync: an OS crash or a power loss can still lose the last batches) |
+| `"memory"` (default) | the in-memory queue and the request in flight: about `flush_interval_s` of traffic at normal load, up to `max_queue_rows` + one batch (`max_batch_rows`, or the writer's) when the writer is saturated or the storage down (lab: up to 100,500 rows with the defaults in a 50k rows/s burst, one 5,000-row batch with the storage down) | none |
+| `"wal"` (needs `spool_dir`) | none: each batch is written to `spool_dir` before `capture_data()` returns, deleted once stored, replayed at the next start (lab: 0 row lost and 0 duplicate over 9 `kill -9`, 3.4 million rows) | one file write per capture (no fsync: an OS crash or a power loss can still lose the last batches) |
+
+The default loss window on `kill -9` is therefore **`max_queue_rows` + one batch** per Pulse. For a deployment that must
+not lose rows on a crash (rolling restarts with `SIGKILL`, OOM killer), use `durability="wal"` with a `spool_dir` on a
+local disk, and a `spool_max_bytes` sized for the longest outage to absorb (once the spool is full, new batches are
+kept in memory only and counted in `memory_only_rows`).
 
 At startup the spool also recovers what a crash left: complete `.tmp` files become spooled batches, incomplete ones are
 deleted, write-ahead copies are replayed. A spool directory belongs to one Pulse of one process at a time. A spooled batch that can no longer be read or serialized is renamed `.bad`
@@ -244,18 +264,36 @@ and counted in `rejected_rows`.
 
 ### Throughput (measured)
 
-Against InfluxDB 2.6.1 in Docker on the same machine, rows of 11 numeric fields, 500-row captures, 15 s per run:
+The line protocol is built column by column (one conversion per frame, then one `str.format` per row), with the same
+lines as the influxdb-client serializer, which costs about 5 ms per frame whatever its size. The shared writer encodes
+one frame per model in each request (50 rows per frame with 100 models), so this was its ceiling. Encoding of 20 float
+fields and an integer prediction, one core:
 
-| Setup | Written rows/s | Threads | Capture p99 |
+| Frame | influxdb-client serializer | column-wise encoder |
+|---|---|---|
+| 50 rows | 5.3 ms (9,500 rows/s) | 0.9 ms (55,000 rows/s) |
+| 5,000 rows | 165 ms (30,000 rows/s) | 75 ms (66,000 rows/s) |
+
+100 models in one process, 50-row captures of 20 float fields and an integer prediction, against InfluxDB 2.6.1 in
+Docker on the same workstation (16 logical CPUs, about 3 times slower per core than the lab machine: capture p50
+0.9 ms instead of 0.3 ms), before and after the new encoder:
+
+| Setup | Writer alone (full queues) | Offered 1M rows/min (16,700 rows/s): written, lag at the end, capture p99 | Threads |
 |---|---|---|---|
-| one Pulse, one request at a time (before, and `write_concurrency=1`) | 21,000 to 23,000 | 2 | 17 ms |
-| one Pulse, `write_concurrency=4` | 37,000 | 2 | 50 ms |
-| 100 Pulse, private writers (before) | 27,500 | 101 | 358 ms |
-| 100 Pulse, one `SharedWriter(concurrency=4)` | 28,600 (40,000 rows/s offered, no loss) | 2 | 90 ms |
+| `SharedWriter(concurrency=4)`, before | 5,900 rows/s | 4,500 rows/s, 16 s, 103 ms | 6 |
+| 100 private writers, before | 22,500 rows/s | 9,500 rows/s, 2.0 s, 87 ms | 101 |
+| `SharedWriter(concurrency=4)`, after | **24,800 rows/s** | **16,400 rows/s, 0.1 to 0.3 s, 21 ms** | 6 |
+| 100 private writers, after | 27,700 rows/s | 14,700 rows/s, 0.6 to 1.1 s, 45 to 50 ms | 101 |
 
-Profile of one 5,000-row request: about 60 ms to build the line protocol (influxdb-client serializer, pure Python,
-under the GIL) and 125 ms of HTTP and ingestion, which `concurrency` overlaps. The ceiling of one process is therefore
-the serialization, in the order of 40,000 to 80,000 rows/s depending on the columns; beyond, run several processes.
+At 500k rows/min offered, the shared writer keeps up with a capture p99 of 2.0 ms (before: 5,800 rows/s written, 7.4 s
+behind, p99 118 ms); private writers keep up too, with a p99 of 25 ms. At 1M rows/min this workstation reaches the
+ceiling of one process: the caller threads and the writer share one core (the GIL), hence the higher p99.
+
+**Per-process ceiling.** Encoding, HTTP client and `capture_data()` all run under the GIL, on one core. The lab
+measured about **2,300 captures/s per process** on the caller side (`SharedWriter`, 500 models, p99 0.88 ms, one core
+at 99 %), and the writer drains about 25,000 rows/s per process on this workstation (more on a faster core, less with
+text columns). Beyond either, run several processes (e.g. several workers of the model server, each with its own
+`SharedWriter`); more `SharedWriter` instances in one process do not add throughput.
 
 ### `CaptureOptions`
 
@@ -275,9 +313,27 @@ the serialization, in the order of 40,000 to 80,000 rows/s depending on the colu
 | `durability` | `"memory"` | `"wal"`: write-ahead copy of each batch in `spool_dir` (see above) |
 | `spool_max_bytes` | `None` | Size limit of `spool_dir`; beyond, rows are dropped and counted (`spool_evicted_rows`) |
 | `spool_eviction` | `"drop_oldest"` | Which rows go when the spool is full: `"drop_oldest"` or `"drop_newest"` |
-| `spool_compression` | `None` | `"gzip"` (level 1): spooled batches 2.2 times smaller on random floats, more on repetitive values (the lab measured about 330 bytes per row of JSON: 1,880 MB for a 30 min outage at 200k rows/min) |
-| `replay_max_rows_per_s` | `None` | Throttle of the spool replay. After a 30 min outage, an unthrottled replay raised the capture p99 from 1 ms to 144 ms |
+| `spool_compression` | `None` | `"gzip"` (level 1), **recommended** with a spool: spooled batches 2.2 times smaller on random floats, more on repetitive values (lab, 30 min outage at 200k rows/min: 819 MB instead of 1,734 MB, 143 bytes per row instead of 303, capture p99 after the outage 1.2 ms), for a replay 9 to 21 % longer |
+| `replay_max_rows_per_s` | `None` | Throttle of the spool replay, per Pulse (see below) |
 | `row_spacing_ns` | 1,000 | Spacing of the timestamps of the rows of one capture (1 µs) |
+
+**Replay throttle.** After an outage, the replay of the spool competes with the capture for the GIL: in the lab, with
+10 private writers, the capture p99 rose to about 30 ms during the replay of a 10 or 30 min outage (1.2 ms with one
+`SharedWriter` and gzip, unthrottled). `replay_max_rows_per_s` stays unthrottled by default, because the recovery
+time becomes `backlog / replay_max_rows_per_s`, and the backlog depends on the traffic of each Pulse: any fixed value
+low enough to matter would turn the 30 min outage of a 25,000 rows/s Pulse (45 million rows) into hours of replay.
+Set it from the normal rate of the Pulse instead: **2 to 6 times its live rate** replays an outage in a half to a sixth
+of its duration. Measured on this workstation with 10 private writers (333 rows/s each, 20,000 rows spooled each, the real encoder and
+a storage answering in 2 ms):
+
+| `replay_max_rows_per_s` | Recovery | Capture p99 during the replay |
+|---|---|---|
+| `None` | 6 s | 61 to 72 ms (about 2 ms without replay) |
+| 2,000 (6 times the live rate) | 11 s | 21 to 36 ms |
+| 666 (2 times the live rate) | 31 s | 16 to 20 ms |
+
+With tens of models, the shared writer does more for the p99 than the throttle, since one thread replays instead of
+one per Pulse.
 
 ## How data is stored
 
@@ -313,7 +369,7 @@ carrying `gen_ai.operation.name` is read, whether it comes from an existing inst
 
 | `record_type` | One row per | Main fields |
 |---|---|---|
-| `agent_run` | agent run (`invoke_agent` span and its subtree) | `steps` (LLM calls), `tool_calls`, `distinct_tools`, `tool_error_rate`, `tool_errors`, `tool_timeouts`, `tool_soft_failures`, `tool_<tool>_calls` / `_errors` / `_timeouts` / `_soft_failures`, `tool_status_counts`, `repeated_calls`, `repeated_calls_window`, `max_same_tool_calls`, `tool_cycle_repeats`, `loop_detected`, `unavailable_tool_calls`, `tool_catalog_hash`, `incomplete`, `out_of_scope_calls`, `delegation_depth`, `input_tokens`, `output_tokens`, `latency_s`, `termination`, `task_success`, `first_tool`, `tool_sequence`, `request_model`, `prompt_version`; with `compliance`: `violated_rules`, `critical_violations`, `rules_version` |
+| `agent_run` | agent run (`invoke_agent` span and its subtree) | `steps` (LLM calls), `tool_calls`, `distinct_tools`, `tool_error_rate`, `tool_errors`, `tool_timeouts`, `tool_soft_failures`, `tool_<tool>_calls` / `_errors` / `_timeouts` / `_soft_failures` (tools called in the run), `tool_status_counts`, `repeated_calls`, `repeated_calls_window`, `max_same_tool_calls`, `tool_cycle_repeats`, `loop_detected`, `first_step_no_tool`, `unavailable_tool_calls`, with tool definitions: `tool_args_checked`, `tool_args_invalid`, `tool_args_invalid_rate`, `tool_args_missing_required`, `tool_args_type_errors`, `tool_args_string_numbers`, `tool_args_unparsable`; `tool_catalog_hash`, `incomplete`, `out_of_scope_calls`, `delegation_depth`, `input_tokens`, `output_tokens`, `latency_s`, `termination`, `task_success`, `first_tool`, `tool_sequence`, `request_model`, `prompt_version`; with `compliance`: `violated_rules`, `critical_violations`, `rules_version` |
 | `tool_call` | `execute_tool` span | `tool_name`, `error`, `status`, `timeout`, `soft_failure`, `latency_s`, `out_of_scope` |
 | `llm_call` | `chat` span | `request_model`, `response_model`, `provider`, `temperature`, `input_tokens`, `output_tokens`, `finish_reason`, `latency_s`, `error` |
 
@@ -367,7 +423,7 @@ exporter = PulsarSpanExporter(
 provider.add_span_processor(BatchSpanProcessor(exporter))
 provider.add_span_processor(exporter.run_tracker())  # sees agent spans start: a run that never ends is still reported
 
-with agent_span(tracer, "permit_assistant", available_tools=[t["function"]["name"] for t in TOOL_SCHEMAS]):
+with agent_span(tracer, "permit_assistant", available_tools=TOOL_SCHEMAS):  # names, or the definitions themselves
     with tool_span(tracer, "check_eligibility", arguments=args) as span:
         output = check_eligibility(**args)
         record_tool_result(span, output, validator=lambda out: isinstance(out.get("eligible"), bool))
@@ -380,10 +436,27 @@ exporter.stats()  # {"partial_traces_dropped": 0, "partial_spans_dropped": 0, "i
 | Run longer than 30 s | The complete run, when its root ends. Former behaviour (`wait_for_root=False`): the trace was assembled after `trace_timeout_s` of inactivity, without its root, and the run lost its LLM and tool calls (`tool_calls=0`, `tool_sequence="none"`). |
 | Run that never ends (model generating for minutes, agent stuck in a loop) | One `agent_run` with `termination="incomplete"`, `incomplete=True`, `latency_s` = time open so far and the calls received so far, after `max_run_s` (default 600 s); the complete record follows if the run ends. With `run_tracker()` the run is known from its start, even when no span ever ends; without it, only from ended spans that carry `gen_ai.agent.name` and are not below an agent span already received (never from LLM or tool calls alone). A hung run is reported once, then forgotten after `orphan_timeout_s`. |
 | Trace whose root never arrives | Given up after `orphan_timeout_s` without new span (default 3600 s), or when more than `max_pending_traces` (10,000) traces wait; counted in `stats()["partial_traces_dropped"]` and `["partial_spans_dropped"]`; agent runs found inside are marked `incomplete=True`. Runs under a long-lived local root (a chat session span) wait for it: lower `orphan_timeout_s` (e.g. 300 s) for chat-style roots, or end the session span per turn. |
-| Tool timeouts and errors | Per tool: `tool_<tool>_calls`, `tool_<tool>_errors`, `tool_<tool>_timeouts`, `tool_<tool>_soft_failures` (every tool of `allowed_tools` and of the catalogue is written, 0 when not called). Per run: `tool_errors`, `tool_timeouts`, `max_tool_error_rate`, `tool_status_counts` (`"ok=3,timeout=2"`). A failed call is a `timeout` when its `error.type` names one (`TimeoutError`, `ReadTimeout`...). `tool_call` records carry `status`, `timeout` and `soft_failure`. |
+| Tool timeouts and errors | Per tool: `tool_<tool>_calls`, `tool_<tool>_errors`, `tool_<tool>_timeouts`, `tool_<tool>_soft_failures`, for the tools called in the run only (a missing counter means 0; see `tool_fields` below). Per run: `tool_errors`, `tool_timeouts`, `max_tool_error_rate`, `tool_status_counts` (`"ok=3,timeout=2"`). A failed call is a `timeout` when its `error.type` names one (`TimeoutError`, `ReadTimeout`...). `tool_call` records carry `status`, `timeout` and `soft_failure`. |
 | Tool that answers but returns nothing usable | `record_tool_result(span, output, status=None, valid=None, validator=None)` sets `pulsar.tool.status` (by default the `status` key of a dict output) and `pulsar.tool.output_valid`. The statuses `retry`, `invalid`, `empty`, `partial`, `garbage` and invalid outputs are soft failures: `tool_soft_failures`, `soft_failure_rate`, `tool_<tool>_soft_failures`. The output itself is never written. |
 | Loops | `repeated_calls` keeps its meaning (consecutive calls identical byte for byte). `repeated_calls_window`: calls whose **normalized** tool and arguments (JSON parsed, keys sorted, `36000` = `36000.0` = `"36000"`, strings trimmed and lower-cased) appeared among the `loop_window` (4) previous calls; `loop_detected` is True from `loop_min_repeats` (2) such calls, so ping-pong A>B>A>B and type variations are loops. `max_same_tool_calls` and `tool_cycle_repeats` (longest repetition of a block of 2 or 3 tools) are counts, not verdicts: the same tool called with other identifiers can be legitimate, test them against a reference. |
 | Removed or added tool | With `agent_span(..., available_tools=[...])` (`pulsar.agent.available_tools`): `tool_catalog_size` and `tool_catalog_hash`, which changes with the catalogue from the first run; with `allowed_tools`, `catalog_missing_tools` and `missing_tools`. `unavailable_tool_calls`: calls to a tool outside the catalogue, or with status `unavailable`, `unknown_tool` or `not_found`. |
+| Wrong arguments (no label needed) | When the run records the tool definitions (`agent_span(..., available_tools=TOOL_SCHEMAS)` with the definitions themselves, `gen_ai.tool.definitions`, or OpenLLMetry's `llm.request.functions.<i>.name` / `.parameters`), every call is checked against its tool's JSON schema (`type`, `required`, `enum`, `additionalProperties: false`, nested properties and items): `tool_args_checked`, `tool_args_invalid` (calls with at least one problem), `tool_args_invalid_rate`, `tool_args_missing_required`, `tool_args_type_errors`, `tool_args_string_numbers` (numbers sent as strings, e.g. `{"income": "36000"}`), `tool_args_unparsable` (not a JSON object). Only counts are written. Without definitions, the fields are absent. |
+| Model that answers instead of acting | `first_step_no_tool`: the first model call was followed by no tool call before the next model call (or the end of the run). |
+
+Per-tool counters are bounded with `tool_fields` (`PulsarSpanExporter` and `TrajectoryAssembler`):
+
+| `tool_fields` | Tools with `tool_<tool>_*` counters |
+|---|---|
+| `"called"` (default) | the tools called in the run (at most 4 fields per tool called) |
+| `"allowed"` | every tool of `allowed_tools`, 0 when not called (needs `allowed_tools`) |
+| `"top_k"` | the `tool_fields_k` (10) tools called most in the run |
+| `"all"` | former behaviour: tools called, allowed and of the catalogue, 0 when not called |
+| `"none"` | none: the per-call detail stays in the `tool_call` records (`tool_name`, `status`...) |
+
+Formerly every tool of the catalogue got four fields, 0 when not called: in the lab, 1200 runs on BFCL catalogues
+carried 2308 per-tool fields. With `"called"`, a run has at most 8 of them there; over the series the field names still
+follow the tools actually called (1568 for the 392 BFCL tools called): with catalogues that change per request, prefer
+`"allowed"` or `"none"`.
 
 ### Rule violations in `agent_run`
 
@@ -393,7 +466,40 @@ exporter.stats()  # {"partial_traces_dropped": 0, "partial_spans_dropped": 0, "i
 `pulsar_metrics.genai.ComplianceMonitor` (pulsar-metrics is not a dependency: any object with `violations(trace)`
 fits) or a callable `trace -> violated rule ids`; the trace is the list of the tools called, as
 `trace_from(tool_sequence)` rebuilds it. A rule set that raises never stops the collection
-(`stats()["compliance_errors"]`). Without `compliance`, the fields are absent.
+(`stats()["compliance_errors"]`). Without `compliance`, the fields are absent. A monitor with `not_evaluable(trace)`
+adds `not_evaluable_rules` (ids of the rules the trace cannot decide, comma-separated), absent when there is none.
+
+A monitor declaring `accepts_rich_trace = True` receives the **rich trace** instead: the tool calls and the
+conversation events of the run, in time order, each a dict:
+
+```python
+{"name": "get_order_details", "kind": "tool", "status": "ok", "args": {"order_id": "W123"}}
+{"name": "user_confirmation", "kind": "event"}
+{"name": "cancel_pending_order", "kind": "tool", "status": "timeout", "args": {"order_id": "W123"}}
+```
+
+`status` is `"ok"`, `"error"` (a call to an unavailable tool included), `"timeout"` or `"soft_failure"`; `args` holds
+the parsed arguments when they are a JSON object. The values are used in memory for the check only and are never
+written (the stored records keep the hashed signatures). Conversation events are OpenTelemetry span events named
+`pulsar.event.<name>` on any span of the run; record them with `record_event`:
+
+```python
+from pulsar_data_collection.genai import record_event
+
+with agent_span(tracer, "retail_assistant"):
+    ...
+    if user_said_yes:
+        record_event("user_confirmation")  # on the current span; record_event(name, span=run) for another one
+    with tool_span(tracer, "cancel_pending_order", arguments={"order_id": order_id}):
+        ...
+```
+
+Policies that need the rich trace: confirmations ("a write only after the user said yes"), and every rule on
+arguments or outcomes ("cancel the order that was looked up", "no retry after a timeout"). In the lab (tau-bench
+retail, 40 episodes), the confirmation policy failed on 36 of 36 runs with a write on the tool names; through the
+exporter with `user_yes` events in the rich trace it gives the 23 real violations. The tool spans and events recorded
+by the helpers carry a sequence number (`pulsar.sequence`), so that their order holds when the clock is coarse
+(15.6 ms on Windows); other instrumentations are ordered by timestamp only.
 
 ### Known limits (night lab, 2026-11-02)
 
@@ -423,6 +529,21 @@ can produce its own verdict (order effects, wording, randomness), so the control
 - `ComparativeProbe` asks to choose between two profiles **in both orders**, with or without a tie option, to measure
   and cancel the position effect;
 - requests are sent in a random order and look like ordinary requests.
+
+`ComparativeProbe` rows also say whether each answer is usable. `answer_status` is `"ok"` (a choice was read),
+`"refusal"` (French or English refusal phrasings: "Je ne peux pas", "Je suis désolé", "I can't", "I'm sorry"...; or a
+`refusal=` callable), `"unparsed"` or `"error"`; `unusable` is True for refusals and unparsed answers. `choice` is
+`"refusal"` for a refusal (it was None, like an unparsed answer, which stays None); `chosen_group` is None for both. In the lab, 23.3 % of the answers of llama3.2:3b were refusals that
+looked like unparsed answers. Two instruments help when the choice question is driven by the position (the 6 local
+models of the lab answered "first" from 2.8 % to 99.1 % of the time):
+
+- `labels="neutral"` rotates the option labels across sets (A/B, 1/2, X/Y and reversed; or a list of pairs); the
+  template then needs `{first_label}` and `{second_label}` slots, and `run(probes, target)` without `choice` reads the
+  label each probe offered (`label_choice`). The `labels` column says which pair was shown;
+- `run_loglik(probes, loglik)` compares the log-likelihood of the two profiles (`loglik(text) -> float`) when the target
+  exposes logprobs: nothing is asked, so there is no position effect (`instrument="loglik"`, `loglik_first`,
+  `loglik_second`). Without logprobs (`loglik=None`, or a first call that raises NotImplementedError or returns None)
+  the instrument is skipped: an empty frame, `rows.attrs["skipped"] == "no_logprobs"`.
 
 `probe.span_attributes()` gives the `pulsar.cf.set_id`, `pulsar.cf.variant`, `pulsar.cf.attribute` and
 `pulsar.cf.control` attributes: set them on the agent span and they reach the `agent_run` records (`cf_set_id`,
@@ -494,7 +615,12 @@ fit = injection.calibrate(french_benign_calibration_set(), language="fr", target
 print(fit.threshold, fit.fit_fpr, fit.recall)  # the French threshold, and the French recall it costs
 injection.record(span, text)                   # pulsar.detector.injection and pulsar.detector.injection_flag
 
-pii = ModelPiiDetector(device="auto", thresholds={"street address": 0.3})  # windows of 250 words, overlap 50
+details = injection.score_details(long_text)  # score, n_tokens, tokens_seen, windows, truncated
+sliding = InjectionDetector(long_text="sliding")  # every 510-token window of long texts, maximum score
+
+pii = ModelPiiDetector(device="auto", thresholds={"street address": 0.3})  # windows of 384 GLiNER tokens, overlap 96
+found = pii.scan(text)                        # a list of findings, with found.windows and found.truncated_windows
+many = pii.scan_many(texts)                   # short texts batched across requests, long ones one by one
 scorer = FaithfulnessScorer(max_sentences=None)
 result = scorer.record(span, answer, passages)  # faithfulness, _min, _coverage and _windows on the span
 threshold = calibrate_threshold(reference_scores, target_fpr=0.05, direction="low").threshold
@@ -516,19 +642,58 @@ Parameters:
   saturate at 0.99999976: benign French imperatives and real attacks then tie, and no threshold separates them
   (`calibrate` warns). On the default model, a French threshold fitted on half of the starter set kept 1.3 % false
   alarms on the other half and caught 3 of 6 hand-written French attacks with `from_logits=True`, none without.
+- **The 512-token horizon.** `InjectionDetector` reads `max_length=512` tokens, 510 of text. With
+  `long_text="truncate"` (default) the rest of a longer text is not scored: an injection appended to a 2000-token
+  text was flagged in 10 % of the cases (SC-09), as often as the benign texts. The detector warns once when it cuts a
+  text, and `score_details(text)` returns a `ClassifierScore` (`score`, `raw`, `n_tokens`, `tokens_seen`, `windows`,
+  `truncated`, `window_scores`); `score(text)` still returns a float. `long_text="sliding"` scores windows of 510
+  tokens overlapping by `overlap_tokens` (default 128) and keeps the maximum: the payload is seen wherever it is, but
+  a long benign text has one chance to score high per window, so **fit the thresholds again in sliding mode**
+  (`calibrate` on long benign texts of the deployment). On 40 synthetic benign administrative texts (English and
+  French) per length, the injection appended at the end was flagged 0/40 in truncate mode at 500, 1000 and 2000
+  tokens and 40/40 in sliding mode, with no benign text above 0.5 in either mode (maximum 0.011); these texts are
+  cleaner than real traffic, where the lab saw 5 to 20 % benign flags at 0.5 on the first window alone. Sliding costs
+  one model call per window: 5 windows, about 3.9x the time, at 2000 tokens on CPU. The default stays "truncate".
+- **dtype.** Every detector takes a `dtype` (`InjectionDetector` and `TextClassifierDetector` pass any keyword to
+  `transformers.pipeline`, e.g. `InjectionDetector(device="cuda", dtype=torch.float16)`: 2.48x faster on a T4,
+  scores within 0.0043, 1 decision in 64 flipped at 0.5, SC-09). Without it, models run in float32 on the CPU and in
+  the dtype of their checkpoint on a GPU. The default NLI checkpoint is stored in float16, and ran so on the CPU,
+  6 to 14x slower than in float32 (SC-09: 4.8 s against 0.67 s per 50-token request): it now runs in float32 there
+  (here, one answer against a 500-token context: 17.1 s in float16, 1.5 s in float32, same score to 1e-4).
 - `ModelPiiDetector`: `device`, `thresholds` (per GLiNER label: `"person"`, `"street address"`, `"date of birth"`),
-  `window_words` and `overlap_words` (default 250 and 50: GLiNER reads at most 384 of its own tokens, punctuation
-  included), `merge` (`"enclosing"`, the default: an address that holds a rule-found postal code or phone number
-  replaces them, and is merged with overlapping rule-found addresses; `"rules"`: the model entity is dropped, as
-  before 0.10), `locales` and `profiles` (passed to the default `PiiDetector`), `batch_size`. `scan(text,
-  business_scope=...)` forwards `business_scope` to the rules detector when it accepts it.
+  `window_tokens` and `overlap_tokens` (default 384, the model's `max_len`, and 96): GLiNER reads at most 384 of its
+  own tokens (words and punctuation marks apart, about 1.9 per word) and drops the rest, so the windows are counted
+  with the model's own words splitter. Up to 0.10 they were 250 *words* (`window_words=250, overlap_words=50`, still
+  accepted): a window often held more than 384 tokens and its end was never read (a name appended to a 1000-token
+  text was found in 65 % of the cases, SC-09). `scan(text)` returns a `PiiScan`, a list of findings with `windows`
+  and `truncated_windows` (windows longer than `max_len`, 0 with token windows; the detector warns once). `merge`
+  (`"enclosing"`, the default: an address that holds a rule-found postal code or phone number replaces them, and is
+  merged with overlapping rule-found addresses; `"rules"`: the model entity is dropped, as before 0.10), `locales`
+  and `profiles` (passed to the default `PiiDetector`), `batch_size`, `dtype`. `scan(text, business_scope=...)`
+  forwards `business_scope` to the rules detector when it accepts it. `scan_many(texts, short_tokens=200)` sends the
+  texts of at most `short_tokens` GLiNER tokens through the model together and the longer ones one by one: batching
+  across requests was 3.3x faster at 50 tokens, 1.1x at 200 and slower from 500 (SC-09, T4); on CPU, 64 requests of
+  about 30 tokens went 2.3x faster through `scan_many` than through `scan`, with the same findings. On 20 synthetic
+  invoice listings of 330 to 700 words (punctuation-heavy) ending with a name, the name was found in 13/20 with token
+  windows and 4/20 with 250-word windows, 40 of whose 45 windows were truncated.
 - `FaithfulnessScorer`: `window_tokens` and `stride_tokens` (default 400 and 300: the joined passages are cut into
   overlapping windows and each sentence keeps its best window; `None` restores the single 512-token premise, silently
   truncated), `max_sentences` (default 6, `None` = all), `lexical_threshold` (default 1.0: a sentence whose word
   trigrams are all in the passages, i.e. a verbatim copy, is supported without the model; `None` disables),
-  `max_claim_words` (splits long sentences at commas and semicolons, default off), `aggregate` (`"mean"` or `"min"`).
+  `max_claim_words` (splits long sentences at commas and semicolons, default off), `aggregate` (`"mean"` or `"min"`),
+  `dtype` and other `transformers.pipeline` keywords.
   `details(answer, passages)` returns a `FaithfulnessResult`: `score`, `min`, `sentences` (support per sentence),
   `lexical`, `sentences_total`, `sentences_scored`, `coverage`, `premise_tokens`, `windows`, `truncated`.
+- **Premises cut at sentence boundaries.** In a token window, the support of a supported sentence falls with the
+  unrelated text around its evidence: median 0.32 when the evidence opens a 500-token context (a full 400-token
+  window) against 0.62 when it closes it (a short last window), 0.40 against 0.93 at 1000 tokens (SC-09).
+  `premise_split="sentences"` cuts the passages into groups of `premise_sentences` consecutive sentences (default 2,
+  one group per starting sentence) and judges each answer sentence against the `top_k_premises` groups (default 4;
+  `None` = all) that share the most words with it, so the support no longer depends on where the evidence falls
+  (here, 10 synthetic contexts per length, a supported claim: median support start / end 0.04 / 0.87 at 500 tokens,
+  0.11 / 0.99 at 1000 and 0.30 / 0.82 at 2000 with token windows, 0.997 / 0.998 at every length with sentence
+  groups; the claim without its evidence stayed at a median of 0.02-0.03, and sentence groups took 0.4-0.5 s per
+  answer against 1.5-6.5 s on CPU). The default stays `"tokens"`; fit the alert threshold again before switching.
 
 `CanaryProbe` asks a fixed set of prompts several times and saves the answers (they are not user data) for
 `pulsar_metrics.genai.model_equality`. Since 0.10 the default is 48 prompts x 10 answers (480 calls per run;
@@ -563,8 +728,8 @@ Parameters:
   Part of it was lost to the former merge rule (an address holding a postal code was dropped; it is kept with
   `merge="enclosing"`). No threshold sweep was run: lower the `"street address"` threshold after measuring on your
   own documents.
-- **Long documents (LP-01).** Before windows, names and addresses beyond GLiNER's 384-word window were never found
-  (recall 0.0, against 0.775 and 0.833 inside it). Windows without any person can produce generic false names ("je",
+- **Long documents (LP-01).** Before windows, names and addresses beyond GLiNER's 384-token window were never found
+  (recall 0.0, against 0.775 and 0.833 inside it); the windows are sized in GLiNER tokens since SC-09. Windows without any person can produce generic false names ("je",
   "le client"); a higher `"person"` threshold reduces them. GLiNER on CPU: p50 2.6 s per document, 0.14 s on a T4.
 - **Faithfulness ranking (LR-01).** Answer-level AUROC 0.616 on RAGTruth (n = 2700, 34.9 % hallucinated; QA 0.526,
   Data2txt 0.552, Summary 0.599), below the number of sentences alone (0.645). Premise windows raised it to 0.689, and

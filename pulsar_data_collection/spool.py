@@ -1,6 +1,7 @@
 """Local spool: batches that could not be written are saved to disk and replayed when the storage is back.
 
-File names: `<time_ns>_<id>_<rows>r` followed by a suffix:
+File names: `<time_ns>_<id>_<rows>r` followed by a suffix (`time_ns` strictly increasing within a process, so that the
+names sort in the order of the batches even when the clock does not move between two of them):
 
 - `.json` / `.json.gz`: spooled batch, replayed oldest first then deleted;
 - `.wal` / `.wal.gz`: write-ahead copy of a batch still in the in-memory queue (`durability="wal"`), deleted once written.
@@ -100,6 +101,7 @@ class Spool:
         self.recovered_files = 0
         self._lock = threading.Lock()
         self._held: set = set()  # files being replayed: never evicted
+        self._last_stamp = 0
         self._recover()
         self._bytes = sum(self._size(p) for p in self.files())
 
@@ -173,11 +175,19 @@ class Spool:
         suffix = (WAL_SUFFIXES if wal else SPOOL_SUFFIXES)[1 if self.compression == "gzip" else 0]
         if not self._make_room(len(data), len(frame), wal=wal):
             return None
-        path = self.directory / f"{time.time_ns()}_{uuid.uuid4().hex[:8]}_{len(frame)}r{suffix}"
+        path = self.directory / f"{self._stamp()}_{uuid.uuid4().hex[:8]}_{len(frame)}r{suffix}"
         temporary = path.with_name(path.name[: -len(suffix)] + ".tmp")
         temporary.write_bytes(data)
         temporary.replace(path)
         return path
+
+    def _stamp(self) -> int:
+        """time_ns, made strictly increasing: the clock of Windows can stay on the same value for milliseconds, and two
+        batches with the same time were ordered by their random id (the oldest could be replayed after, or evicted
+        instead of, a newer one)"""
+        with self._lock:
+            self._last_stamp = max(time.time_ns(), self._last_stamp + 1)
+            return self._last_stamp
 
     def _refuse(self, rows: int) -> bool:
         self.evicted_rows += rows

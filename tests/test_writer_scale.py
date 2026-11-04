@@ -6,6 +6,8 @@ types fixed by the first write, partial writes refused with HTTP 422 "dropped=N"
 """
 
 import gzip
+import socket
+import struct
 import subprocess
 import sys
 import threading
@@ -19,7 +21,7 @@ import pytest
 
 import pulsar_data_collection.pulse as pulse_module
 from pulsar_data_collection.database_connectors.influxdb import InfluxdbActions, _dropped, _raise_write_error
-from pulsar_data_collection.exceptions import StorageRejectedError, StorageWriteTimeoutError
+from pulsar_data_collection.exceptions import StorageConnectionResetError, StorageRejectedError, StorageWriteTimeoutError
 from pulsar_data_collection.models import CaptureOptions, DataWithPrediction, PulseParameters
 from pulsar_data_collection.pulse import Pulse
 from pulsar_data_collection.results import StatsReporter, process_health
@@ -357,6 +359,71 @@ def test_read_timeouts_are_recognised():
         _raise_write_error(ConnectionError("refused"), 10)
 
 
+class ResettingServer:
+    """HTTP server that reads each request in full (headers and body), then resets the connection without answering:
+    InfluxDB may have stored the rows of a write cut that way"""
+
+    def __init__(self):
+        self.socket = socket.socket()
+        self.socket.bind(("127.0.0.1", 0))
+        self.socket.listen(16)
+        self.url = f"http://127.0.0.1:{self.socket.getsockname()[1]}"
+        self.writes = []  # bodies of the write requests received in full
+        threading.Thread(target=self._serve, daemon=True).start()
+
+    def _serve(self):
+        while True:
+            try:
+                connection, _ = self.socket.accept()
+            except OSError:
+                return
+            data = b""
+            while b"\r\n\r\n" not in data:
+                data += connection.recv(65536)
+            head, body = data.split(b"\r\n\r\n", 1)
+            length = next((int(h.split(b":")[1]) for h in head.split(b"\r\n") if h.lower().startswith(b"content-length")), 0)
+            while len(body) < length:
+                body += connection.recv(65536)
+            if head.startswith(b"POST /api/v2/write"):
+                self.writes.append(body)
+            connection.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0))  # RST, not FIN
+            connection.close()
+
+    def close(self):
+        self.socket.close()
+
+
+def test_a_connection_reset_after_the_request_is_sent_is_uncertain_not_lost():
+    server = ResettingServer()
+    login = {"url": server.url, "token": "t", "org": "o", "bucket_name": "b"}
+    pulse = Pulse(params().model_copy(update={"login": login}), options(probe_interval_s=None))  # starts anyway
+    try:
+        capture(pulse, batch(0))
+        assert pulse.flush(10)
+        stats = pulse.stats()
+    finally:
+        pulse.close(timeout_s=1)
+        server.close()
+    assert len(server.writes) == 1 and server.writes[0].count(b"\n") == N - 1  # the whole request reached the server
+    assert stats["uncertain_rows"] == 50 and stats["dropped_rows"] == 0  # was counted in dropped_rows
+    assert stats["write_errors"] == 1 and stats["write_timeouts"] == 0
+
+
+def test_connection_cuts_are_recognised_but_not_refusals():
+    from http.client import RemoteDisconnected
+
+    from urllib3.exceptions import MaxRetryError, NewConnectionError, ProtocolError
+
+    for cause in (ConnectionResetError(10054, "reset by peer"), RemoteDisconnected("closed without response")):
+        with pytest.raises(StorageConnectionResetError):
+            _raise_write_error(ProtocolError("Connection aborted.", cause), 10)
+    with pytest.raises(StorageConnectionResetError):
+        _raise_write_error(MaxRetryError(None, "/api/v2/write", ProtocolError("Connection aborted.", cause)), 10)
+    refused = NewConnectionError(None, "Failed to establish a new connection: [WinError 10061] refused")
+    with pytest.raises(NewConnectionError):  # never reached the storage: the rows are not stored
+        _raise_write_error(refused, 10)
+
+
 # ---------------------------------------------------------------------------------------------------------- M35
 def test_writing_resumes_within_a_probe_interval_after_an_outage(store):
     store.down = True
@@ -457,6 +524,53 @@ def test_spool_size_limit_evicts_the_oldest_and_counts_them(store, tmp_path):
     pulse.close(timeout_s=1)
     assert stats["spool_bytes"] <= one * 3.5 and stats["spool_files"] <= 3
     assert stats["spool_evicted_rows"] >= 150 and stats["dropped_rows"] == stats["spool_evicted_rows"]
+
+
+@pytest.mark.parametrize("eviction", ["drop_oldest", "drop_newest"])
+@pytest.mark.parametrize("compression", [None, "gzip"])
+def test_spool_cap_counts_every_evicted_row_exactly(store, tmp_path, eviction, compression):
+    store.down = True
+    probe = Spool(tmp_path / "probe", compression=compression)
+    sizes = [probe.save(InfluxdbActions.prepare_frame(batch(k * 100), None, START), {"m": 1}).stat().st_size for k in range(10)]
+    cap = int(4.5 * sum(sizes) / len(sizes))  # room for 4 batches out of 10
+    spool_dir = tmp_path / "spool"
+    pulse = Pulse(
+        params(),
+        options(
+            spool_dir=spool_dir,
+            spool_max_bytes=cap,
+            spool_eviction=eviction,
+            spool_compression=compression,
+            probe_interval_s=None,
+        ),
+    )
+    for k in range(10):
+        capture(pulse, batch(k * 100), k)
+        assert pulse.flush(5)
+    full = pulse.stats()
+    assert full["spool_bytes"] == sum(f.stat().st_size for f in spool_dir.iterdir()) <= cap
+    assert full["spool_files"] == 4 and full["spool_evicted_rows"] == 300 and full["dropped_rows"] == 300
+    store.down = False
+    pulse._writer._channel.endpoint.retry_at = 0.0
+    deadline = time.monotonic() + 10
+    while pulse.stats()["spool_files"] and time.monotonic() < deadline:
+        time.sleep(0.05)
+    pulse.close(timeout_s=2)
+    stats = pulse.stats()
+    kept = range(6, 10) if eviction == "drop_oldest" else range(4)
+    seqs = sorted(fields["seq"][1] for fields in store.points.values())
+    assert seqs == [k * 100 + i for k in kept for i in range(N)]  # exactly the batches that were not evicted
+    assert stats["replayed_rows"] == 200 and stats["spool_evicted_rows"] == 300 and stats["dropped_rows"] == 300
+    assert stats["captured_rows"] == stats["replayed_rows"] + stats["spool_evicted_rows"] and stats["spool_bytes"] == 0
+
+
+def test_spooled_batches_keep_their_order_when_the_clock_does_not_move(tmp_path, monkeypatch):
+    import pulsar_data_collection.spool as spool_module
+
+    monkeypatch.setattr(spool_module.time, "time_ns", lambda: 1_700_000_000_000_000_000)  # coarse clock (Windows)
+    spool = Spool(tmp_path)
+    saved = [spool.save(pd.DataFrame({"x": [float(k)]}), {}) for k in range(30)]
+    assert spool.files() == saved  # was ordered by the random id: replay and eviction did not take the oldest first
 
 
 def test_spool_compression_round_trip(tmp_path):

@@ -4,6 +4,7 @@ Applications already instrumented by an OpenTelemetry GenAI instrumentation (Ope
 them: PulsarSpanExporter reads any span carrying gen_ai.operation.name.
 """
 
+import itertools
 import json
 from contextlib import contextmanager
 from typing import Any, Callable, Iterable, Optional
@@ -13,26 +14,49 @@ from opentelemetry.trace import Status, StatusCode
 
 from . import semconv as sc
 
+# order of the tool spans and events of this process (pulsar.sequence): timestamps can be equal on a coarse clock
+_sequence = itertools.count(1)
+
+
+def next_sequence() -> int:
+    """Next pulsar.sequence number of this process (tool spans and events, shared with the OpenRunTracker)"""
+    return next(_sequence)
+
 
 @contextmanager
 def agent_span(
     tracer: trace.Tracer,
     agent_name: str,
     prompt_version: Optional[str] = None,
-    available_tools: Optional[Iterable[str]] = None,
+    available_tools: Optional[Iterable] = None,
     **attributes,
 ):
     """Span of one agent run; set `pulsar.agent.termination` / `pulsar.agent.task_success` on it when known
 
-    `available_tools`: names of the tools offered to the model for this run (the catalogue sent with the request), so
-    that a removed tool shows from the first run (`tool_catalog_hash`, `catalog_missing_tools`,
-    `unavailable_tool_calls` in agent_run).
+    `available_tools`: the tools offered to the model for this run (the catalogue sent with the request), so that a
+    removed tool shows from the first run (`tool_catalog_hash`, `catalog_missing_tools`, `unavailable_tool_calls` in
+    agent_run). Either tool names, or the tool definitions themselves ({"name", "parameters"} or OpenAI
+    {"type": "function", "function": {...}}): their parameter schemas are then recorded (`gen_ai.tool.definitions`,
+    names and schemas only) and the arguments of every call are checked against them (`tool_args_*` in agent_run).
     """
     attrs = {sc.OPERATION: sc.OP_INVOKE_AGENT, sc.AGENT_NAME: agent_name, **attributes}
     if prompt_version:
         attrs[sc.PROMPT_VERSION] = prompt_version
     if available_tools is not None:
-        attrs[sc.AVAILABLE_TOOLS] = sorted({str(t) for t in available_tools})
+        names, definitions = set(), []
+        for item in available_tools:
+            if isinstance(item, dict):
+                function = item.get("function") if isinstance(item.get("function"), dict) else item
+                if function.get("name"):
+                    names.add(str(function["name"]))
+                    parameters = function.get("parameters", function.get("input_schema"))
+                    if isinstance(parameters, dict):
+                        definitions.append({"name": str(function["name"]), "parameters": parameters})
+            else:
+                names.add(str(item))
+        attrs[sc.AVAILABLE_TOOLS] = sorted(names)
+        if definitions:
+            attrs[sc.TOOL_DEFINITIONS] = json.dumps(sorted(definitions, key=lambda d: d["name"]), sort_keys=True)
     with tracer.start_as_current_span(f"invoke_agent {agent_name}", kind=trace.SpanKind.INTERNAL, attributes=attrs) as span:
         yield span
 
@@ -61,7 +85,7 @@ def record_llm_response(span, response_model=None, input_tokens=None, output_tok
 @contextmanager
 def tool_span(tracer: trace.Tracer, tool_name: str, arguments=None, call_id: Optional[str] = None):
     """Span of one tool execution; an exception marks the call as failed (error.type) and is re-raised"""
-    attrs = {sc.OPERATION: sc.OP_EXECUTE_TOOL, sc.TOOL_NAME: tool_name}
+    attrs = {sc.OPERATION: sc.OP_EXECUTE_TOOL, sc.TOOL_NAME: tool_name, sc.SEQUENCE: next(_sequence)}
     if call_id:
         attrs[sc.TOOL_CALL_ID] = call_id
     if arguments is not None:
@@ -104,3 +128,19 @@ def record_tool_result(
     if valid is not None:
         span.set_attribute(sc.TOOL_OUTPUT_VALID, bool(valid))
     return str(status).strip().lower() if status else None
+
+
+def record_event(name: str, span=None, **attributes) -> None:
+    """Record a conversation event (e.g. "user_confirmation") on the current span, or on `span`
+
+    The event is an OpenTelemetry span event named `pulsar.event.<name>`. PulsarSpanExporter puts it in the
+    compliance trace of the run, in time order with the tool calls, for the rules that need it (e.g. "a write only
+    after the user confirmed"): a monitor declaring `accepts_rich_trace = True` receives {"name": name,
+    "kind": "event"}. Only the name and the time are read; `attributes` go to the span event (other exporters) and are
+    never written by Pulsar.
+    """
+    name = str(name).strip()
+    if not name:
+        raise ValueError("an event needs a name")
+    target = span if span is not None else trace.get_current_span()
+    target.add_event(sc.EVENT_PREFIX + name, attributes={**attributes, sc.SEQUENCE: next(_sequence)})

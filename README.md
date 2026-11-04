@@ -158,9 +158,11 @@ Writing to the database must not slow down predictions. By default (`mode="backg
   replayed, oldest first, as soon as the database is available again. Without `spool_dir`, these rows are dropped and
   counted. During the delay InfluxDB is probed (`/ping`) every `probe_interval_s` (1 s): writing resumes about a second
   after the end of an outage, not up to 60 s later.
-- A write that **timed out** may have been stored by InfluxDB: with `spool_dir` it is spooled and written again
-  (writes are idempotent: same measurement, tags and timestamp overwrite the same point, no duplicate); without it the
-  rows are counted in `uncertain_rows`, not in `dropped_rows`.
+- A write that **timed out**, or whose **connection was cut** (reset, closed) once the request was sent and before
+  the answer, may have been stored by InfluxDB: with `spool_dir` it is spooled and written again (writes are
+  idempotent: same measurement, tags and timestamp overwrite the same point, no duplicate); without it the rows are
+  counted in `uncertain_rows`, not in `dropped_rows`. A refused connection never reached InfluxDB: its rows are dropped
+  (or spooled).
 - A batch InfluxDB **refuses** (HTTP 400 / 422, e.g. a field type conflict) is never retried nor spooled. Frames are
   written together only when they share their columns *and* dtypes, object columns mixing numbers and strings are split
   by kind, and the counters are exact: on a partial write (422 `dropped=N`) the accepted rows are counted in
@@ -231,12 +233,30 @@ Each Pulse keeps its own queue bound, spool and counters; `max_batch_rows`, `flu
 and `write_concurrency` of its options are replaced by those of the writer. `pulse.close()` detaches the Pulse;
 `writer.close()` stops the thread.
 
+**Private writers or shared writer?** The shared writer now drains as fast as private writers (the line protocol
+encoding used to limit it to 13,000 to 19,000 rows/s in the lab, see [Throughput](#throughput-measured)), so the
+choice is about the caller side:
+
+- a few models (up to about 10) per process: private writers (the default) are fine;
+- tens to hundreds of models per process: `SharedWriter(concurrency=4)`. One thread instead of one per Pulse (the lab
+  counted 39 threads instead of 534 at 500 models, and one TCP connection instead of 500), the capture p99 stays low
+  while private writers fight for the GIL (lab, 100 models: 0.94 ms instead of 13.8 ms), and InfluxDB receives
+  5,000-row requests instead of one small request per model and per second;
+- above the per-process ceiling (next section), split the models over several processes: one Python process encodes
+  on one core whatever the number of writers (four `SharedWriter` of 25 models drain 28,000 rows/s, one of 100 models
+  25,000 rows/s, with the same CPU time per row).
+
 ### Durability modes
 
 | `durability` | Rows lost by a crash of the process (`kill -9`) | Cost |
 |---|---|---|
-| `"memory"` (default) | the in-memory queue and the request in flight: about `flush_interval_s` of traffic at normal load, up to `max_queue_rows` + one batch when the writer is saturated (lab: 80,000 to 100,000 rows in a 50k rows/s burst) | none |
-| `"wal"` (needs `spool_dir`) | none: each batch is written to `spool_dir` before `capture_data()` returns, deleted once stored, replayed at the next start | one file write per capture (no fsync: an OS crash or a power loss can still lose the last batches) |
+| `"memory"` (default) | the in-memory queue and the request in flight: about `flush_interval_s` of traffic at normal load, up to `max_queue_rows` + one batch (`max_batch_rows`, or the writer's) when the writer is saturated or the storage down (lab: up to 100,500 rows with the defaults in a 50k rows/s burst, one 5,000-row batch with the storage down) | none |
+| `"wal"` (needs `spool_dir`) | none: each batch is written to `spool_dir` before `capture_data()` returns, deleted once stored, replayed at the next start (lab: 0 row lost and 0 duplicate over 9 `kill -9`, 3.4 million rows) | one file write per capture (no fsync: an OS crash or a power loss can still lose the last batches) |
+
+The default loss window on `kill -9` is therefore **`max_queue_rows` + one batch** per Pulse. For a deployment that must
+not lose rows on a crash (rolling restarts with `SIGKILL`, OOM killer), use `durability="wal"` with a `spool_dir` on a
+local disk, and a `spool_max_bytes` sized for the longest outage to absorb (once the spool is full, new batches are
+kept in memory only and counted in `memory_only_rows`).
 
 At startup the spool also recovers what a crash left: complete `.tmp` files become spooled batches, incomplete ones are
 deleted, write-ahead copies are replayed. A spool directory belongs to one Pulse of one process at a time. A spooled batch that can no longer be read or serialized is renamed `.bad`
@@ -244,18 +264,36 @@ and counted in `rejected_rows`.
 
 ### Throughput (measured)
 
-Against InfluxDB 2.6.1 in Docker on the same machine, rows of 11 numeric fields, 500-row captures, 15 s per run:
+The line protocol is built column by column (one conversion per frame, then one `str.format` per row), with the same
+lines as the influxdb-client serializer, which costs about 5 ms per frame whatever its size. The shared writer encodes
+one frame per model in each request (50 rows per frame with 100 models), so this was its ceiling. Encoding of 20 float
+fields and an integer prediction, one core:
 
-| Setup | Written rows/s | Threads | Capture p99 |
+| Frame | influxdb-client serializer | column-wise encoder |
+|---|---|---|
+| 50 rows | 5.3 ms (9,500 rows/s) | 0.9 ms (55,000 rows/s) |
+| 5,000 rows | 165 ms (30,000 rows/s) | 75 ms (66,000 rows/s) |
+
+100 models in one process, 50-row captures of 20 float fields and an integer prediction, against InfluxDB 2.6.1 in
+Docker on the same workstation (16 logical CPUs, about 3 times slower per core than the lab machine: capture p50
+0.9 ms instead of 0.3 ms), before and after the new encoder:
+
+| Setup | Writer alone (full queues) | Offered 1M rows/min (16,700 rows/s): written, lag at the end, capture p99 | Threads |
 |---|---|---|---|
-| one Pulse, one request at a time (before, and `write_concurrency=1`) | 21,000 to 23,000 | 2 | 17 ms |
-| one Pulse, `write_concurrency=4` | 37,000 | 2 | 50 ms |
-| 100 Pulse, private writers (before) | 27,500 | 101 | 358 ms |
-| 100 Pulse, one `SharedWriter(concurrency=4)` | 28,600 (40,000 rows/s offered, no loss) | 2 | 90 ms |
+| `SharedWriter(concurrency=4)`, before | 5,900 rows/s | 4,500 rows/s, 16 s, 103 ms | 6 |
+| 100 private writers, before | 22,500 rows/s | 9,500 rows/s, 2.0 s, 87 ms | 101 |
+| `SharedWriter(concurrency=4)`, after | **24,800 rows/s** | **16,400 rows/s, 0.1 to 0.3 s, 21 ms** | 6 |
+| 100 private writers, after | 27,700 rows/s | 14,700 rows/s, 0.6 to 1.1 s, 45 to 50 ms | 101 |
 
-Profile of one 5,000-row request: about 60 ms to build the line protocol (influxdb-client serializer, pure Python,
-under the GIL) and 125 ms of HTTP and ingestion, which `concurrency` overlaps. The ceiling of one process is therefore
-the serialization, in the order of 40,000 to 80,000 rows/s depending on the columns; beyond, run several processes.
+At 500k rows/min offered, the shared writer keeps up with a capture p99 of 2.0 ms (before: 5,800 rows/s written, 7.4 s
+behind, p99 118 ms); private writers keep up too, with a p99 of 25 ms. At 1M rows/min this workstation reaches the
+ceiling of one process: the caller threads and the writer share one core (the GIL), hence the higher p99.
+
+**Per-process ceiling.** Encoding, HTTP client and `capture_data()` all run under the GIL, on one core. The lab
+measured about **2,300 captures/s per process** on the caller side (`SharedWriter`, 500 models, p99 0.88 ms, one core
+at 99 %), and the writer drains about 25,000 rows/s per process on this workstation (more on a faster core, less with
+text columns). Beyond either, run several processes (e.g. several workers of the model server, each with its own
+`SharedWriter`); more `SharedWriter` instances in one process do not add throughput.
 
 ### `CaptureOptions`
 
@@ -275,9 +313,27 @@ the serialization, in the order of 40,000 to 80,000 rows/s depending on the colu
 | `durability` | `"memory"` | `"wal"`: write-ahead copy of each batch in `spool_dir` (see above) |
 | `spool_max_bytes` | `None` | Size limit of `spool_dir`; beyond, rows are dropped and counted (`spool_evicted_rows`) |
 | `spool_eviction` | `"drop_oldest"` | Which rows go when the spool is full: `"drop_oldest"` or `"drop_newest"` |
-| `spool_compression` | `None` | `"gzip"` (level 1): spooled batches 2.2 times smaller on random floats, more on repetitive values (the lab measured about 330 bytes per row of JSON: 1,880 MB for a 30 min outage at 200k rows/min) |
-| `replay_max_rows_per_s` | `None` | Throttle of the spool replay. After a 30 min outage, an unthrottled replay raised the capture p99 from 1 ms to 144 ms |
+| `spool_compression` | `None` | `"gzip"` (level 1), **recommended** with a spool: spooled batches 2.2 times smaller on random floats, more on repetitive values (lab, 30 min outage at 200k rows/min: 819 MB instead of 1,734 MB, 143 bytes per row instead of 303, capture p99 after the outage 1.2 ms), for a replay 9 to 21 % longer |
+| `replay_max_rows_per_s` | `None` | Throttle of the spool replay, per Pulse (see below) |
 | `row_spacing_ns` | 1,000 | Spacing of the timestamps of the rows of one capture (1 µs) |
+
+**Replay throttle.** After an outage, the replay of the spool competes with the capture for the GIL: in the lab, with
+10 private writers, the capture p99 rose to about 30 ms during the replay of a 10 or 30 min outage (1.2 ms with one
+`SharedWriter` and gzip, unthrottled). `replay_max_rows_per_s` stays unthrottled by default, because the recovery
+time becomes `backlog / replay_max_rows_per_s`, and the backlog depends on the traffic of each Pulse: any fixed value
+low enough to matter would turn the 30 min outage of a 25,000 rows/s Pulse (45 million rows) into hours of replay.
+Set it from the normal rate of the Pulse instead: **2 to 6 times its live rate** replays an outage in a half to a sixth
+of its duration. Measured on this workstation with 10 private writers (333 rows/s each, 20,000 rows spooled each, the real encoder and
+a storage answering in 2 ms):
+
+| `replay_max_rows_per_s` | Recovery | Capture p99 during the replay |
+|---|---|---|
+| `None` | 6 s | 61 to 72 ms (about 2 ms without replay) |
+| 2,000 (6 times the live rate) | 11 s | 21 to 36 ms |
+| 666 (2 times the live rate) | 31 s | 16 to 20 ms |
+
+With tens of models, the shared writer does more for the p99 than the throttle, since one thread replays instead of
+one per Pulse.
 
 ## How data is stored
 

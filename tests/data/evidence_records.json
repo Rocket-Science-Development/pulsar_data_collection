@@ -1,0 +1,383 @@
+[
+  {
+    "schema_version": "pulsar.evidence/1",
+    "evidence_id": "80b98e32c4735e5a91351f6d6d7baa794fad07251f6d75606bdcdf87518091f4",
+    "system_id": "SYS-EXAMPLE-001",
+    "model_id": "credit_model",
+    "model_version": "1.0",
+    "metric": {
+      "family": "drift",
+      "name": "ks_2samp",
+      "feature": "income",
+      "group": null,
+      "reference_group": null,
+      "subject_metric": null,
+      "value": 4.296365444722286e-27,
+      "threshold": 0.05,
+      "direction": "lower",
+      "decision_basis": "p_value",
+      "p_value": 4.296365444722286e-27,
+      "ci_low": null,
+      "ci_high": null,
+      "e_value": null,
+      "n": 500,
+      "status": "alert",
+      "error": null,
+      "method": null
+    },
+    "window": {
+      "start": "2026-10-26T00:00:00Z",
+      "end": "2026-10-26T08:19:00Z",
+      "n_rows": 500
+    },
+    "reference": {
+      "id": "reference-2026-09",
+      "start": "2026-09-01T00:00:00Z",
+      "end": "2026-09-01T16:39:00Z",
+      "n_rows": 1000
+    },
+    "reliability": {
+      "reliable": true,
+      "reasons": [],
+      "notes": [
+        "nominal_threshold"
+      ],
+      "reason_text": null,
+      "calibration": {
+        "method": "nominal",
+        "null_status": null,
+        "window_size": null,
+        "quantile": null,
+        "n_reference_windows": null,
+        "n_draws": null,
+        "n_effective_draws": null,
+        "share_at_bound": null,
+        "threshold_low": null,
+        "threshold_high": null,
+        "empirical_p_value": null,
+        "p_value_floor": null
+      },
+      "persistence": null,
+      "quality": {
+        "missing_share_current": 0.0,
+        "missing_share_reference": 0.0,
+        "low_expected_share": null,
+        "n_labelled": null,
+        "label_coverage": null,
+        "suppressed": null
+      }
+    },
+    "provenance": {
+      "producer": "pulsar-metrics",
+      "producer_version": "0.12.0",
+      "produced_at": "2026-11-02T12:00:00Z",
+      "run_name": "weekly check"
+    },
+    "details": {}
+  },
+  {
+    "schema_version": "pulsar.evidence/1",
+    "evidence_id": "7483974224ee355559486d71d52023cdc99042fe369ca3c4197ff4e92da44f51",
+    "system_id": "SYS-EXAMPLE-001",
+    "model_id": "credit_model",
+    "model_version": "1.0",
+    "metric": {
+      "family": "drift",
+      "name": "psi",
+      "feature": "income",
+      "group": null,
+      "reference_group": null,
+      "subject_metric": null,
+      "value": 0.6877123521853475,
+      "threshold": 0.2,
+      "direction": "upper",
+      "decision_basis": "value",
+      "p_value": null,
+      "ci_low": null,
+      "ci_high": null,
+      "e_value": null,
+      "n": 500,
+      "status": "alert",
+      "error": null,
+      "method": null
+    },
+    "window": {
+      "start": "2026-10-26T00:00:00Z",
+      "end": "2026-10-26T08:19:00Z",
+      "n_rows": 500
+    },
+    "reference": {
+      "id": "reference-2026-09",
+      "start": "2026-09-01T00:00:00Z",
+      "end": "2026-09-01T16:39:00Z",
+      "n_rows": 1000
+    },
+    "reliability": {
+      "reliable": true,
+      "reasons": [],
+      "notes": [
+        "nominal_threshold",
+        "sparse_cells"
+      ],
+      "reason_text": null,
+      "calibration": {
+        "method": "nominal",
+        "null_status": null,
+        "window_size": null,
+        "quantile": null,
+        "n_reference_windows": null,
+        "n_draws": null,
+        "n_effective_draws": null,
+        "share_at_bound": null,
+        "threshold_low": null,
+        "threshold_high": null,
+        "empirical_p_value": null,
+        "p_value_floor": null
+      },
+      "persistence": null,
+      "quality": {
+        "missing_share_current": 0.0,
+        "missing_share_reference": 0.0,
+        "low_expected_share": 0.20833333333333334,
+        "n_labelled": null,
+        "label_coverage": null,
+        "suppressed": null
+      }
+    },
+    "provenance": {
+      "producer": "pulsar-metrics",
+      "producer_version": "0.12.0",
+      "produced_at": "2026-11-02T12:00:00Z",
+      "run_name": "weekly check"
+    },
+    "details": {}
+  },
+  {
+    "schema_version": "pulsar.evidence/1",
+    "evidence_id": "5dffb4bfd1443a5757f0eb2591e2f2b5ed24dc8a179d155678976d0df1cebcb1",
+    "system_id": "SYS-EXAMPLE-001",
+    "model_id": "credit_model",
+    "model_version": "1.0",
+    "metric": {
+      "family": "performance",
+      "name": "accuracy",
+      "feature": "prediction",
+      "group": null,
+      "reference_group": null,
+      "subject_metric": null,
+      "value": 0.808,
+      "threshold": 0.7,
+      "direction": "lower",
+      "decision_basis": "value",
+      "p_value": null,
+      "ci_low": null,
+      "ci_high": null,
+      "e_value": null,
+      "n": 500,
+      "status": "ok",
+      "error": null,
+      "method": null
+    },
+    "window": {
+      "start": "2026-10-26T00:00:00Z",
+      "end": "2026-10-26T08:19:00Z",
+      "n_rows": 500
+    },
+    "reference": {
+      "id": "reference-2026-09",
+      "start": "2026-09-01T00:00:00Z",
+      "end": "2026-09-01T16:39:00Z",
+      "n_rows": 1000
+    },
+    "reliability": {
+      "reliable": true,
+      "reasons": [],
+      "notes": [],
+      "reason_text": null,
+      "calibration": {
+        "method": "nominal",
+        "null_status": null,
+        "window_size": null,
+        "quantile": null,
+        "n_reference_windows": null,
+        "n_draws": null,
+        "n_effective_draws": null,
+        "share_at_bound": null,
+        "threshold_low": null,
+        "threshold_high": null,
+        "empirical_p_value": null,
+        "p_value_floor": null
+      },
+      "persistence": null,
+      "quality": {
+        "missing_share_current": null,
+        "missing_share_reference": null,
+        "low_expected_share": null,
+        "n_labelled": 500,
+        "label_coverage": 1.0,
+        "suppressed": null
+      }
+    },
+    "provenance": {
+      "producer": "pulsar-metrics",
+      "producer_version": "0.12.0",
+      "produced_at": "2026-11-02T12:00:00Z",
+      "run_name": "weekly check"
+    },
+    "details": {}
+  },
+  {
+    "schema_version": "pulsar.evidence/1",
+    "evidence_id": "98dfbe786016c59672d3cb04817f00534785ea55992228aae433dbdee2c828eb",
+    "system_id": "SYS-EXAMPLE-002",
+    "model_id": "assistant",
+    "model_version": "2026.10",
+    "metric": {
+      "family": "genai",
+      "name": "mmd",
+      "feature": "embedding",
+      "group": null,
+      "reference_group": null,
+      "subject_metric": null,
+      "value": 0.02718251379370762,
+      "threshold": 0.05,
+      "direction": "lower",
+      "decision_basis": "p_value",
+      "p_value": 0.005,
+      "ci_low": null,
+      "ci_high": null,
+      "e_value": null,
+      "n": 80,
+      "status": "alert",
+      "error": null,
+      "method": "MMD^2 (unbiased), Gaussian mixture kernel, widths x median distance 3.93; permutation p-value 0.0050; reference 80 texts"
+    },
+    "window": {
+      "start": "2026-10-26T00:00:00Z",
+      "end": "2026-11-01T23:59:59Z",
+      "n_rows": 80
+    },
+    "reference": {
+      "id": "canary-2026-09",
+      "start": null,
+      "end": null,
+      "n_rows": 80
+    },
+    "reliability": {
+      "reliable": true,
+      "reasons": [],
+      "notes": [
+        "nominal_threshold"
+      ],
+      "reason_text": null,
+      "calibration": {
+        "method": "nominal",
+        "null_status": null,
+        "window_size": null,
+        "quantile": null,
+        "n_reference_windows": null,
+        "n_draws": null,
+        "n_effective_draws": null,
+        "share_at_bound": null,
+        "threshold_low": null,
+        "threshold_high": null,
+        "empirical_p_value": null,
+        "p_value_floor": null
+      },
+      "persistence": null,
+      "quality": {
+        "missing_share_current": null,
+        "missing_share_reference": null,
+        "low_expected_share": null,
+        "n_labelled": null,
+        "label_coverage": null,
+        "suppressed": null
+      }
+    },
+    "provenance": {
+      "producer": "pulsar-metrics",
+      "producer_version": "0.12.0",
+      "produced_at": "2026-11-02T12:00:00Z",
+      "run_name": null
+    },
+    "details": {
+      "test_type": "fixed"
+    }
+  },
+  {
+    "schema_version": "pulsar.evidence/1",
+    "evidence_id": "e82bf7c74bcb6340169a7c36a7fbdadf82acdeeffd4f59dd23fa0b9e966cde59",
+    "system_id": "SYS-EXAMPLE-002",
+    "model_id": "assistant",
+    "model_version": "2026.10",
+    "metric": {
+      "family": "compliance",
+      "name": "rule_compliance",
+      "feature": "auth-before-write",
+      "group": null,
+      "reference_group": null,
+      "subject_metric": null,
+      "value": 0.975609756097561,
+      "threshold": 1.0,
+      "direction": "lower",
+      "decision_basis": "value",
+      "p_value": null,
+      "ci_low": 0.8740493794422577,
+      "ci_high": 0.9956814684310875,
+      "e_value": null,
+      "n": 41,
+      "status": "alert",
+      "error": null,
+      "method": "(!create_file U authenticate) | G !create_file [critical; rules rules-v1]; 1 violating runs; Wilson"
+    },
+    "window": {
+      "start": "2026-10-26T00:00:00Z",
+      "end": "2026-11-01T23:59:59Z",
+      "n_rows": 41
+    },
+    "reference": {
+      "id": null,
+      "start": null,
+      "end": null,
+      "n_rows": null
+    },
+    "reliability": {
+      "reliable": true,
+      "reasons": [],
+      "notes": [],
+      "reason_text": null,
+      "calibration": {
+        "method": "nominal",
+        "null_status": null,
+        "window_size": null,
+        "quantile": null,
+        "n_reference_windows": null,
+        "n_draws": null,
+        "n_effective_draws": null,
+        "share_at_bound": null,
+        "threshold_low": null,
+        "threshold_high": null,
+        "empirical_p_value": null,
+        "p_value_floor": null
+      },
+      "persistence": null,
+      "quality": {
+        "missing_share_current": null,
+        "missing_share_reference": null,
+        "low_expected_share": null,
+        "n_labelled": null,
+        "label_coverage": null,
+        "suppressed": null
+      }
+    },
+    "provenance": {
+      "producer": "pulsar-metrics",
+      "producer_version": "0.12.0",
+      "produced_at": "2026-11-02T12:00:00Z",
+      "run_name": null
+    },
+    "details": {
+      "test_type": "fixed"
+    }
+  }
+]

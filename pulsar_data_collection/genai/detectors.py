@@ -53,12 +53,60 @@ def resolve_device(device):
         return "cpu"
 
 
-def _pipeline(task: str, model: str, device=None, **kwargs):
+def _on_cpu(device) -> bool:
+    """True for the devices that run on the CPU: None (library default), "cpu", -1"""
+    return device is None or device == -1 or (isinstance(device, str) and device.lower().startswith("cpu"))
+
+
+def _cpu_dtype(device, dtype):
+    """dtype to load a model with: the given one, else float32 on the CPU (half precision is 6-14x slower there, SC-09)
+    and the checkpoint's own dtype elsewhere (None)"""
+    if dtype is not None or not _on_cpu(device):
+        return dtype
+    try:
+        import torch
+    except ImportError:  # pragma: no cover - depends on the environment
+        return None
+    return torch.float32
+
+
+def _pipeline(task: str, model: str, device=None, dtype=None, **kwargs):
     try:
         from transformers import pipeline
     except ImportError as exc:  # pragma: no cover - depends on the environment
         raise ImportError('this detector needs the "detectors" extra: pip install "pulsar-data-collection[detectors]"') from exc
-    return pipeline(task, model=model, device=resolve_device(device), **kwargs)
+    device = resolve_device(device)
+    if "torch_dtype" not in kwargs:  # the name before transformers 4.56; given, it wins
+        dtype = _cpu_dtype(device, dtype)
+        if dtype is not None:
+            kwargs["dtype" if "dtype" in inspect.signature(pipeline).parameters else "torch_dtype"] = dtype
+    return pipeline(task, model=model, device=device, **kwargs)
+
+
+_GLINER_TOKENS = re.compile(r"\w+(?:[-_]\w+)*|\S")  # GLiNER's default ("whitespace") words splitter
+_WORD_SPANS = re.compile(r"\S+")
+
+
+def _token_spans(tokenizer, text: str) -> List[tuple]:
+    """[start, end) character spans of the tokens of `text` (without special tokens); without a fast tokenizer, words
+    stand for tokens"""
+    if tokenizer is not None:
+        try:
+            return [tuple(o) for o in tokenizer(text, add_special_tokens=False, return_offsets_mapping=True)["offset_mapping"]]
+        except (NotImplementedError, KeyError, TypeError, ValueError):  # slow tokenizer: no offsets
+            pass
+    return [m.span() for m in _WORD_SPANS.finditer(text)]
+
+
+def _token_windows(spans: List[tuple], size: int, step: int) -> List[tuple]:
+    """[start, end) character spans of windows of `size` tokens every `step` tokens, the last one ending the text"""
+    windows = []
+    for first in range(0, len(spans), step):
+        last = min(first + size, len(spans)) - 1
+        windows.append((spans[first][0], spans[last][1]))
+        if last == len(spans) - 1:
+            break
+    return windows
 
 
 # --------------------------------------------------------------------------------------------------------------------
@@ -315,8 +363,27 @@ def french_benign_calibration_set() -> List[str]:
 # Text classifiers
 
 
+@dataclass
+class ClassifierScore:
+    """Detail of a classifier score (see `TextClassifierDetector.score_details`)"""
+
+    score: float  # after the calibrator, if any: what `score` returns
+    raw: float  # before the calibrator (max over the windows)
+    n_tokens: int  # tokens of the text, without the special tokens
+    tokens_seen: int  # tokens the model read: all of them unless `truncated`
+    windows: int = 1  # windows scored (more than 1 only with long_text="sliding")
+    truncated: bool = False  # the text was longer than the horizon and only its beginning was scored
+    window_scores: List[float] = field(default_factory=list)  # raw score of each window
+
+
 class TextClassifierDetector:
     """A Hugging Face text classifier as a detector: score = probability mass of the `positive_labels`
+
+    The model reads at most `max_length` tokens, special tokens included (510 text tokens at 512): its **horizon**.
+    Longer texts are either cut at the horizon (`long_text="truncate"`, default: what follows is not scored, a warning
+    is given once per detector and `score_details` reports `truncated`) or scored on sliding windows of the horizon
+    (`long_text="sliding"`: score = maximum over the windows, which raises the score of long benign texts too, so fit
+    the thresholds again in that mode).
 
     Parameters
     ----------
@@ -325,7 +392,7 @@ class TextClassifierDetector:
     device : optional
         None (CPU), "auto", "cpu", "cuda", "cuda:1" or a GPU index
     max_length : int, optional
-        Longer texts are truncated (default 512 tokens)
+        Tokens read by the model per call, special tokens included (default 512)
     name : str, optional
         Detector name, i.e. the span attribute `pulsar.detector.<name>` and the record field `det_<name>`
     positive_labels : sequence of str, optional
@@ -342,6 +409,15 @@ class TextClassifierDetector:
         Compute the score from the model's logits in double precision (default False: the pipeline's single-precision
         softmax). Above about 0.9999998 the single-precision scores are equal: benign texts and attacks that the model
         scores near 1 tie, and no threshold can separate them. Recommended before fitting a threshold
+    long_text : str, optional
+        Texts longer than the horizon: "truncate" (default) or "sliding" (windows of the horizon, maximum score)
+    overlap_tokens : int, optional
+        Tokens shared by two consecutive sliding windows (default 128), so that a payload across a window edge is read
+        whole by one of them
+    **pipeline_kwargs
+        Passed to `transformers.pipeline`, e.g. `dtype=torch.float16` on a GPU (2.5x faster on a T4 for the default
+        injection model, scores within 0.005). Without `dtype`, the model runs in float32 on the CPU and in the dtype of
+        its checkpoint elsewhere
     """
 
     name = "classifier"
@@ -360,8 +436,12 @@ class TextClassifierDetector:
         language: Optional[Callable[[str], str]] = None,
         calibrator: Optional[Callable[[float], float]] = None,
         from_logits: bool = False,
+        long_text: str = "truncate",
+        overlap_tokens: int = 128,
         **pipeline_kwargs,
     ):
+        if long_text not in ("truncate", "sliding"):
+            raise ValueError('long_text must be "truncate" or "sliding"')
         if name is not None:
             self.name = name
         if positive_labels is not None:
@@ -374,12 +454,36 @@ class TextClassifierDetector:
         self.calibrator = calibrator
         self.calibrations: Dict[str, ThresholdCalibration] = {}
         self.from_logits = from_logits
+        self.long_text, self.max_length = long_text, max_length
         if from_logits:
             pipeline_kwargs.update(top_k=None, function_to_apply="none")
         self._all_labels = "top_k" in pipeline_kwargs
         self._classify = _pipeline(
             "text-classification", model, device=device, truncation=True, max_length=max_length, **pipeline_kwargs
         )
+        if not 0 <= overlap_tokens < self.horizon:
+            raise ValueError(f"overlap_tokens must be in [0, {self.horizon})")
+        self.overlap_tokens = overlap_tokens
+        self._truncation_warned = False
+
+    @property
+    def horizon(self) -> int:
+        """Text tokens the model reads in one call: `max_length` minus the special tokens"""
+        tokenizer = getattr(self._classify, "tokenizer", None)
+        try:
+            special = int(tokenizer.num_special_tokens_to_add(pair=False))
+        except (AttributeError, TypeError, ValueError):
+            special = 2
+        return max(self.max_length - special, 1)
+
+    def windows(self, text: str) -> tuple:
+        """(windows, text tokens): the [start, end) character spans scored, one unless long_text="sliding" and the text
+        is longer than the horizon"""
+        spans = _token_spans(getattr(self._classify, "tokenizer", None), text)
+        horizon = self.horizon
+        if self.long_text == "truncate" or len(spans) <= horizon:
+            return [(0, len(text))], len(spans)
+        return _token_windows(spans, horizon, horizon - self.overlap_tokens), len(spans)
 
     def _positive_score(self, result) -> float:
         if self.from_logits:  # softmax of the logits, in double precision
@@ -391,29 +495,63 @@ class TextClassifierDetector:
             return float(sum(r["score"] for r in result if r["label"].upper() in self._positive))
         return float(result["score"] if result["label"].upper() in self._positive else 1 - result["score"])
 
+    def _run(self, chunks: List[str], batch_size: Optional[int]) -> List[float]:
+        """Raw scores of `chunks`; a single chunk without `batch_size` in a single-text call"""
+        if len(chunks) == 1 and batch_size is None:
+            if self._all_labels:  # a list in, one list of every label out per text
+                return [self._positive_score(self._classify([chunks[0]])[0])]
+            return [self._positive_score(self._classify(chunks[0])[0])]
+        return [self._positive_score(r) for r in self._classify(chunks, batch_size=batch_size or 16)]
+
+    def _details(self, texts: List[str], batch_size: Optional[int]) -> List[ClassifierScore]:
+        out: List[Optional[ClassifierScore]] = [None] * len(texts)
+        chunks, owners, sizes = [], [], {}
+        horizon = self.horizon
+        for i, text in enumerate(texts):
+            if not text:
+                out[i] = ClassifierScore(0.0, 0.0, 0, 0, windows=0)
+                continue
+            spans, n_tokens = self.windows(text)
+            sizes[i] = n_tokens
+            for s, e in spans:
+                chunks.append(text[s:e])
+                owners.append(i)
+        raws = self._run(chunks, batch_size) if chunks else []
+        per_text: Dict[int, List[float]] = {}
+        for i, raw in zip(owners, raws):
+            per_text.setdefault(i, []).append(raw)
+        longest = 0
+        for i, scores in per_text.items():
+            raw, n_tokens = max(scores), sizes[i]
+            truncated = len(scores) == 1 and n_tokens > horizon
+            longest = max(longest, n_tokens if truncated else 0)
+            value = float(self.calibrator(raw)) if self.calibrator is not None else raw
+            seen = min(n_tokens, horizon) if truncated else n_tokens
+            out[i] = ClassifierScore(value, raw, n_tokens, seen, len(scores), truncated, scores)
+        if longest and not self._truncation_warned:
+            self._truncation_warned = True
+            warnings.warn(
+                f"{type(self).__name__}: a text of {longest} tokens was cut to its first {horizon} (max_length="
+                f'{self.max_length}); what follows is not scored. Use long_text="sliding" to score every window '
+                "(and fit the thresholds again), or read `score_details(text).truncated`. Warned once per detector",
+                stacklevel=3,
+            )
+        return out
+
+    def score_details(self, text: str) -> ClassifierScore:
+        """Score with its detail: tokens of the text, tokens seen, windows, truncation"""
+        return self._details([text], None)[0]
+
     def raw_score(self, text: str) -> float:
         """Score of the model, before any calibrator"""
-        if not text:
-            return 0.0
-        if self._all_labels:  # a list in, one list of every label out per text
-            return self._positive_score(self._classify([text])[0])
-        return self._positive_score(self._classify(text)[0])
+        return self.score_details(text).raw if text else 0.0
 
     def score(self, text: str) -> float:
-        raw = self.raw_score(text)
-        return float(self.calibrator(raw)) if self.calibrator is not None and text else raw
+        return self.score_details(text).score if text else 0.0
 
     def score_many(self, texts: Sequence[str], batch_size: int = 16) -> List[float]:
-        """Scores of several texts, in one batched call"""
-        texts = list(texts)
-        out = [0.0] * len(texts)
-        idx = [i for i, t in enumerate(texts) if t]
-        if idx:
-            results = self._classify([texts[i] for i in idx], batch_size=batch_size)
-            for i, result in zip(idx, results):
-                raw = self._positive_score(result)
-                out[i] = float(self.calibrator(raw)) if self.calibrator is not None else raw
-        return out
+        """Scores of several texts, in one batched call (every window of every text with long_text="sliding")"""
+        return [d.score for d in self._details(list(texts), batch_size)]
 
     def threshold_for(self, language: Optional[str]) -> float:
         return self.thresholds.get(language, self.threshold) if language else self.threshold
@@ -433,7 +571,8 @@ class TextClassifierDetector:
         """Fit the alert threshold of `language` (or the default one) on benign texts of the deployment (A/A)
 
         The threshold is set so that at most `target_fpr` of the benign texts raise the alert. Pass known positives to
-        read the recall it costs (`.recall`): a tighter threshold for a language also misses more attacks in it.
+        read the recall it costs (`.recall`): a tighter threshold for a language also misses more attacks in it. Fit it
+        in the `long_text` mode the detector will run in: sliding windows raise the scores of long benign texts.
         """
         scores = self.score_many(benign)
         result = calibrate_threshold(scores, target_fpr, "high", self.score_many(positives) if positives else None)
@@ -466,6 +605,11 @@ class InjectionDetector(TextClassifierDetector):
     The default model over-flags benign French imperatives ("Ouvrez-moi un dossier"): fit a French threshold with
     `calibrate(benign_fr, language="fr")` (e.g. on `french_benign_calibration_set()`, then on real traffic). It does
     not detect harmful requests without an injection wrapper: see `ContentSafetyDetector`.
+
+    It reads 510 tokens (`max_length=512`): an injection appended to a 2000-token text was flagged in 10 % of the cases
+    (SC-09). Pass `long_text="sliding"` to score every window of long texts, and fit its thresholds in that mode;
+    `score_details(text)` tells the tokens seen. Half precision on a GPU: `InjectionDetector(device="cuda",
+    dtype=torch.float16)` (any keyword argument reaches `transformers.pipeline`).
     """
 
     name = "injection"
@@ -496,7 +640,15 @@ class ContentSafetyDetector(TextClassifierDetector):
 # --------------------------------------------------------------------------------------------------------------------
 # Personal information
 
-_WORD_SPANS = re.compile(r"\S+")
+
+class PiiScan(list):
+    """Findings of `ModelPiiDetector.scan` (a list, in reading order) with what the model read: `windows` scanned and
+    `truncated_windows`, the windows longer than GLiNER's `max_len` whose end the model did not read (0 unless the
+    windows are sized in words, see `window_words`)"""
+
+    def __init__(self, findings=(), windows: int = 0, truncated_windows: int = 0):
+        super().__init__(findings)
+        self.windows, self.truncated_windows = windows, truncated_windows
 
 
 class ModelPiiDetector:
@@ -514,9 +666,14 @@ class ModelPiiDetector:
         None (CPU), "auto" (first GPU if any), "cpu", "cuda", "cuda:1"
     thresholds : dict, optional
         Per-label minimum score, by GLiNER label (e.g. {"street address": 0.3}); others use `threshold`
+    window_tokens, overlap_tokens : int, optional
+        GLiNER reads at most `max_len` (384 for the default model) of its own tokens (words and punctuation marks
+        apart, about 1.9 per word) and drops the rest: longer texts are scanned on windows of `window_tokens` of these
+        tokens (default: the model's `max_len`) overlapping by `overlap_tokens` (default 96), counted with the model's
+        own words splitter, and positions are mapped back to the whole text
     window_words, overlap_words : int, optional
-        GLiNER reads at most 384 words: longer texts are scanned on windows of `window_words` words (default 250)
-        overlapping by `overlap_words` (default 50), and positions are mapped back to the whole text
+        Windows sized in words instead (the defaults up to 0.10: 250 and 50). A window of 250 words often holds more than 384
+        tokens and its end is then not read: `scan()` counts these windows in `truncated_windows`
     merge : str, optional
         "enclosing" (default): a model entity that fully encloses rule findings (an address holding its postal code or
         a phone number) replaces them, and a model address overlapping rule-found addresses is merged with them (union
@@ -526,6 +683,8 @@ class ModelPiiDetector:
         when `rules` is not given; None keeps the `PiiDetector` defaults
     batch_size : int, optional
         Windows per model call (default 8)
+    dtype : optional
+        torch dtype of the model (e.g. `torch.float16` on a GPU); default float32 on the CPU, the checkpoint's elsewhere
     """
 
     LABELS = {"person": "person_name", "street address": "street_address", "date of birth": "date_of_birth"}
@@ -538,15 +697,24 @@ class ModelPiiDetector:
         *,
         device=None,
         thresholds: Optional[Dict[str, float]] = None,
-        window_words: int = 250,
-        overlap_words: int = 50,
+        window_tokens: Optional[int] = None,
+        overlap_tokens: int = 96,
+        window_words: Optional[int] = None,
+        overlap_words: Optional[int] = None,
         merge: str = "enclosing",
         batch_size: int = 8,
         locales: Optional[Sequence[str]] = None,
         profiles: Optional[Sequence[str]] = None,
+        dtype=None,
     ):
-        if not 0 <= overlap_words < window_words:
-            raise ValueError("overlap_words must be in [0, window_words)")
+        if window_words is not None:
+            overlap_words = 50 if overlap_words is None else overlap_words
+            if window_tokens is not None:
+                raise ValueError("give window_tokens or window_words, not both")
+            if not 0 <= overlap_words < window_words:
+                raise ValueError("overlap_words must be in [0, window_words)")
+        elif overlap_words is not None:
+            raise ValueError("overlap_words needs window_words")
         if merge not in ("enclosing", "rules"):
             raise ValueError('merge must be "enclosing" or "rules"')
         unknown = set(thresholds or {}) - set(self.LABELS)
@@ -561,6 +729,15 @@ class ModelPiiDetector:
         if device is not None:
             self._model = self._model.to(device)
         self.device = device
+        self._set_dtype(dtype)
+        self.max_len = int(getattr(getattr(self._model, "config", None), "max_len", None) or 384)
+        if window_words is None:
+            window_tokens = self.max_len if window_tokens is None else window_tokens
+            if not 0 < window_tokens <= self.max_len:
+                raise ValueError(f"window_tokens must be in (0, {self.max_len}], the model's max_len")
+            if not 0 <= overlap_tokens < window_tokens:
+                raise ValueError("overlap_tokens must be in [0, window_tokens)")
+        self.window_tokens, self.overlap_tokens = window_tokens, overlap_tokens
         self.threshold = threshold
         self.thresholds = dict(thresholds or {})
         if rules is None:
@@ -571,45 +748,90 @@ class ModelPiiDetector:
         self.rules = rules
         self._rules_scoped: Optional[bool] = None
         self.window_words, self.overlap_words, self.merge, self.batch_size = window_words, overlap_words, merge, batch_size
+        self._truncation_warned = False
+
+    def _set_dtype(self, dtype) -> None:
+        explicit = dtype is not None
+        dtype = _cpu_dtype(self.device, dtype)
+        if dtype is None:
+            return
+        try:
+            current = next(iter(self._model.parameters())).dtype
+        except (AttributeError, TypeError, StopIteration):
+            current = None
+        if explicit or (current is not None and current != dtype):
+            self._model = self._model.to(dtype=dtype)
+
+    def tokens(self, text: str) -> List[tuple]:
+        """[start, end) character spans of GLiNER's tokens of `text`, from the model's own words splitter"""
+        splitter = getattr(getattr(self._model, "data_processor", None), "words_splitter", None)
+        if callable(splitter):
+            try:
+                return [(int(s), int(e)) for _, s, e in splitter(text)]
+            except (TypeError, ValueError):  # pragma: no cover - a splitter of another shape
+                pass
+        return [m.span() for m in _GLINER_TOKENS.finditer(text)]
 
     def windows(self, text: str) -> List[tuple]:
         """[start, end) character spans of the windows scanned by the model"""
-        words = [m.span() for m in _WORD_SPANS.finditer(text)]
-        if len(words) <= self.window_words:
-            return [(0, len(text))] if words else []
-        step, spans = self.window_words - self.overlap_words, []
-        for first in range(0, len(words), step):
-            last = min(first + self.window_words, len(words)) - 1
-            spans.append((words[first][0], words[last][1]))
-            if last == len(words) - 1:
-                break
-        return spans
+        if self.window_words is not None:
+            units, size, overlap = [m.span() for m in _WORD_SPANS.finditer(text)], self.window_words, self.overlap_words
+        else:
+            units, size, overlap = self.tokens(text), self.window_tokens, self.overlap_tokens
+        if len(units) <= size:
+            return [(0, len(text))] if units else []
+        return _token_windows(units, size, size - overlap)
 
-    def _predict(self, chunks: List[str], labels: List[str], threshold: float) -> List[list]:
-        model = self._model
+    def _predict(self, chunks: List[str], labels: List[str], threshold: float, batch_size: Optional[int] = None) -> List[list]:
+        model, batch_size = self._model, batch_size or self.batch_size
         if callable(getattr(model, "inference", None)):
-            return model.inference(chunks, labels, threshold=threshold, batch_size=self.batch_size)
+            return model.inference(chunks, labels, threshold=threshold, batch_size=batch_size)
         if callable(getattr(model, "batch_predict_entities", None)):  # gliner < 0.2.20
             return model.batch_predict_entities(chunks, labels, threshold=threshold)
         return [model.predict_entities(chunk, labels, threshold=threshold) for chunk in chunks]
 
+    def _model_scan(self, texts: Sequence[str], batch_size: Optional[int] = None) -> List[tuple]:
+        """(entities, windows, truncated windows) of each text, every window of every text in one model call"""
+        chunks, owners = [], []
+        for i, text in enumerate(texts):
+            for s, e in self.windows(text) if text else []:
+                chunks.append((s, text[s:e]))
+                owners.append(i)
+        found: List[list] = [[] for _ in texts]
+        counts = [[0, 0] for _ in texts]
+        if chunks:
+            labels = list(self.LABELS)
+            floor = min([self.threshold, *self.thresholds.values()])
+            predicted = self._predict([c for _, c in chunks], labels, floor, batch_size)
+            for i, (offset, chunk), entities in zip(owners, chunks, predicted):
+                counts[i][0] += 1
+                if len(self.tokens(chunk)) > self.max_len:
+                    counts[i][1] += 1
+                for e in entities:
+                    if e["score"] >= self.thresholds.get(e["label"], self.threshold):
+                        found[i].append(
+                            Finding(self.LABELS[e["label"]], offset + e["start"], offset + e["end"], float(e["score"]))
+                        )
+        out = []
+        for entities, (windows, truncated) in zip(found, counts):
+            kept: List[Finding] = []  # an entity seen in two overlapping windows is kept once (most confident)
+            for f in sorted(entities, key=lambda f: (-f.confidence, -(f.end - f.start), f.start)):
+                if all(f.end <= k.start or f.start >= k.end for k in kept):
+                    kept.append(f)
+            out.append((sorted(kept, key=lambda f: f.start), windows, truncated))
+        if not self._truncation_warned and any(t for _, _, t in out):
+            self._truncation_warned = True
+            warnings.warn(
+                f"ModelPiiDetector: {sum(t for _, _, t in out)} window(s) longer than GLiNER's max_len of {self.max_len} "
+                "tokens: their end was not read. Size the windows in tokens (window_tokens, the default) rather than "
+                "window_words. Warned once per detector",
+                stacklevel=3,
+            )
+        return out
+
     def model_entities(self, text: str) -> List[Finding]:
         """Entities found by the model alone, on every window, positions in `text`, without overlaps"""
-        spans = self.windows(text) if text else []
-        if not spans:
-            return []
-        labels = list(self.LABELS)
-        floor = min([self.threshold, *self.thresholds.values()])
-        found = []
-        for (offset, end), entities in zip(spans, self._predict([text[s:e] for s, e in spans], labels, floor)):
-            for e in entities:
-                if e["score"] >= self.thresholds.get(e["label"], self.threshold):
-                    found.append(Finding(self.LABELS[e["label"]], offset + e["start"], offset + e["end"], float(e["score"])))
-        kept: List[Finding] = []  # an entity seen in two overlapping windows is kept once (most confident)
-        for f in sorted(found, key=lambda f: (-f.confidence, -(f.end - f.start), f.start)):
-            if all(f.end <= k.start or f.start >= k.end for k in kept):
-                kept.append(f)
-        return sorted(kept, key=lambda f: f.start)
+        return self._model_scan([text])[0][0]
 
     def _rules_scan(self, text: str, business_scope: str) -> list:
         if business_scope == "window":
@@ -621,14 +843,9 @@ class ModelPiiDetector:
                 self._rules_scoped = False
         return self.rules.scan(text, business_scope=business_scope) if self._rules_scoped else self.rules.scan(text)
 
-    def scan(self, text: str, business_scope: str = "window") -> list:
-        """Rule-based findings merged with the model entities, without overlaps, in reading order
-
-        `business_scope` is forwarded to the rules detector when it accepts it (`PiiDetector.scan`: "window" or
-        "adjacent", used by `PiiSession` for outputs); a rules detector without it scans one way only.
-        """
+    def _merge(self, text: str, business_scope: str, entities: List[Finding], windows: int, truncated: int) -> PiiScan:
         findings = self._rules_scan(text, business_scope)
-        for candidate in self.model_entities(text):
+        for candidate in entities:
             overlapping = [f for f in findings if not (candidate.end <= f.start or candidate.start >= f.end)]
             if not overlapping:
                 findings.append(candidate)
@@ -643,7 +860,33 @@ class ModelPiiDetector:
                 overlapping = [f for f in findings if not (candidate.end <= f.start or candidate.start >= f.end)]
             if all(candidate.start <= f.start and f.end <= candidate.end for f in overlapping):
                 findings = [f for f in findings if f not in overlapping] + [candidate]
-        return sorted(findings, key=lambda f: f.start)
+        return PiiScan(sorted(findings, key=lambda f: f.start), windows, truncated)
+
+    def scan(self, text: str, business_scope: str = "window") -> PiiScan:
+        """Rule-based findings merged with the model entities, without overlaps, in reading order
+
+        `business_scope` is forwarded to the rules detector when it accepts it (`PiiDetector.scan`: "window" or
+        "adjacent", used by `PiiSession` for outputs); a rules detector without it scans one way only. The result is a
+        list with the number of `windows` scanned and of `truncated_windows` (see `PiiScan`).
+        """
+        return self._merge(text, business_scope, *self._model_scan([text])[0])
+
+    def scan_many(
+        self, texts: Sequence[str], business_scope: str = "window", short_tokens: int = 200, batch_size: Optional[int] = None
+    ) -> List[PiiScan]:
+        """`scan` of several texts: the texts of at most `short_tokens` GLiNER tokens go through the model together,
+        `batch_size` (default the detector's) at a time, the longer ones one by one
+
+        Batching across requests is 3.3x faster at 50 tokens and 1.1x at 200, and slower from 500 tokens (SC-09, GPU):
+        a long text already fills the batches with its own windows.
+        """
+        texts = list(texts)
+        short = [i for i, t in enumerate(texts) if t and len(self.tokens(t)) <= short_tokens]
+        model = dict(zip(short, self._model_scan([texts[i] for i in short], batch_size)))
+        return [
+            self._merge(text, business_scope, *(model[i] if i in model else self._model_scan([text])[0]))
+            for i, text in enumerate(texts)
+        ]
 
 
 # --------------------------------------------------------------------------------------------------------------------
@@ -673,7 +916,7 @@ class FaithfulnessResult:
     sentences_total: int = 0  # sentences of at least 3 words in the answer
     sentences_scored: int = 0  # at most max_sentences of them
     premise_tokens: int = 0
-    windows: int = 0  # premise windows (1 when the premise fits)
+    windows: int = 0  # premise windows (1 when the premise fits), or sentence groups with premise_split="sentences"
     truncated: bool = False  # the premise did not fit and was cut (windowing disabled)
 
     @property
@@ -707,6 +950,22 @@ class FaithfulnessScorer:
         entailment of long hypotheses falls with their length
     aggregate : str, optional
         "mean" (default) or "min" (weakest sentence) for `score`
+    premise_split : str, optional
+        "tokens" (default): the token windows above. In a window of 400 tokens, the support of a sentence falls with
+        the unrelated text around its evidence (median 0.32 in a full window against 0.62 in the short last window of a
+        500-token context, SC-09). "sentences": the passages are cut at sentence boundaries into groups of
+        `premise_sentences` consecutive sentences (one group per starting sentence, so neighbours are read together)
+        and each answer sentence is judged against the `top_k_premises` groups that share the most words with it: its
+        support no longer depends on where the evidence falls. Fit the alert threshold again in that mode
+    premise_sentences : int, optional
+        Sentences per premise group (default 2)
+    top_k_premises : int, optional
+        Premise groups judged per answer sentence (default 4; None = all of them, one model call per group)
+    dtype : optional
+        torch dtype of the model; default float32 on the CPU (the default model's checkpoint is float16, 6-14x slower
+        there, SC-09) and the checkpoint's own dtype on a GPU
+    **pipeline_kwargs
+        Passed to `transformers.pipeline`
     """
 
     name = "faithfulness"
@@ -723,12 +982,25 @@ class FaithfulnessScorer:
         max_claim_words: Optional[int] = None,
         aggregate: str = "mean",
         batch_size: int = 16,
+        premise_split: str = "tokens",
+        premise_sentences: int = 2,
+        top_k_premises: Optional[int] = 4,
+        dtype=None,
+        **pipeline_kwargs,
     ):
         if window_tokens is not None and not 0 < stride_tokens <= window_tokens:
             raise ValueError("stride_tokens must be in (0, window_tokens]")
         if aggregate not in ("mean", "min"):
             raise ValueError('aggregate must be "mean" or "min"')
-        self._nli = _pipeline("text-classification", model, device=device, truncation=True, max_length=512, top_k=None)
+        if premise_split not in ("tokens", "sentences"):
+            raise ValueError('premise_split must be "tokens" or "sentences"')
+        if premise_sentences < 1 or (top_k_premises is not None and top_k_premises < 1):
+            raise ValueError("premise_sentences and top_k_premises must be at least 1")
+        pipeline_kwargs.setdefault("truncation", True)
+        pipeline_kwargs.setdefault("max_length", 512)
+        pipeline_kwargs.setdefault("top_k", None)
+        self._nli = _pipeline("text-classification", model, device=device, dtype=dtype, **pipeline_kwargs)
+        self.premise_split, self.premise_sentences, self.top_k_premises = premise_split, premise_sentences, top_k_premises
         self.window_tokens, self.stride_tokens = window_tokens, stride_tokens
         self.max_sentences, self.lexical_threshold, self.max_claim_words = max_sentences, lexical_threshold, max_claim_words
         self.aggregate, self.batch_size = aggregate, batch_size
@@ -741,28 +1013,42 @@ class FaithfulnessScorer:
         return self._entail(self._nli({"text": premise, "text_pair": hypothesis}))
 
     def _token_spans(self, premise: str) -> List[tuple]:
-        tokenizer = getattr(self._nli, "tokenizer", None)
-        if tokenizer is not None:
-            try:
-                return [
-                    tuple(o) for o in tokenizer(premise, add_special_tokens=False, return_offsets_mapping=True)["offset_mapping"]
-                ]
-            except (NotImplementedError, KeyError, TypeError):  # slow tokenizer: no offsets
-                pass
-        return [m.span() for m in _WORD_SPANS.finditer(premise)]  # without a fast tokenizer, words stand for tokens
+        return _token_spans(getattr(self._nli, "tokenizer", None), premise)
 
     def premise_windows(self, premise: str) -> tuple:
         """(windows, premise tokens): the premise cut into overlapping windows of `window_tokens` tokens"""
         spans = self._token_spans(premise)
         if self.window_tokens is None or len(spans) <= self.window_tokens:
             return [premise], len(spans)
-        windows = []
-        for first in range(0, len(spans), self.stride_tokens):
-            last = min(first + self.window_tokens, len(spans)) - 1
-            windows.append(premise[spans[first][0] : spans[last][1]])
-            if last == len(spans) - 1:
-                break
-        return windows, len(spans)
+        return [premise[s:e] for s, e in _token_windows(spans, self.window_tokens, self.stride_tokens)], len(spans)
+
+    def premise_groups(self, context: Sequence[str]) -> List[str]:
+        """The passages cut at sentence boundaries into groups of `premise_sentences` consecutive sentences (one group
+        per starting sentence); a group longer than `window_tokens` (400 if None) is cut into token windows"""
+        sentences = [s for p in context if p for s in _SENTENCES.split(p.strip()) if s]
+        size = self.premise_sentences
+        groups = [" ".join(sentences[i : i + size]) for i in range(max(len(sentences) - size + 1, 1))]
+        limit = self.window_tokens or 400
+        out = []
+        for group in groups:
+            spans = self._token_spans(group)
+            if len(spans) <= limit:
+                out.append(group)
+            else:
+                out += [group[s:e] for s, e in _token_windows(spans, limit, min(self.stride_tokens, limit))]
+        return out
+
+    @staticmethod
+    def _content_words(text: str) -> set:
+        return {w for w in _norm_words(text) if len(w) >= 3 or any(c.isdigit() for c in w)}
+
+    def _closest(self, claim: str, groups: List[str], words: List[set]) -> List[str]:
+        """The `top_k_premises` groups sharing the most content words with `claim` (all of them if None)"""
+        if self.top_k_premises is None or len(groups) <= self.top_k_premises:
+            return groups
+        own = self._content_words(claim)
+        ranked = sorted(range(len(groups)), key=lambda j: (-len(own & words[j]), j))
+        return [groups[j] for j in sorted(ranked[: self.top_k_premises])]
 
     def _claims(self, answer: str) -> List[str]:
         sentences = [s for s in _SENTENCES.split(answer.strip()) if len(s.split()) >= 3]
@@ -792,7 +1078,10 @@ class FaithfulnessScorer:
         scored = claims if max_sentences is None else claims[:max_sentences]
         if not scored or not premise:
             return FaithfulnessResult(None, None, sentences_total=len(claims))  # nothing to judge
-        windows, n_tokens = self.premise_windows(premise)
+        if self.premise_split == "sentences":
+            windows, n_tokens = self.premise_groups(context), len(self._token_spans(premise))
+        else:
+            windows, n_tokens = self.premise_windows(premise)
         support = [0.0] * len(scored)
         lexical = [False] * len(scored)
         if self.lexical_threshold is not None:
@@ -801,7 +1090,11 @@ class FaithfulnessScorer:
                 own = _trigrams(_norm_words(s))
                 if own and sum(g in grams for g in own) / len(own) >= self.lexical_threshold:
                     support[i], lexical[i] = 1.0, True
-        pairs = [(i, w) for i in range(len(scored)) if not lexical[i] for w in windows]
+        if self.premise_split == "sentences":
+            words = [self._content_words(w) for w in windows]
+            pairs = [(i, w) for i in range(len(scored)) if not lexical[i] for w in self._closest(scored[i], windows, words)]
+        else:
+            pairs = [(i, w) for i in range(len(scored)) if not lexical[i] for w in windows]
         if pairs:
             outputs = self._nli([{"text": w, "text_pair": scored[i]} for i, w in pairs], batch_size=self.batch_size)
             if outputs and isinstance(outputs[0], dict):

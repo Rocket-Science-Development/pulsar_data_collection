@@ -550,7 +550,12 @@ fit = injection.calibrate(french_benign_calibration_set(), language="fr", target
 print(fit.threshold, fit.fit_fpr, fit.recall)  # the French threshold, and the French recall it costs
 injection.record(span, text)                   # pulsar.detector.injection and pulsar.detector.injection_flag
 
-pii = ModelPiiDetector(device="auto", thresholds={"street address": 0.3})  # windows of 250 words, overlap 50
+details = injection.score_details(long_text)  # score, n_tokens, tokens_seen, windows, truncated
+sliding = InjectionDetector(long_text="sliding")  # every 510-token window of long texts, maximum score
+
+pii = ModelPiiDetector(device="auto", thresholds={"street address": 0.3})  # windows of 384 GLiNER tokens, overlap 96
+found = pii.scan(text)                        # a list of findings, with found.windows and found.truncated_windows
+many = pii.scan_many(texts)                   # short texts batched across requests, long ones one by one
 scorer = FaithfulnessScorer(max_sentences=None)
 result = scorer.record(span, answer, passages)  # faithfulness, _min, _coverage and _windows on the span
 threshold = calibrate_threshold(reference_scores, target_fpr=0.05, direction="low").threshold
@@ -572,19 +577,58 @@ Parameters:
   saturate at 0.99999976: benign French imperatives and real attacks then tie, and no threshold separates them
   (`calibrate` warns). On the default model, a French threshold fitted on half of the starter set kept 1.3 % false
   alarms on the other half and caught 3 of 6 hand-written French attacks with `from_logits=True`, none without.
+- **The 512-token horizon.** `InjectionDetector` reads `max_length=512` tokens, 510 of text. With
+  `long_text="truncate"` (default) the rest of a longer text is not scored: an injection appended to a 2000-token
+  text was flagged in 10 % of the cases (SC-09), as often as the benign texts. The detector warns once when it cuts a
+  text, and `score_details(text)` returns a `ClassifierScore` (`score`, `raw`, `n_tokens`, `tokens_seen`, `windows`,
+  `truncated`, `window_scores`); `score(text)` still returns a float. `long_text="sliding"` scores windows of 510
+  tokens overlapping by `overlap_tokens` (default 128) and keeps the maximum: the payload is seen wherever it is, but
+  a long benign text has one chance to score high per window, so **fit the thresholds again in sliding mode**
+  (`calibrate` on long benign texts of the deployment). On 40 synthetic benign administrative texts (English and
+  French) per length, the injection appended at the end was flagged 0/40 in truncate mode at 500, 1000 and 2000
+  tokens and 40/40 in sliding mode, with no benign text above 0.5 in either mode (maximum 0.011); these texts are
+  cleaner than real traffic, where the lab saw 5 to 20 % benign flags at 0.5 on the first window alone. Sliding costs
+  one model call per window: 5 windows, about 3.9x the time, at 2000 tokens on CPU. The default stays "truncate".
+- **dtype.** Every detector takes a `dtype` (`InjectionDetector` and `TextClassifierDetector` pass any keyword to
+  `transformers.pipeline`, e.g. `InjectionDetector(device="cuda", dtype=torch.float16)`: 2.48x faster on a T4,
+  scores within 0.0043, 1 decision in 64 flipped at 0.5, SC-09). Without it, models run in float32 on the CPU and in
+  the dtype of their checkpoint on a GPU. The default NLI checkpoint is stored in float16, and ran so on the CPU,
+  6 to 14x slower than in float32 (SC-09: 4.8 s against 0.67 s per 50-token request): it now runs in float32 there
+  (here, one answer against a 500-token context: 17.1 s in float16, 1.5 s in float32, same score to 1e-4).
 - `ModelPiiDetector`: `device`, `thresholds` (per GLiNER label: `"person"`, `"street address"`, `"date of birth"`),
-  `window_words` and `overlap_words` (default 250 and 50: GLiNER reads at most 384 of its own tokens, punctuation
-  included), `merge` (`"enclosing"`, the default: an address that holds a rule-found postal code or phone number
-  replaces them, and is merged with overlapping rule-found addresses; `"rules"`: the model entity is dropped, as
-  before 0.10), `locales` and `profiles` (passed to the default `PiiDetector`), `batch_size`. `scan(text,
-  business_scope=...)` forwards `business_scope` to the rules detector when it accepts it.
+  `window_tokens` and `overlap_tokens` (default 384, the model's `max_len`, and 96): GLiNER reads at most 384 of its
+  own tokens (words and punctuation marks apart, about 1.9 per word) and drops the rest, so the windows are counted
+  with the model's own words splitter. Up to 0.10 they were 250 *words* (`window_words=250, overlap_words=50`, still
+  accepted): a window often held more than 384 tokens and its end was never read (a name appended to a 1000-token
+  text was found in 65 % of the cases, SC-09). `scan(text)` returns a `PiiScan`, a list of findings with `windows`
+  and `truncated_windows` (windows longer than `max_len`, 0 with token windows; the detector warns once). `merge`
+  (`"enclosing"`, the default: an address that holds a rule-found postal code or phone number replaces them, and is
+  merged with overlapping rule-found addresses; `"rules"`: the model entity is dropped, as before 0.10), `locales`
+  and `profiles` (passed to the default `PiiDetector`), `batch_size`, `dtype`. `scan(text, business_scope=...)`
+  forwards `business_scope` to the rules detector when it accepts it. `scan_many(texts, short_tokens=200)` sends the
+  texts of at most `short_tokens` GLiNER tokens through the model together and the longer ones one by one: batching
+  across requests was 3.3x faster at 50 tokens, 1.1x at 200 and slower from 500 (SC-09, T4); on CPU, 64 requests of
+  about 30 tokens went 2.3x faster through `scan_many` than through `scan`, with the same findings. On 20 synthetic
+  invoice listings of 330 to 700 words (punctuation-heavy) ending with a name, the name was found in 13/20 with token
+  windows and 4/20 with 250-word windows, 40 of whose 45 windows were truncated.
 - `FaithfulnessScorer`: `window_tokens` and `stride_tokens` (default 400 and 300: the joined passages are cut into
   overlapping windows and each sentence keeps its best window; `None` restores the single 512-token premise, silently
   truncated), `max_sentences` (default 6, `None` = all), `lexical_threshold` (default 1.0: a sentence whose word
   trigrams are all in the passages, i.e. a verbatim copy, is supported without the model; `None` disables),
-  `max_claim_words` (splits long sentences at commas and semicolons, default off), `aggregate` (`"mean"` or `"min"`).
+  `max_claim_words` (splits long sentences at commas and semicolons, default off), `aggregate` (`"mean"` or `"min"`),
+  `dtype` and other `transformers.pipeline` keywords.
   `details(answer, passages)` returns a `FaithfulnessResult`: `score`, `min`, `sentences` (support per sentence),
   `lexical`, `sentences_total`, `sentences_scored`, `coverage`, `premise_tokens`, `windows`, `truncated`.
+- **Premises cut at sentence boundaries.** In a token window, the support of a supported sentence falls with the
+  unrelated text around its evidence: median 0.32 when the evidence opens a 500-token context (a full 400-token
+  window) against 0.62 when it closes it (a short last window), 0.40 against 0.93 at 1000 tokens (SC-09).
+  `premise_split="sentences"` cuts the passages into groups of `premise_sentences` consecutive sentences (default 2,
+  one group per starting sentence) and judges each answer sentence against the `top_k_premises` groups (default 4;
+  `None` = all) that share the most words with it, so the support no longer depends on where the evidence falls
+  (here, 10 synthetic contexts per length, a supported claim: median support start / end 0.04 / 0.87 at 500 tokens,
+  0.11 / 0.99 at 1000 and 0.30 / 0.82 at 2000 with token windows, 0.997 / 0.998 at every length with sentence
+  groups; the claim without its evidence stayed at a median of 0.02-0.03, and sentence groups took 0.4-0.5 s per
+  answer against 1.5-6.5 s on CPU). The default stays `"tokens"`; fit the alert threshold again before switching.
 
 `CanaryProbe` asks a fixed set of prompts several times and saves the answers (they are not user data) for
 `pulsar_metrics.genai.model_equality`. Since 0.10 the default is 48 prompts x 10 answers (480 calls per run;
@@ -619,8 +663,8 @@ Parameters:
   Part of it was lost to the former merge rule (an address holding a postal code was dropped; it is kept with
   `merge="enclosing"`). No threshold sweep was run: lower the `"street address"` threshold after measuring on your
   own documents.
-- **Long documents (LP-01).** Before windows, names and addresses beyond GLiNER's 384-word window were never found
-  (recall 0.0, against 0.775 and 0.833 inside it). Windows without any person can produce generic false names ("je",
+- **Long documents (LP-01).** Before windows, names and addresses beyond GLiNER's 384-token window were never found
+  (recall 0.0, against 0.775 and 0.833 inside it); the windows are sized in GLiNER tokens since SC-09. Windows without any person can produce generic false names ("je",
   "le client"); a higher `"person"` threshold reduces them. GLiNER on CPU: p50 2.6 s per document, 0.14 s on a T4.
 - **Faithfulness ranking (LR-01).** Answer-level AUROC 0.616 on RAGTruth (n = 2700, 34.9 % hallucinated; QA 0.526,
   Data2txt 0.552, Summary 0.599), below the number of sentences alone (0.645). Premise windows raised it to 0.689, and

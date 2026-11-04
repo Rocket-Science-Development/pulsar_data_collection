@@ -33,6 +33,9 @@ class SpanView:
     status_error: bool
     attributes: dict = field(default_factory=dict)
     parent_remote: bool = False  # the parent span lives in another process: this span is a local root
+    # conversation events of the span, as (name without the "pulsar.event." prefix, timestamp ns, sequence or None);
+    # see instrument.record_event
+    events: list = field(default_factory=list)
 
     @property
     def operation(self) -> Optional[str]:
@@ -249,7 +252,30 @@ def _catalog(spans: list) -> Optional[set]:
     return catalog
 
 
-def _tool_fields(tool_calls: list, tools: list, allowed_tools: Optional[set], catalog: Optional[set]) -> dict:
+TOOL_FIELD_MODES = ("called", "allowed", "top_k", "all", "none")
+
+
+def _per_tool_names(tools: list, allowed_tools: Optional[set], catalog: Optional[set], mode: str, k: int) -> list:
+    """Tools that get `tool_<tool>_*` counters in agent_run, see TrajectoryAssembler(tool_fields=...)"""
+    if mode == "none":
+        return []
+    if mode == "allowed":
+        return sorted(allowed_tools or ())
+    if mode == "top_k":
+        return sorted(name for name, _ in sorted(Counter(tools).items(), key=lambda item: (-item[1], item[0]))[:k])
+    if mode == "all":  # former behaviour: grows with the catalogue (4 fields per tool offered, even when not called)
+        return sorted(set(tools) | set(allowed_tools or ()) | set(catalog or ()))
+    return sorted(set(tools))
+
+
+def _tool_fields(
+    tool_calls: list,
+    tools: list,
+    allowed_tools: Optional[set],
+    catalog: Optional[set],
+    mode: str = "called",
+    k: int = 10,
+) -> dict:
     """Per-tool and per-status counts, soft failures, tool catalogue and calls to tools that are not available"""
     statuses = [tool_status(s) for s in tool_calls]
     errors = [_is_error(s, st) for s, st in zip(tool_calls, statuses)]
@@ -266,19 +292,19 @@ def _tool_fields(tool_calls: list, tools: list, allowed_tools: Optional[set], ca
         "unavailable_tool_calls": sum(unavailable),
         "tool_status_counts": ",".join(f"{k}={v}" for k, v in sorted(Counter(statuses).items())) or "none",
     }
-    # every tool of allowed_tools and of the catalogue is written (0 when not called), so that a per-tool test always
-    # has a value for each run
-    max_rate = 0.0
-    for name in sorted(set(tools) | set(allowed_tools or ()) | set(catalog or ())):
+    # by default only the tools called in the run get counters (a missing counter means 0): writing every tool of the
+    # catalogue made the schema grow with it (2308 fields for a catalogue of 580 tools in the lab)
+    for name in _per_tool_names(tools, allowed_tools, catalog, mode, k):
         idx = [i for i, t in enumerate(tools) if t == name]
         key = _field_name(name)
-        n_errors = sum(errors[i] for i in idx)
         out[f"tool_{key}_calls"] = len(idx)
-        out[f"tool_{key}_errors"] = n_errors
+        out[f"tool_{key}_errors"] = sum(errors[i] for i in idx)
         out[f"tool_{key}_timeouts"] = sum(timeouts[i] for i in idx)
         out[f"tool_{key}_soft_failures"] = sum(soft[i] for i in idx)
-        if idx:
-            max_rate = max(max_rate, n_errors / len(idx))
+    max_rate = 0.0
+    for name in set(tools):
+        idx = [i for i, t in enumerate(tools) if t == name]
+        max_rate = max(max_rate, sum(errors[i] for i in idx) / len(idx))
     out["max_tool_error_rate"] = max_rate
     if catalog is not None:
         ordered = sorted(catalog)
@@ -291,26 +317,227 @@ def _tool_fields(tool_calls: list, tools: list, allowed_tools: Optional[set], ca
     return out
 
 
+def _definition_items(value) -> list:
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except ValueError:
+            return []
+    if isinstance(value, dict):
+        value = [value]
+    return [item for item in value or [] if isinstance(item, dict)] if isinstance(value, (list, tuple)) else []
+
+
+def _parameters(value):
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except ValueError:
+            return None
+    return value if isinstance(value, dict) else None
+
+
+_FUNCTION_ATTRIBUTE = re.compile(r"^llm\.request\.functions\.(\d+)\.(name|parameters)$")
+
+
+def tool_schemas(spans: list) -> dict:
+    """Tool name -> JSON schema of its arguments, from the tool definitions recorded on the spans of a run
+
+    Read from `gen_ai.tool.definitions` (items {"name", "parameters"}, or OpenAI {"type": "function", "function": {...}})
+    and from the OpenLLMetry attributes llm.request.functions.<i>.name / .parameters. A tool without parameters schema
+    is not checked.
+    """
+    schemas = {}
+    for s in spans:
+        for item in _definition_items(s.attributes.get(sc.TOOL_DEFINITIONS)):
+            item = item.get("function") if isinstance(item.get("function"), dict) else item
+            parameters = _parameters(item.get("parameters", item.get("input_schema")))
+            if item.get("name") and parameters is not None:
+                schemas[str(item["name"])] = parameters
+        functions = defaultdict(dict)
+        for key, value in s.attributes.items():
+            match = _FUNCTION_ATTRIBUTE.match(key)
+            if match:
+                functions[match.group(1)][match.group(2)] = value
+        for function in functions.values():
+            parameters = _parameters(function.get("parameters"))
+            if function.get("name") and parameters is not None:
+                schemas[str(function["name"])] = parameters
+    return schemas
+
+
+_JSON_TYPES = {
+    "string": lambda v: isinstance(v, str),
+    "integer": lambda v: (isinstance(v, int) and not isinstance(v, bool)) or (isinstance(v, float) and v.is_integer()),
+    "number": lambda v: isinstance(v, (int, float)) and not isinstance(v, bool),
+    "boolean": lambda v: isinstance(v, bool),
+    "array": lambda v: isinstance(v, (list, tuple)),
+    "object": lambda v: isinstance(v, dict),
+    "null": lambda v: v is None,
+}
+
+
+def _schema_problems(value, schema: dict, problems: set, depth: int = 0) -> None:
+    """Add to `problems` what is wrong with `value` against a JSON schema (type, required, enum, additionalProperties;
+    nested properties and array items are checked; other keywords are ignored)"""
+    if not isinstance(schema, dict) or depth > 8:
+        return
+    expected = schema.get("type")
+    types = [t for t in (expected if isinstance(expected, list) else [expected]) if t in _JSON_TYPES]
+    if types and not any(_JSON_TYPES[t](value) for t in types):
+        problems.add("type")
+        if isinstance(value, str) and {"number", "integer"} & set(types) and _NUMBER.match(value.strip()):
+            problems.add("string_number")  # e.g. {"amount": "36000"} for an integer
+        return
+    if "enum" in schema and isinstance(schema["enum"], list) and value not in schema["enum"]:
+        problems.add("enum")
+    if isinstance(value, dict):
+        properties = schema.get("properties") if isinstance(schema.get("properties"), dict) else {}
+        if any(name not in value for name in schema.get("required") or []):
+            problems.add("missing_required")
+        if schema.get("additionalProperties") is False and any(name not in properties for name in value):
+            problems.add("unexpected")
+        for name, item in value.items():
+            if name in properties:
+                _schema_problems(item, properties[name], problems, depth + 1)
+    elif isinstance(value, (list, tuple)) and isinstance(schema.get("items"), dict):
+        for item in value:
+            _schema_problems(item, schema["items"], problems, depth + 1)
+
+
+def argument_problems(span: SpanView, schema: dict) -> set:
+    """Problems of the arguments of one tool call against the tool's JSON schema: "unparsable" (not a JSON object),
+    "missing_required", "type", "string_number" (a number sent as a string, also counted as "type"), "enum",
+    "unexpected" (a parameter outside `properties` with additionalProperties false); empty when the call is valid"""
+    raw = _raw_arguments(span)
+    try:
+        args = json.loads(raw) if raw.strip() else {}
+    except ValueError:
+        return {"unparsable"}
+    if not isinstance(args, dict):
+        return {"unparsable"}
+    problems = set()
+    _schema_problems(args, {**schema, "type": "object"}, problems)
+    return problems
+
+
+def _argument_fields(tool_calls: list, tools: list, schemas: dict) -> dict:
+    """Label-free quality of the arguments (tool_args_*), written when the run recorded tool definitions
+
+    Only the counts are written, never the argument values. In the lab, llama3.2:3b sent 854 numbers as strings
+    against 150 for llama3.1:8b on the same cases, while steps, tool_calls and tool_error_rate did not move.
+    """
+    if not schemas:
+        return {}
+    checked = [argument_problems(s, schemas[t]) for s, t in zip(tool_calls, tools) if t in schemas]
+    invalid = sum(1 for problems in checked if problems)
+    return {
+        "tool_args_checked": len(checked),
+        "tool_args_invalid": invalid,
+        "tool_args_invalid_rate": (invalid / len(checked)) if checked else 0.0,
+        "tool_args_missing_required": sum(1 for p in checked if "missing_required" in p),
+        "tool_args_type_errors": sum(1 for p in checked if "type" in p),
+        "tool_args_string_numbers": sum(1 for p in checked if "string_number" in p),
+        "tool_args_unparsable": sum(1 for p in checked if "unparsable" in p),
+    }
+
+
+def _first_step_no_tool(llm_calls: list, tool_calls: list) -> bool:
+    """The first model call was not followed by any tool call before the next model call (or the end of the run)"""
+    if not llm_calls:
+        return not tool_calls
+    calls = sorted(llm_calls, key=lambda s: s.start_ns)
+    first, following = calls[0], calls[1] if len(calls) > 1 else None
+    stop = following.start_ns if following is not None else float("inf")
+    return not any(first.start_ns <= s.start_ns < stop for s in tool_calls)
+
+
+# ------------------------------------------------------------------------------------------------ compliance trace
+def _element_status(span: SpanView) -> str:
+    """ "ok", "error", "timeout" or "soft_failure" (a call to an unavailable tool is an "error")"""
+    status = tool_status(span)
+    if status == sc.TOOL_TIMEOUT:
+        return "timeout"
+    if _is_error(span, status) or status in sc.UNAVAILABLE_STATUSES:
+        return "error"
+    if _is_soft_failure(span, status):
+        return "soft_failure"
+    return "ok"
+
+
+def _parsed_arguments(span: SpanView) -> Optional[dict]:
+    raw = _raw_arguments(span)
+    try:
+        args = json.loads(raw) if raw.strip() else {}
+    except ValueError:
+        return None
+    return args if isinstance(args, dict) else None
+
+
+def _order(timestamp: int, sequence) -> tuple:
+    """Sort key of the trace: time, then the helpers' sequence number for equal times (coarse clocks)"""
+    return (timestamp, sequence if isinstance(sequence, int) else -1)
+
+
+def compliance_trace(tool_calls: list, spans: list, rich: bool) -> list:
+    """Trace checked by the compliance rules
+
+    Without `rich`: the names of the tools called, in order (former trace, as `trace_from(tool_sequence)` rebuilds it).
+    With `rich`: tool calls and conversation events (`pulsar.event.<name>` span events) in time order, each a dict
+    {"name", "kind": "tool"|"event"}; tool calls add "args" (parsed arguments, when they are a JSON object) and "status"
+    ("ok", "error", "timeout" or "soft_failure"). The argument values stay in memory, they are never written.
+    """
+    tools = sorted(tool_calls, key=lambda s: s.start_ns)
+    if not rich:
+        return [s.attributes.get(sc.TOOL_NAME) or s.name for s in tools]
+    timed = []
+    for s in tools:
+        element = {"name": s.attributes.get(sc.TOOL_NAME) or s.name, "kind": "tool", "status": _element_status(s)}
+        args = _parsed_arguments(s)
+        if args is not None:
+            element["args"] = args
+        timed.append((_order(s.start_ns, s.attributes.get(sc.SEQUENCE)), element))
+    for s in spans:
+        for name, timestamp, *sequence in s.events:
+            timed.append((_order(timestamp, sequence[0] if sequence else None), {"name": name, "kind": "event"}))
+    return [element for _, element in sorted(timed, key=lambda item: item[0])]
+
+
 def _rule_id(rule) -> str:
     return str(getattr(rule, "id", rule))
+
+
+def accepts_rich_trace(compliance) -> bool:
+    """The monitor declares `accepts_rich_trace = True`: it receives tool calls and events as dicts (compliance_trace)"""
+    return getattr(compliance, "accepts_rich_trace", False) is True
 
 
 def compliance_fields(compliance, tools: list, rules_version: Optional[str] = None) -> dict:
     """violated_rules / violations / critical_violations / rules_version of one run
 
     `compliance` is a pulsar_metrics ComplianceMonitor (any object with `violations(trace)`, and optionally `rules`
-    carrying `id` / `severity` and `version`) or a callable trace -> violated rule ids. The trace is the list of the
-    tool names called, as `pulsar_metrics.genai.compliance.trace_from(tool_sequence)` rebuilds it.
+    carrying `id` / `severity` and `version`) or a callable trace -> violated rule ids. `tools` is the trace: the list
+    of the tool names called, as `pulsar_metrics.genai.compliance.trace_from(tool_sequence)` rebuilds it, or, for a
+    monitor declaring `accepts_rich_trace = True`, the rich trace of `compliance_trace` (tool calls with their
+    arguments and status, and conversation events, in time order). A monitor with `not_evaluable(trace)` (rules that
+    the trace cannot decide, e.g. a confirmation rule without events) adds `not_evaluable_rules` (rule ids,
+    comma-separated), only when the list is not empty.
     """
     check = getattr(compliance, "violations", compliance)
     violated = sorted({_rule_id(r) for r in (check(list(tools)) or [])})
     severity = {_rule_id(r): str(getattr(r, "severity", "")).lower() for r in getattr(compliance, "rules", None) or []}
-    return {
+    out = {
         "violated_rules": ",".join(violated) or "none",
         "violations": len(violated),
         "critical_violations": sum(1 for r in violated if severity.get(r) == "critical"),
         "rules_version": str(rules_version or getattr(compliance, "version", None) or "unversioned"),
     }
+    not_evaluable = getattr(compliance, "not_evaluable", None)
+    if callable(not_evaluable):
+        rules = sorted({_rule_id(r) for r in (not_evaluable(list(tools)) or [])})
+        if rules:
+            out["not_evaluable_rules"] = ",".join(rules)
+    return out
 
 
 def agent_run_record(
@@ -321,12 +548,15 @@ def agent_run_record(
     loop_window: int = 4,
     loop_min_repeats: int = 2,
     incomplete: bool = False,
+    tool_fields: str = "called",
+    tool_fields_k: int = 10,
 ) -> dict:
     """Trajectory features of one agent run
 
     `repeated_calls` keeps its historical meaning (consecutive calls identical byte for byte). `repeated_calls_window`
     counts the calls whose normalized signature (tool + arguments, see `normalized_signature`) appeared among the
-    `loop_window` previous calls; `loop_detected` is True from `loop_min_repeats` such calls.
+    `loop_window` previous calls; `loop_detected` is True from `loop_min_repeats` such calls. `tool_fields` and
+    `tool_fields_k` choose the tools that get `tool_<tool>_*` counters (see TrajectoryAssembler).
     """
     a = root.attributes
     llm_calls = [s for s in descendants if s.operation in sc.LLM_OPERATIONS]
@@ -349,6 +579,7 @@ def agent_run_record(
         "max_same_tool_calls": max(counts.values()) if counts else 0,
         "tool_cycle_repeats": _cycle_repeats(tools),
         "loop_detected": repeated_window >= loop_min_repeats,
+        "first_step_no_tool": _first_step_no_tool(llm_calls, tool_calls),
         "out_of_scope_calls": sum(1 for t in tools if allowed_tools is not None and t not in allowed_tools),
         "delegation_depth": _delegation_depth(root, descendants),
         "input_tokens": sum(int(s.attributes.get(sc.INPUT_TOKENS) or 0) for s in llm_calls),
@@ -365,7 +596,9 @@ def agent_run_record(
         "prompt_version": a.get(sc.PROMPT_VERSION),
         "trace_id": format(root.trace_id, "032x"),
     }
-    record.update(_tool_fields(tool_calls, tools, allowed_tools, _catalog([root, *descendants])))
+    spans = [root, *descendants]
+    record.update(_tool_fields(tool_calls, tools, allowed_tools, _catalog(spans), tool_fields, tool_fields_k))
+    record.update(_argument_fields(tool_calls, tools, tool_schemas(spans)))
     if sc.TASK_SUCCESS in a:
         record["task_success"] = bool(a[sc.TASK_SUCCESS])
     for key, attribute in (
@@ -440,7 +673,16 @@ class TrajectoryAssembler:
         Rules checked on each run (pulsar_metrics.genai.ComplianceMonitor, or any callable trace -> violated rule ids):
         adds `violated_rules`, `violations`, `critical_violations` and `rules_version` to the agent runs
     rules_version : str, optional
-        Version of the rules written with the violations (default: `compliance.version`, else "unversioned")
+        Version of the rules written with the violations (default: `compliance.version`, else "unversioned"). A monitor
+        declaring `accepts_rich_trace = True` receives the rich trace (tool calls with arguments and status, and the
+        `pulsar.event.*` conversation events, in time order, see `compliance_trace`); others receive the tool names.
+    tool_fields : str, optional
+        Tools that get the counters `tool_<tool>_calls` / `_errors` / `_timeouts` / `_soft_failures` in agent_run:
+        "called" (default: the tools called in the run, a missing counter means 0), "allowed" (every tool of
+        `allowed_tools`, 0 when not called), "top_k" (the `tool_fields_k` tools called most in the run), "all" (former
+        behaviour: called, allowed and catalogue tools, 4 fields per tool offered) or "none"
+    tool_fields_k : int, optional
+        Number of tools with counters for `tool_fields="top_k"` (default 10)
     """
 
     def __init__(
@@ -456,8 +698,16 @@ class TrajectoryAssembler:
         loop_min_repeats: int = 2,
         compliance: Any = None,
         rules_version: Optional[str] = None,
+        tool_fields: str = "called",
+        tool_fields_k: int = 10,
     ):
+        if tool_fields not in TOOL_FIELD_MODES:
+            raise ValueError(f"tool_fields must be one of {TOOL_FIELD_MODES}, not {tool_fields!r}")
+        if tool_fields == "allowed" and allowed_tools is None:
+            raise ValueError('tool_fields="allowed" needs allowed_tools')
         self.allowed_tools = set(allowed_tools) if allowed_tools is not None else None
+        self.tool_fields = tool_fields
+        self.tool_fields_k = int(tool_fields_k)
         self.trace_timeout_ns = int(trace_timeout_s * 1e9)
         self.max_pending_traces = max_pending_traces
         self.wait_for_root = wait_for_root
@@ -630,11 +880,14 @@ class TrajectoryAssembler:
             loop_window=self.loop_window,
             loop_min_repeats=self.loop_min_repeats,
             incomplete=incomplete,
+            tool_fields=self.tool_fields,
+            tool_fields_k=self.tool_fields_k,
         )
         if self.compliance is not None:
-            tools = [] if record["tool_sequence"] == "none" else record["tool_sequence"].split(">")
             try:
-                record.update(compliance_fields(self.compliance, tools, self.rules_version))
+                tool_calls = [s for s in descendants if s.operation == sc.OP_EXECUTE_TOOL]
+                trace = compliance_trace(tool_calls, [root, *descendants], rich=accepts_rich_trace(self.compliance))
+                record.update(compliance_fields(self.compliance, trace, self.rules_version))
             except Exception:  # noqa: BLE001 - a faulty rule set must never stop the collection
                 self._counters["compliance_errors"] += 1
                 log.warning("compliance check failed for trace %s", record["trace_id"], exc_info=True)

@@ -31,6 +31,11 @@ PROMPT_VERSION = "pulsar.prompt.version"
 # Tool catalogue offered to the model for this run (list of tool names), set on the agent span: a removed or added tool
 # is then visible from the first run (tool_catalog_hash, catalog_missing_tools, unavailable_tool_calls)
 AVAILABLE_TOOLS = "pulsar.agent.available_tools"
+# Tool definitions offered to the model (JSON list of {"name", "parameters": JSON schema}, OpenAI {"function": {...}}
+# items accepted), on the agent span or on the LLM spans: the arguments of each call are checked against them
+# (tool_args_* in agent_run). `gen_ai.tool.definitions` is the GenAI convention; OpenLLMetry writes
+# llm.request.functions.<i>.name / .parameters, which are read too.
+TOOL_DEFINITIONS = "gen_ai.tool.definitions"
 # Outcome of a tool call, set on the tool span (see record_tool_result): "ok", "error", "timeout", "retry", "invalid",
 # "unavailable"... When absent, it is derived from the span status ("timeout" when error.type names a timeout).
 TOOL_STATUS = "pulsar.tool.status"
@@ -40,6 +45,12 @@ CF_SET_ID = "pulsar.cf.set_id"  # requests of one set differ only by the probed 
 CF_VARIANT = "pulsar.cf.variant"  # group of the value used in this request, e.g. "fr"
 CF_ATTRIBUTE = "pulsar.cf.attribute"  # probed attribute, e.g. "first_name"
 CF_CONTROL = "pulsar.cf.control"  # "none", "placebo" (irrelevant attribute) or "order_swapped"
+# Conversation events (e.g. a user confirmation) recorded as OpenTelemetry span events named "pulsar.event.<name>" (see
+# instrument.record_event): they enter the compliance trace with the tool calls, in time order
+EVENT_PREFIX = "pulsar.event."
+# Order of the tool spans and conversation events recorded by the helpers of genai.instrument (process-wide counter):
+# breaks the ties of timestamps, which are coarse on some systems (15.6 ms on Windows)
+SEQUENCE = "pulsar.sequence"
 # Personal information (pulsar_data_collection.privacy.PiiSession): counts and types only, never the values
 from ..privacy.attributes import PII_COUNT, PII_ROLES, PII_TYPES  # noqa: E402,F401
 

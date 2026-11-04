@@ -3,6 +3,20 @@
 All notable changes to pulsar-data-collection. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.12.0] - 2026-11-04
+
+### Added
+
+- `pulsar_data_collection.evidence.EvidenceOutbox` sends evidence records (JSON dicts in the `pulsar.evidence/1`
+  format of pulsar-metrics, with no dependency on it) to a central service over HTTPS. Every record is written
+  durably to a local SQLite file before any send; a background thread posts batches, oldest first, and deletes a
+  record only on a 2xx answer (at-least-once delivery, the receiver deduplicates on `evidence_id`). Pending records
+  survive a restart. Network errors, timeouts, 408, 429 and 5xx are retried with exponential backoff, jitter and
+  `Retry-After`; 401/403 are retried as configuration errors; other 4xx move the record to a quarantine table;
+  413 splits the batch. Bounded store with a counted overflow policy (`drop_oldest` or `drop_newest`), `flush()`,
+  `close()`, `stats()` counters. The token is never logged, shown in `repr` or stored in errors; https and TLS
+  verification are on by default (`ca_bundle` for a private CA); redirects are refused; every request has a timeout.
+
 ## [0.11.0] - 2026-11-04
 
 Changes recommended by the scalability rerun and the P2 lab of 3 November 2026 (N1, N3, M32, m18, m19, SC-09,

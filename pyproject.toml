@@ -1,6 +1,6 @@
 [project]
 name = "pulsar-data-collection"
-version = "0.11.0"
+version = "0.12.0"
 description = "sdk enabling data collection from model serving code for our MPM solution"
 authors = [{ name = "Développement Science Fusée inc.", email = "mlops@rocketscience.one" }]
 readme = "README.md"

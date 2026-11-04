@@ -895,6 +895,54 @@ that it never collides with the numeric verdict `status`.
 The Grafana dashboards built on these measurements are in
 [pulsar_demo/observability](https://github.com/Rocket-Science-Development/pulsar_demo/tree/main/observability).
 
+## Sending evidence records to a central service
+
+When the raw data must stay where it is collected and only aggregated results may leave, `EvidenceOutbox` sends
+evidence records (e.g. the `"pulsar.evidence/1"` records of `pulsar_metrics.evidence`) to an HTTPS endpoint. It takes
+plain dicts and only checks that each carries a `schema_version` and an `evidence_id`: it does not depend on
+pulsar-metrics.
+
+```python
+from pulsar_data_collection.evidence import EvidenceOutbox
+
+with EvidenceOutbox(
+    "https://governance.example/api/evidence",
+    directory="/var/lib/pulsar/outbox",
+    token_env="PULSAR_EVIDENCE_TOKEN",  # or token=..., or headers=callable returning the Authorization header
+    ca_bundle="/etc/pki/internal-ca.pem",  # optional: private CA; certificates are always verified by default
+) as outbox:
+    outbox.put_many([r.to_dict() for r in records])  # durable on return
+    print(outbox.stats())
+```
+
+- **Durable first.** `put` / `put_many` write to a SQLite file in `directory` (WAL journal, `synchronous=FULL`) before
+  returning; a background thread then POSTs batches (`batch_size`, `max_batch_bytes`) as
+  `{"records": [...], "sent_at": "..."}`. Records left by a crash or a kill are sent by the next outbox opened on the
+  same directory.
+- **At least once.** A record leaves the store only on a 2xx answer, so a lost answer means a second send: the
+  receiver deduplicates on `evidence_id`; a 409 answer (the receiver already holds the id) counts as delivered. A
+  record put again while pending replaces the pending copy and goes to the end of the queue: the answer to a send of
+  the old version never deletes nor quarantines the new one.
+- **Retries.** Network errors, timeouts, 408, 429 and 5xx are retried with exponential backoff and jitter
+  (`retry_initial_s` > 0, `retry_max_s` >= `retry_initial_s`, 0 <= `jitter` < 1), honouring `Retry-After`; for ever,
+  or `max_attempts`. 401, 403, 404, 405, 410, 421 and redirects (refused, so that the token never follows them) are
+  endpoint or configuration errors: retried and logged as errors, never discarded. Any other 4xx may mean that a
+  record is refused: the batch is split and its records sent one by one. A record refused on its own goes to the
+  quarantine table (`quarantined()`, never retried) when another record of the same batch was accepted, when it was
+  alone in its batch, or when it is too large (413). When every record of a batch is refused one by one, the request
+  is taken to be refused (schema or endpoint error), not the records: they are retried.
+- **Bounded.** At most `max_records` pending (default 100 000); beyond, `overflow="drop_oldest"` (default) or
+  `"drop_newest"`, and every record lost is counted in `dropped` and logged.
+- **Secrets.** The token is never logged, shown by `repr()` or kept in errors; credentials in the URL are refused and
+  the query string is left out of logs. `https` is required (`allow_http=True` for loopback tests only), every request
+  has a timeout (`timeout_s`, default 10 s), and system proxies (`HTTPS_PROXY`) apply.
+- `flush(timeout_s)` sends what is pending now and waits; `close(flush=False)` leaves it on disk for the next start.
+  A closed outbox cannot be started again (`RuntimeError`): open a new one on the same directory.
+
+`stats()`: `queued`, `sent`, `retried` (record sends that failed and will be retried), `failed` (moved to the
+quarantine), `dropped`, `replaced`, `requests`, `pending`, `quarantined`, `oldest_pending_age_s`,
+`consecutive_failures`, `receiver_available`, `last_error`.
+
 ## API reference
 
 ### `PulseParameters`

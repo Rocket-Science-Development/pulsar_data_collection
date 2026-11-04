@@ -526,6 +526,15 @@ def test_spool_size_limit_evicts_the_oldest_and_counts_them(store, tmp_path):
     assert stats["spool_evicted_rows"] >= 150 and stats["dropped_rows"] == stats["spool_evicted_rows"]
 
 
+def test_spooled_batches_keep_their_order_when_the_clock_does_not_move(tmp_path, monkeypatch):
+    import pulsar_data_collection.spool as spool_module
+
+    monkeypatch.setattr(spool_module.time, "time_ns", lambda: 1_700_000_000_000_000_000)  # coarse clock (Windows)
+    spool = Spool(tmp_path)
+    saved = [spool.save(pd.DataFrame({"x": [float(k)]}), {}) for k in range(30)]
+    assert spool.files() == saved  # was ordered by the random id: replay and eviction did not take the oldest first
+
+
 def test_spool_compression_round_trip(tmp_path):
     frame = InfluxdbActions.prepare_frame(batch(0), None, START)
     plain = Spool(tmp_path / "plain").save(frame, {"m": 1})

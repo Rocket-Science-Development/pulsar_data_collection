@@ -24,7 +24,7 @@ LA-01, LA-02, LB-02).
 
 - `InjectionDetector` / `TextClassifierDetector`: `score_details(text)` returns a `ClassifierScore` (`n_tokens`,
   `tokens_seen`, `windows`, `truncated`, `window_scores`); `long_text="sliding"` (opt-in) scores long texts on
-  overlapping 510-token windows (score = maximum; refit thresholds in that mode); `horizon`, `windows()`.
+  overlapping windows of the horizon minus 8 tokens (score = maximum; refit thresholds in that mode); `horizon`, `windows()`.
 - `dtype=` on every detector; `FaithfulnessScorer` also passes `**pipeline_kwargs`.
 - `ModelPiiDetector`: `window_tokens` / `overlap_tokens` (GLiNER tokens); `scan()` returns a `PiiScan` (a list) with
   `windows` and `truncated_windows`; `scan_many(texts)` batches short texts (2.3x on CPU).
@@ -41,7 +41,8 @@ LA-01, LA-02, LB-02).
   `llm.request.functions.*`), and `first_step_no_tool`.
 - Rich compliance trace for monitors declaring `accepts_rich_trace = True`: tool calls with their parsed arguments and
   status, and conversation events `pulsar.event.<name>` recorded with `record_event()`, in time order
-  (`pulsar.sequence` breaks timestamp ties). Argument values are never written. `not_evaluable_rules` when the monitor
+  (`pulsar.sequence`, also set by the `OpenRunTracker` on the tool spans of other instrumentations, breaks timestamp
+  ties). Argument values are never written. `not_evaluable_rules` when the monitor
   exposes `not_evaluable`.
 - `ComparativeProbe`: `answer_status`, `unusable`, `labels`, `instrument` columns; `refusal=` (default `is_refusal`,
   French and English); neutral label rotation (`labels="neutral"`, `label_choice()`); `run_loglik(probes, loglik)`,

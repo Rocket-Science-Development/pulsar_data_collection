@@ -475,7 +475,8 @@ def _parsed_arguments(span: SpanView) -> Optional[dict]:
 
 
 def _order(timestamp: int, sequence) -> tuple:
-    """Sort key of the trace: time, then the helpers' sequence number for equal times (coarse clocks)"""
+    """Sort key of the trace: time, then the sequence number for equal times (coarse clocks). tool_span, record_event
+    and, for the tool spans of other instrumentations, the OpenRunTracker set it"""
     return (timestamp, sequence if isinstance(sequence, int) else -1)
 
 
@@ -504,7 +505,14 @@ def compliance_trace(tool_calls: list, spans: list, rich: bool) -> list:
 
 
 def _rule_id(rule) -> str:
-    return str(getattr(rule, "id", rule))
+    """Id of a violated rule: its `id`, or the string itself (never a trace element, whose arguments must not be
+    written)"""
+    if isinstance(rule, str):
+        return rule
+    rule_id = getattr(rule, "id", None)
+    if rule_id is None:
+        raise TypeError(f"a compliance monitor must return rule ids or rules, not {type(rule).__name__}")
+    return str(rule_id)
 
 
 def accepts_rich_trace(compliance) -> bool:

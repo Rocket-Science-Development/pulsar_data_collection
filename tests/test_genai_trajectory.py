@@ -632,3 +632,40 @@ def test_rules_the_trace_cannot_decide_are_stored():
     assert run["not_evaluable_rules"] == "confirm-before-write"
     assert "not_evaluable_rules" not in run_of(TrajectoryAssembler(compliance=Monitor()), [tool(3, "search", 0, 1)])
     assert "not_evaluable_rules" not in run_of(TrajectoryAssembler(compliance=FakeMonitor()), [tool(3, "create_file", 0, 1)])
+
+
+def test_tool_spans_of_other_instrumentations_keep_their_order_on_a_frozen_clock(monkeypatch):
+    """Review: on a coarse clock, a tool span without pulsar.sequence sorted before every event of the same tick"""
+    import opentelemetry.sdk.trace as sdk_trace
+
+    from pulsar_data_collection.genai import record_event
+
+    monkeypatch.setattr(sdk_trace, "time_ns", lambda: 10**9)
+    monitor = RichMonitor()
+    provider = TracerProvider()
+    exporter = PulsarSpanExporter(ListSink(), compliance=monitor)
+    provider.add_span_processor(exporter.run_tracker(check_interval_s=None))
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+    tracer = provider.get_tracer("t")
+    with agent_span(tracer, "retail"):
+        record_event("e0")
+        with tool_span(tracer, "a"):
+            pass
+        with tracer.start_as_current_span("execute_tool c", attributes={sc.OPERATION: sc.OP_EXECUTE_TOOL, sc.TOOL_NAME: "c"}):
+            pass
+        record_event("e1")
+    provider.shutdown()
+    # the frozen clock makes the run look overdue (an early incomplete record): the finished run is the last trace
+    assert [e["name"] for e in monitor.traces[-1]] == ["e0", "a", "c", "e1"]
+
+
+def test_a_monitor_returning_trace_elements_never_writes_arguments():
+    """Review: violated_rules took str() of whatever the monitor returned, arguments included"""
+
+    class Leaky(RichMonitor):
+        def violations(self, trace):
+            return list(trace)
+
+    assembler = TrajectoryAssembler(compliance=Leaky())
+    run = run_of(assembler, [tool(3, "cancel_order", 0, 1, arguments='{"order_id": "W1"}')])
+    assert "W1" not in str(run) and assembler.stats()["compliance_errors"] == 1

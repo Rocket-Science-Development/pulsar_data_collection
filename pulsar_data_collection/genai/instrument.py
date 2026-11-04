@@ -18,6 +18,11 @@ from . import semconv as sc
 _sequence = itertools.count(1)
 
 
+def next_sequence() -> int:
+    """Next pulsar.sequence number of this process (tool spans and events, shared with the OpenRunTracker)"""
+    return next(_sequence)
+
+
 @contextmanager
 def agent_span(
     tracer: trace.Tracer,

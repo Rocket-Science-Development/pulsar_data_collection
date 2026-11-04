@@ -15,6 +15,7 @@ from opentelemetry.trace import StatusCode
 from ..models import CaptureOptions, DataWithPrediction, PulseParameters
 from ..pulse import Pulse
 from . import semconv as sc
+from .instrument import next_sequence
 from .trajectory import OpenRun, SpanView, TrajectoryAssembler
 
 log = logging.getLogger(__name__)
@@ -249,6 +250,11 @@ class OpenRunTracker(SpanProcessor):
 
     def on_start(self, span, parent_context=None) -> None:
         attributes = span.attributes or {}
+        if sc.SEQUENCE not in attributes and (
+            attributes.get(sc.OPERATION) == sc.OP_EXECUTE_TOOL or str(span.name).startswith(sc.OP_EXECUTE_TOOL)
+        ):
+            # tool spans of other instrumentations get the same order number as tool_span and record_event
+            span.set_attribute(sc.SEQUENCE, next_sequence())
         # every span start is queued (agent attributes only), so that a sub-agent below an intermediate span is known
         agent = attributes.get(sc.OPERATION) == sc.OP_INVOKE_AGENT
         parent = span.parent

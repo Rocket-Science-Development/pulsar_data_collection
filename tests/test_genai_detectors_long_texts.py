@@ -73,7 +73,7 @@ def test_an_injection_after_the_horizon_is_scored_with_sliding_windows(injection
     with warnings.catch_warnings():
         warnings.simplefilter("error")  # nothing is cut: no warning
         result = sliding.score_details(text)
-        assert result.score == pytest.approx(0.99) and not result.truncated and result.windows == 5
+        assert result.score == pytest.approx(0.99) and not result.truncated and result.windows == 6
         assert result.tokens_seen == result.n_tokens == 2009 and max(result.window_scores) == result.raw
         assert sliding.score(text) == pytest.approx(0.99)
         assert sliding.score_many(["", text, INJECTION]) == [
@@ -85,13 +85,13 @@ def test_an_injection_after_the_horizon_is_scored_with_sliding_windows(injection
     with pytest.raises(ValueError):
         InjectionDetector(long_text="split")
     with pytest.raises(ValueError):
-        InjectionDetector(overlap_tokens=510)
+        InjectionDetector(long_text="sliding", overlap_tokens=502)
 
 
 def test_an_injection_across_a_window_edge_is_read_whole(injection):
     """The windows overlap by `overlap_tokens`: a payload cut by one window edge is whole in the next window"""
     words = [f"word{i}" for i in range(1500)]
-    words[507:507] = INJECTION.split()  # across the end of the first window (510 tokens)
+    words[499:499] = INJECTION.split()  # across the end of the first window (502 tokens: horizon minus the margin)
     detector = InjectionDetector(long_text="sliding")
     assert detector.score(" ".join(words)) == pytest.approx(0.99)
     no_overlap = InjectionDetector(long_text="sliding", overlap_tokens=0)
@@ -173,8 +173,6 @@ def test_names_at_the_end_of_long_texts_are_found_with_token_windows(token_gline
         ModelPiiDetector(rules=NoRules(), window_tokens=500)  # beyond what GLiNER reads
     with pytest.raises(ValueError):
         ModelPiiDetector(rules=NoRules(), overlap_tokens=384)
-    with pytest.raises(ValueError):
-        ModelPiiDetector(rules=NoRules(), overlap_words=20)
 
 
 def test_scan_many_batches_the_short_texts(token_gliner):
@@ -312,3 +310,26 @@ def test_models_run_in_float32_on_the_cpu_and_take_a_dtype(monkeypatch):
     assert ModelPiiDetector(rules=NoRules())._model.dtypes == ["float32"]
     assert ModelPiiDetector(rules=NoRules(), device="cuda:0")._model.dtypes == [None]  # moved, dtype kept
     assert ModelPiiDetector(rules=NoRules(), device="cuda:0", dtype="float16")._model.dtypes == [None, "float16"]
+
+
+def test_a_short_max_length_still_builds_in_truncate_mode(injection):
+    """Review: the sliding-window overlap was checked even in truncate mode, so max_length <= 130 no longer built"""
+    assert InjectionDetector(max_length=128).score("hello") < 0.5
+    with pytest.raises(ValueError):
+        InjectionDetector(max_length=128, long_text="sliding")
+    assert InjectionDetector(max_length=128, long_text="sliding", overlap_tokens=32).overlap_tokens == 32
+
+
+def test_sliding_windows_leave_a_margin_below_the_horizon(injection):
+    """Review: a window cut inside a word can tokenize longer on its own; windows stay a few tokens below the horizon"""
+    detector = InjectionDetector(long_text="sliding")
+    windows, n_tokens = detector.windows(" ".join(f"w{i}" for i in range(2000)))
+    assert n_tokens == 2000 and len(windows) > 1
+    text = " ".join(f"w{i}" for i in range(2000))
+    assert max(len(text[a:b].split()) for a, b in windows) <= detector.horizon - 8
+
+
+def test_overlap_words_alone_keeps_the_former_word_windows(token_gliner):
+    """Review: ModelPiiDetector(overlap_words=N) was valid in 0.10 (250-word windows) and must stay so"""
+    detector = ModelPiiDetector(rules=NoRules(), overlap_words=30)
+    assert (detector.window_words, detector.overlap_words) == (250, 30)

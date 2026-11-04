@@ -98,6 +98,9 @@ def _token_spans(tokenizer, text: str) -> List[tuple]:
     return [m.span() for m in _WORD_SPANS.finditer(text)]
 
 
+_RETOKENIZE_MARGIN = 8
+
+
 def _token_windows(spans: List[tuple], size: int, step: int) -> List[tuple]:
     """[start, end) character spans of windows of `size` tokens every `step` tokens, the last one ending the text"""
     windows = []
@@ -461,8 +464,8 @@ class TextClassifierDetector:
         self._classify = _pipeline(
             "text-classification", model, device=device, truncation=True, max_length=max_length, **pipeline_kwargs
         )
-        if not 0 <= overlap_tokens < self.horizon:
-            raise ValueError(f"overlap_tokens must be in [0, {self.horizon})")
+        if long_text == "sliding" and not 0 <= overlap_tokens < self._window_size:
+            raise ValueError(f"overlap_tokens must be in [0, {self._window_size})")
         self.overlap_tokens = overlap_tokens
         self._truncation_warned = False
 
@@ -476,6 +479,13 @@ class TextClassifierDetector:
             special = 2
         return max(self.max_length - special, 1)
 
+    @property
+    def _window_size(self) -> int:
+        """Tokens of a sliding window: the horizon minus a margin, since a window cut inside a word can tokenize a few
+        tokens longer on its own and the pipeline would drop its tail"""
+        horizon = self.horizon
+        return horizon - _RETOKENIZE_MARGIN if horizon > 4 * _RETOKENIZE_MARGIN else horizon
+
     def windows(self, text: str) -> tuple:
         """(windows, text tokens): the [start, end) character spans scored, one unless long_text="sliding" and the text
         is longer than the horizon"""
@@ -483,7 +493,8 @@ class TextClassifierDetector:
         horizon = self.horizon
         if self.long_text == "truncate" or len(spans) <= horizon:
             return [(0, len(text))], len(spans)
-        return _token_windows(spans, horizon, horizon - self.overlap_tokens), len(spans)
+        size = self._window_size
+        return _token_windows(spans, size, size - self.overlap_tokens), len(spans)
 
     def _positive_score(self, result) -> float:
         if self.from_logits:  # softmax of the logits, in double precision
@@ -707,14 +718,14 @@ class ModelPiiDetector:
         profiles: Optional[Sequence[str]] = None,
         dtype=None,
     ):
+        if window_words is None and overlap_words is not None:
+            window_words = 250  # former word windows (0.10), whose default size was 250 words
         if window_words is not None:
             overlap_words = 50 if overlap_words is None else overlap_words
             if window_tokens is not None:
                 raise ValueError("give window_tokens or window_words, not both")
             if not 0 <= overlap_words < window_words:
                 raise ValueError("overlap_words must be in [0, window_words)")
-        elif overlap_words is not None:
-            raise ValueError("overlap_words needs window_words")
         if merge not in ("enclosing", "rules"):
             raise ValueError('merge must be "enclosing" or "rules"')
         unknown = set(thresholds or {}) - set(self.LABELS)

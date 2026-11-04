@@ -640,7 +640,15 @@ class ContentSafetyDetector(TextClassifierDetector):
 # --------------------------------------------------------------------------------------------------------------------
 # Personal information
 
-_WORD_SPANS = re.compile(r"\S+")
+
+class PiiScan(list):
+    """Findings of `ModelPiiDetector.scan` (a list, in reading order) with what the model read: `windows` scanned and
+    `truncated_windows`, the windows longer than GLiNER's `max_len` whose end the model did not read (0 unless the
+    windows are sized in words, see `window_words`)"""
+
+    def __init__(self, findings=(), windows: int = 0, truncated_windows: int = 0):
+        super().__init__(findings)
+        self.windows, self.truncated_windows = windows, truncated_windows
 
 
 class ModelPiiDetector:
@@ -658,9 +666,14 @@ class ModelPiiDetector:
         None (CPU), "auto" (first GPU if any), "cpu", "cuda", "cuda:1"
     thresholds : dict, optional
         Per-label minimum score, by GLiNER label (e.g. {"street address": 0.3}); others use `threshold`
+    window_tokens, overlap_tokens : int, optional
+        GLiNER reads at most `max_len` (384 for the default model) of its own tokens (words and punctuation marks
+        apart, about 1.9 per word) and drops the rest: longer texts are scanned on windows of `window_tokens` of these
+        tokens (default: the model's `max_len`) overlapping by `overlap_tokens` (default 96), counted with the model's
+        own words splitter, and positions are mapped back to the whole text
     window_words, overlap_words : int, optional
-        GLiNER reads at most 384 words: longer texts are scanned on windows of `window_words` words (default 250)
-        overlapping by `overlap_words` (default 50), and positions are mapped back to the whole text
+        Windows sized in words instead (the defaults up to 0.10: 250 and 50). A window of 250 words often holds more than 384
+        tokens and its end is then not read: `scan()` counts these windows in `truncated_windows`
     merge : str, optional
         "enclosing" (default): a model entity that fully encloses rule findings (an address holding its postal code or
         a phone number) replaces them, and a model address overlapping rule-found addresses is merged with them (union
@@ -670,6 +683,8 @@ class ModelPiiDetector:
         when `rules` is not given; None keeps the `PiiDetector` defaults
     batch_size : int, optional
         Windows per model call (default 8)
+    dtype : optional
+        torch dtype of the model (e.g. `torch.float16` on a GPU); default float32 on the CPU, the checkpoint's elsewhere
     """
 
     LABELS = {"person": "person_name", "street address": "street_address", "date of birth": "date_of_birth"}
@@ -682,15 +697,24 @@ class ModelPiiDetector:
         *,
         device=None,
         thresholds: Optional[Dict[str, float]] = None,
-        window_words: int = 250,
-        overlap_words: int = 50,
+        window_tokens: Optional[int] = None,
+        overlap_tokens: int = 96,
+        window_words: Optional[int] = None,
+        overlap_words: Optional[int] = None,
         merge: str = "enclosing",
         batch_size: int = 8,
         locales: Optional[Sequence[str]] = None,
         profiles: Optional[Sequence[str]] = None,
+        dtype=None,
     ):
-        if not 0 <= overlap_words < window_words:
-            raise ValueError("overlap_words must be in [0, window_words)")
+        if window_words is not None:
+            overlap_words = 50 if overlap_words is None else overlap_words
+            if window_tokens is not None:
+                raise ValueError("give window_tokens or window_words, not both")
+            if not 0 <= overlap_words < window_words:
+                raise ValueError("overlap_words must be in [0, window_words)")
+        elif overlap_words is not None:
+            raise ValueError("overlap_words needs window_words")
         if merge not in ("enclosing", "rules"):
             raise ValueError('merge must be "enclosing" or "rules"')
         unknown = set(thresholds or {}) - set(self.LABELS)
@@ -705,6 +729,15 @@ class ModelPiiDetector:
         if device is not None:
             self._model = self._model.to(device)
         self.device = device
+        self._set_dtype(dtype)
+        self.max_len = int(getattr(getattr(self._model, "config", None), "max_len", None) or 384)
+        if window_words is None:
+            window_tokens = self.max_len if window_tokens is None else window_tokens
+            if not 0 < window_tokens <= self.max_len:
+                raise ValueError(f"window_tokens must be in (0, {self.max_len}], the model's max_len")
+            if not 0 <= overlap_tokens < window_tokens:
+                raise ValueError("overlap_tokens must be in [0, window_tokens)")
+        self.window_tokens, self.overlap_tokens = window_tokens, overlap_tokens
         self.threshold = threshold
         self.thresholds = dict(thresholds or {})
         if rules is None:
@@ -715,45 +748,90 @@ class ModelPiiDetector:
         self.rules = rules
         self._rules_scoped: Optional[bool] = None
         self.window_words, self.overlap_words, self.merge, self.batch_size = window_words, overlap_words, merge, batch_size
+        self._truncation_warned = False
+
+    def _set_dtype(self, dtype) -> None:
+        explicit = dtype is not None
+        dtype = _cpu_dtype(self.device, dtype)
+        if dtype is None:
+            return
+        try:
+            current = next(iter(self._model.parameters())).dtype
+        except (AttributeError, TypeError, StopIteration):
+            current = None
+        if explicit or (current is not None and current != dtype):
+            self._model = self._model.to(dtype=dtype)
+
+    def tokens(self, text: str) -> List[tuple]:
+        """[start, end) character spans of GLiNER's tokens of `text`, from the model's own words splitter"""
+        splitter = getattr(getattr(self._model, "data_processor", None), "words_splitter", None)
+        if callable(splitter):
+            try:
+                return [(int(s), int(e)) for _, s, e in splitter(text)]
+            except (TypeError, ValueError):  # pragma: no cover - a splitter of another shape
+                pass
+        return [m.span() for m in _GLINER_TOKENS.finditer(text)]
 
     def windows(self, text: str) -> List[tuple]:
         """[start, end) character spans of the windows scanned by the model"""
-        words = [m.span() for m in _WORD_SPANS.finditer(text)]
-        if len(words) <= self.window_words:
-            return [(0, len(text))] if words else []
-        step, spans = self.window_words - self.overlap_words, []
-        for first in range(0, len(words), step):
-            last = min(first + self.window_words, len(words)) - 1
-            spans.append((words[first][0], words[last][1]))
-            if last == len(words) - 1:
-                break
-        return spans
+        if self.window_words is not None:
+            units, size, overlap = [m.span() for m in _WORD_SPANS.finditer(text)], self.window_words, self.overlap_words
+        else:
+            units, size, overlap = self.tokens(text), self.window_tokens, self.overlap_tokens
+        if len(units) <= size:
+            return [(0, len(text))] if units else []
+        return _token_windows(units, size, size - overlap)
 
-    def _predict(self, chunks: List[str], labels: List[str], threshold: float) -> List[list]:
-        model = self._model
+    def _predict(self, chunks: List[str], labels: List[str], threshold: float, batch_size: Optional[int] = None) -> List[list]:
+        model, batch_size = self._model, batch_size or self.batch_size
         if callable(getattr(model, "inference", None)):
-            return model.inference(chunks, labels, threshold=threshold, batch_size=self.batch_size)
+            return model.inference(chunks, labels, threshold=threshold, batch_size=batch_size)
         if callable(getattr(model, "batch_predict_entities", None)):  # gliner < 0.2.20
             return model.batch_predict_entities(chunks, labels, threshold=threshold)
         return [model.predict_entities(chunk, labels, threshold=threshold) for chunk in chunks]
 
+    def _model_scan(self, texts: Sequence[str], batch_size: Optional[int] = None) -> List[tuple]:
+        """(entities, windows, truncated windows) of each text, every window of every text in one model call"""
+        chunks, owners = [], []
+        for i, text in enumerate(texts):
+            for s, e in self.windows(text) if text else []:
+                chunks.append((s, text[s:e]))
+                owners.append(i)
+        found: List[list] = [[] for _ in texts]
+        counts = [[0, 0] for _ in texts]
+        if chunks:
+            labels = list(self.LABELS)
+            floor = min([self.threshold, *self.thresholds.values()])
+            predicted = self._predict([c for _, c in chunks], labels, floor, batch_size)
+            for i, (offset, chunk), entities in zip(owners, chunks, predicted):
+                counts[i][0] += 1
+                if len(self.tokens(chunk)) > self.max_len:
+                    counts[i][1] += 1
+                for e in entities:
+                    if e["score"] >= self.thresholds.get(e["label"], self.threshold):
+                        found[i].append(
+                            Finding(self.LABELS[e["label"]], offset + e["start"], offset + e["end"], float(e["score"]))
+                        )
+        out = []
+        for entities, (windows, truncated) in zip(found, counts):
+            kept: List[Finding] = []  # an entity seen in two overlapping windows is kept once (most confident)
+            for f in sorted(entities, key=lambda f: (-f.confidence, -(f.end - f.start), f.start)):
+                if all(f.end <= k.start or f.start >= k.end for k in kept):
+                    kept.append(f)
+            out.append((sorted(kept, key=lambda f: f.start), windows, truncated))
+        if not self._truncation_warned and any(t for _, _, t in out):
+            self._truncation_warned = True
+            warnings.warn(
+                f"ModelPiiDetector: {sum(t for _, _, t in out)} window(s) longer than GLiNER's max_len of {self.max_len} "
+                "tokens: their end was not read. Size the windows in tokens (window_tokens, the default) rather than "
+                "window_words. Warned once per detector",
+                stacklevel=3,
+            )
+        return out
+
     def model_entities(self, text: str) -> List[Finding]:
         """Entities found by the model alone, on every window, positions in `text`, without overlaps"""
-        spans = self.windows(text) if text else []
-        if not spans:
-            return []
-        labels = list(self.LABELS)
-        floor = min([self.threshold, *self.thresholds.values()])
-        found = []
-        for (offset, end), entities in zip(spans, self._predict([text[s:e] for s, e in spans], labels, floor)):
-            for e in entities:
-                if e["score"] >= self.thresholds.get(e["label"], self.threshold):
-                    found.append(Finding(self.LABELS[e["label"]], offset + e["start"], offset + e["end"], float(e["score"])))
-        kept: List[Finding] = []  # an entity seen in two overlapping windows is kept once (most confident)
-        for f in sorted(found, key=lambda f: (-f.confidence, -(f.end - f.start), f.start)):
-            if all(f.end <= k.start or f.start >= k.end for k in kept):
-                kept.append(f)
-        return sorted(kept, key=lambda f: f.start)
+        return self._model_scan([text])[0][0]
 
     def _rules_scan(self, text: str, business_scope: str) -> list:
         if business_scope == "window":
@@ -765,14 +843,9 @@ class ModelPiiDetector:
                 self._rules_scoped = False
         return self.rules.scan(text, business_scope=business_scope) if self._rules_scoped else self.rules.scan(text)
 
-    def scan(self, text: str, business_scope: str = "window") -> list:
-        """Rule-based findings merged with the model entities, without overlaps, in reading order
-
-        `business_scope` is forwarded to the rules detector when it accepts it (`PiiDetector.scan`: "window" or
-        "adjacent", used by `PiiSession` for outputs); a rules detector without it scans one way only.
-        """
+    def _merge(self, text: str, business_scope: str, entities: List[Finding], windows: int, truncated: int) -> PiiScan:
         findings = self._rules_scan(text, business_scope)
-        for candidate in self.model_entities(text):
+        for candidate in entities:
             overlapping = [f for f in findings if not (candidate.end <= f.start or candidate.start >= f.end)]
             if not overlapping:
                 findings.append(candidate)
@@ -787,7 +860,33 @@ class ModelPiiDetector:
                 overlapping = [f for f in findings if not (candidate.end <= f.start or candidate.start >= f.end)]
             if all(candidate.start <= f.start and f.end <= candidate.end for f in overlapping):
                 findings = [f for f in findings if f not in overlapping] + [candidate]
-        return sorted(findings, key=lambda f: f.start)
+        return PiiScan(sorted(findings, key=lambda f: f.start), windows, truncated)
+
+    def scan(self, text: str, business_scope: str = "window") -> PiiScan:
+        """Rule-based findings merged with the model entities, without overlaps, in reading order
+
+        `business_scope` is forwarded to the rules detector when it accepts it (`PiiDetector.scan`: "window" or
+        "adjacent", used by `PiiSession` for outputs); a rules detector without it scans one way only. The result is a
+        list with the number of `windows` scanned and of `truncated_windows` (see `PiiScan`).
+        """
+        return self._merge(text, business_scope, *self._model_scan([text])[0])
+
+    def scan_many(
+        self, texts: Sequence[str], business_scope: str = "window", short_tokens: int = 200, batch_size: Optional[int] = None
+    ) -> List[PiiScan]:
+        """`scan` of several texts: the texts of at most `short_tokens` GLiNER tokens go through the model together,
+        `batch_size` (default the detector's) at a time, the longer ones one by one
+
+        Batching across requests is 3.3x faster at 50 tokens and 1.1x at 200, and slower from 500 tokens (SC-09, GPU):
+        a long text already fills the batches with its own windows.
+        """
+        texts = list(texts)
+        short = [i for i, t in enumerate(texts) if t and len(self.tokens(t)) <= short_tokens]
+        model = dict(zip(short, self._model_scan([texts[i] for i in short], batch_size)))
+        return [
+            self._merge(text, business_scope, *(model[i] if i in model else self._model_scan([text])[0]))
+            for i, text in enumerate(texts)
+        ]
 
 
 # --------------------------------------------------------------------------------------------------------------------

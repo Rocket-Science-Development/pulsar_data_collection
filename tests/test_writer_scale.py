@@ -526,6 +526,44 @@ def test_spool_size_limit_evicts_the_oldest_and_counts_them(store, tmp_path):
     assert stats["spool_evicted_rows"] >= 150 and stats["dropped_rows"] == stats["spool_evicted_rows"]
 
 
+@pytest.mark.parametrize("eviction", ["drop_oldest", "drop_newest"])
+@pytest.mark.parametrize("compression", [None, "gzip"])
+def test_spool_cap_counts_every_evicted_row_exactly(store, tmp_path, eviction, compression):
+    store.down = True
+    probe = Spool(tmp_path / "probe", compression=compression)
+    sizes = [probe.save(InfluxdbActions.prepare_frame(batch(k * 100), None, START), {"m": 1}).stat().st_size for k in range(10)]
+    cap = int(4.5 * sum(sizes) / len(sizes))  # room for 4 batches out of 10
+    spool_dir = tmp_path / "spool"
+    pulse = Pulse(
+        params(),
+        options(
+            spool_dir=spool_dir,
+            spool_max_bytes=cap,
+            spool_eviction=eviction,
+            spool_compression=compression,
+            probe_interval_s=None,
+        ),
+    )
+    for k in range(10):
+        capture(pulse, batch(k * 100), k)
+        assert pulse.flush(5)
+    full = pulse.stats()
+    assert full["spool_bytes"] == sum(f.stat().st_size for f in spool_dir.iterdir()) <= cap
+    assert full["spool_files"] == 4 and full["spool_evicted_rows"] == 300 and full["dropped_rows"] == 300
+    store.down = False
+    pulse._writer._channel.endpoint.retry_at = 0.0
+    deadline = time.monotonic() + 10
+    while pulse.stats()["spool_files"] and time.monotonic() < deadline:
+        time.sleep(0.05)
+    pulse.close(timeout_s=2)
+    stats = pulse.stats()
+    kept = range(6, 10) if eviction == "drop_oldest" else range(4)
+    seqs = sorted(fields["seq"][1] for fields in store.points.values())
+    assert seqs == [k * 100 + i for k in kept for i in range(N)]  # exactly the batches that were not evicted
+    assert stats["replayed_rows"] == 200 and stats["spool_evicted_rows"] == 300 and stats["dropped_rows"] == 300
+    assert stats["captured_rows"] == stats["replayed_rows"] + stats["spool_evicted_rows"] and stats["spool_bytes"] == 0
+
+
 def test_spooled_batches_keep_their_order_when_the_clock_does_not_move(tmp_path, monkeypatch):
     import pulsar_data_collection.spool as spool_module
 

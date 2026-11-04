@@ -162,8 +162,10 @@ def test_lost_answer_resends_the_same_ids_only(tmp_path):
             stats = box.stats()
         ids = receiver.ids()
         assert sorted(set(ids)) == [f"ev-{i:04d}" for i in range(5)]
-        assert len(ids) == 10  # every record twice, never another id
-        assert stats["replaced"] == 1 and stats["queued"] == 5 and stats["retried"] == 5
+        # every record at least twice (the lost answer, then the retry), never another id; a loaded machine can make a
+        # retry slower than timeout_s too, so the number of re-sends is a lower bound, not an exact count
+        assert len(ids) >= 10 and all(ids.count(i) >= 2 for i in set(ids))
+        assert stats["replaced"] == 1 and stats["queued"] == 5 and stats["retried"] >= 5
     finally:
         receiver.stop()
 

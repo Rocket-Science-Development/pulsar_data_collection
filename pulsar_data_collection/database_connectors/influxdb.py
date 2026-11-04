@@ -1,4 +1,5 @@
 import json
+import math
 import re
 import threading
 from typing import Optional
@@ -7,6 +8,7 @@ import numpy as np
 import pandas as pd
 from influxdb_client import BucketsApi, InfluxDBClient, WritePrecision
 from influxdb_client.client.write.dataframe_serializer import DataframeSerializer
+from influxdb_client.client.write.point import _ESCAPE_KEY, _ESCAPE_MEASUREMENT, _ESCAPE_STRING
 from influxdb_client.client.write_api import SYNCHRONOUS, PointSettings
 from influxdb_client.rest import ApiException
 from urllib3.exceptions import HTTPError, MaxRetryError, ReadTimeoutError
@@ -17,6 +19,9 @@ from .database_actions import DatabaseActions, DatabaseActionsFactory
 DEFAULT_TIMEOUT_S = 10.0
 DEFAULT_ROW_SPACING_NS = 1_000  # 1 µs between the rows of a capture: up to 1 million rows/s per model without running ahead
 _DROPPED = re.compile(r"dropped=(\d+)")
+_NANOSECONDS = {"s": 10**9, "ms": 10**6, "us": 10**3, "ns": 1}
+_NAT = np.iinfo("int64").min
+_CHUNK_ROWS = 200  # rows formatted per call: about 2 ms of GIL
 
 
 def _dropped(body) -> Optional[int]:
@@ -51,6 +56,120 @@ def _raise_write_error(error: Exception, rows: int):
             f"InfluxDB did not answer in time, {rows} rows may or may not be stored: {error}"
         ) from error
     raise error
+
+
+# ---------------------------------------------------------------------------------------------------------- line protocol
+def _literal(text: str) -> str:
+    """Text placed as is in a str.format pattern"""
+    return text.replace("{", "{{").replace("}", "}}")
+
+
+def _nanoseconds(column: pd.Series) -> Optional[list]:
+    """Timestamps as int nanoseconds since the epoch (naive times are UTC); None if not datetimes or with NaT"""
+    if not pd.api.types.is_datetime64_any_dtype(column.dtype):
+        return None
+    values = column.array
+    factor = _NANOSECONDS.get(getattr(values, "unit", None))
+    if factor is None:
+        return None
+    stamps = values.asi8
+    if (stamps == _NAT).any():
+        return None
+    return (stamps * factor).tolist() if factor != 1 else stamps.tolist()
+
+
+def _kind(dtype) -> str:
+    """ "i" integer, "n" float or boolean, "s" anything else (written as text); nullable dtypes like the numpy ones"""
+    kind = dtype.type
+    return "i" if issubclass(kind, np.integer) else "n" if issubclass(kind, (np.floating, np.bool_)) else "s"
+
+
+def _numbers(frame: pd.DataFrame, dtypes: list, timestamp: int) -> dict:
+    """Values of the columns of a frame whose fields are all numpy numbers or booleans: one conversion for the frame
+    (a Series per column costs more than formatting 50 rows); NaN only in float columns"""
+    columns = frame.to_numpy(dtype=object).T.tolist()
+    out = {}
+    for position, (key, dtype, items) in enumerate(zip(frame.columns, dtypes, columns)):
+        if position == timestamp:
+            continue
+        mask = None
+        if dtype.kind == "f" and any(map(math.isnan, items)):
+            mask = [math.isnan(v) for v in items]
+        out[key] = ("i" if dtype.kind in "iu" else "n", items, mask)
+    return out
+
+
+def _any_values(frame: pd.DataFrame, timestamp_column: str) -> dict:
+    out = {}
+    for key, column in frame.items():
+        if key == timestamp_column:
+            continue
+        array = column.to_numpy(dtype=object)
+        mask = pd.isna(array)
+        out[key] = (_kind(column.dtype), array.tolist(), mask.tolist() if mask.any() else None)
+    return out
+
+
+def encode_lines(frame: pd.DataFrame, measurement: str, timestamp_column: str, tags: dict) -> Optional[list]:
+    """Line protocol of a frame, built column by column; None when the frame needs the generic serializer
+
+    Same lines as influxdb_client's DataframeSerializer (fields and tags sorted by key, missing values left out, rows
+    without any field left out, integers suffixed `i`, text quoted and escaped, nanosecond timestamps), but several
+    times faster on small frames: the serializer costs milliseconds per frame, whatever its size, and the shared writer
+    encodes one frame per model per request. Only the column named `timestamp_column` is the timestamp (the serializer
+    also took a column whose name is part of it, such as "time" or "e" for "_time").
+    """
+    columns = frame.columns.tolist()
+    if not all(isinstance(c, str) for c in columns) or len(set(columns)) != len(columns) or timestamp_column not in columns:
+        return None
+    if len(columns) < 2:
+        return None
+    stamps = _nanoseconds(frame[timestamp_column])
+    if stamps is None:
+        return None
+    tag_items = sorted((str(k), str(v)) for k, v in tags.items() if k not in columns)  # a column wins over a tag
+    if any(v == "" for _, v in tag_items):
+        return None
+    dtypes = frame.dtypes.tolist()
+    timestamp = columns.index(timestamp_column)
+    numeric = all(isinstance(t, np.dtype) and t.kind in "fiub" for i, t in enumerate(dtypes) if i != timestamp)
+    fields = _numbers(frame, dtypes, timestamp) if numeric else _any_values(frame, timestamp_column)
+    head = str(measurement).translate(_ESCAPE_MEASUREMENT)
+    head += "".join(f",{k.translate(_ESCAPE_KEY)}={v.translate(_ESCAPE_KEY)}" for k, v in tag_items) + " "
+    parts, values, missing = [], [], False
+    for key in sorted(fields):
+        name = key.translate(_ESCAPE_KEY)
+        kind, items, mask = fields[key]
+        if kind == "s":
+            items = [str(v).translate(_ESCAPE_STRING) for v in items]
+            before, after = f',{name}="', '"'
+        else:
+            before, after = f",{name}=", "i" if kind == "i" else ""
+        if mask is None:
+            parts.append(_literal(before) + "{}" + _literal(after))
+            values.append(items)
+        else:  # the whole field, or nothing, per row
+            missing = True
+            parts.append("{}")
+            values.append(["" if m else f"{before}{v}{after}" for v, m in zip(items, mask)])
+    values.append(stamps)
+    if not missing:
+        pattern = _literal(head) + "".join(parts)[1:] + " {}"
+        return _formatted(pattern.format, values)
+    pattern = "".join(parts) + " {}"
+    return [head + line[1:] for line in _formatted(pattern.format, values) if line[0] != " "]
+
+
+def _formatted(format_row, columns: list) -> list:
+    """format_row(*row) for every row, a chunk at a time: one call over thousands of rows would hold the GIL for tens of
+    milliseconds, and the threads calling capture_data() would wait as long"""
+    rows = len(columns[0])
+    if rows <= _CHUNK_ROWS:
+        return list(map(format_row, *columns))
+    lines = []
+    for start in range(0, rows, _CHUNK_ROWS):
+        lines.extend(map(format_row, *(column[start : start + _CHUNK_ROWS] for column in columns)))
+    return lines
 
 
 class _SharedClients:
@@ -200,6 +319,9 @@ class InfluxdbActions(DatabaseActions):
         frame: pd.DataFrame, data_frame_measurement_name: str, data_frame_timestamp_column: str, tags: dict, **_
     ) -> list:
         """Line protocol of prepared rows (nanosecond timestamps); rows without any field are left out"""
+        lines = encode_lines(frame, data_frame_measurement_name, data_frame_timestamp_column, tags)
+        if lines is not None:
+            return lines
         point_settings = PointSettings(**{key: str(value) for key, value in tags.items()})
         return DataframeSerializer(
             frame,

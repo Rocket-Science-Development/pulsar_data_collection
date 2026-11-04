@@ -58,14 +58,16 @@ def _kind(value) -> str:
     return "s"
 
 
-def split_mixed_objects(frame: pd.DataFrame) -> list:
+def split_mixed_objects(frame: pd.DataFrame, signature: Optional[tuple] = None) -> list:
     """Split a frame whose object columns mix numbers, booleans and strings into frames of one kind per column
 
     The storage serializes an object column as strings: one string in a float column made every row of the batch
     conflict with the stored float field. Each part gets its column converted (float, bool or str), so that only the
-    rows really in conflict are refused.
+    rows really in conflict are refused. `signature` (from `_signature`) spares reading the dtypes again.
     """
-    mixed = [c for c in frame.columns if frame[c].dtype == object and pd.api.types.infer_dtype(frame[c], skipna=True) in _MIXED]
+    columns, dtypes = signature or _signature(frame)
+    objects = [c for c, dtype in zip(columns, dtypes) if dtype == "object"]
+    mixed = [c for c in objects if pd.api.types.infer_dtype(frame[c], skipna=True) in _MIXED]
     if not mixed:
         return [frame]
     groups: dict = {}
@@ -511,7 +513,7 @@ class SharedWriter:
             key = (id(channel), id(entry.meta), _signature(entry.frame))
             groups.setdefault(key, (channel, entry.meta, []))[2].append(entry)
         tops, units = [], []
-        for channel, meta, entries in groups.values():
+        for (_, _, signature), (channel, meta, entries) in groups.items():
             frames = [e.frame for e in entries]
             frame = pd.concat(frames, ignore_index=True) if len(frames) > 1 else frames[0]
             files = [e.wal for e in entries if e.wal is not None]
@@ -519,7 +521,7 @@ class SharedWriter:
             whole = not files or len(files) == len(entries)
             top = _Unit(channel, frame, meta, [len(f) for f in frames], replay=replay, files=files, whole=whole)
             tops.append(top)
-            parts = split_mixed_objects(frame)
+            parts = split_mixed_objects(frame, signature)
             if len(parts) == 1:
                 units.append(top)
             else:

@@ -920,18 +920,24 @@ with EvidenceOutbox(
   `{"records": [...], "sent_at": "..."}`. Records left by a crash or a kill are sent by the next outbox opened on the
   same directory.
 - **At least once.** A record leaves the store only on a 2xx answer, so a lost answer means a second send: the
-  receiver deduplicates on `evidence_id`. A record put again while pending replaces the pending copy.
+  receiver deduplicates on `evidence_id`; a 409 answer (the receiver already holds the id) counts as delivered. A
+  record put again while pending replaces the pending copy and goes to the end of the queue: the answer to a send of
+  the old version never deletes nor quarantines the new one.
 - **Retries.** Network errors, timeouts, 408, 429 and 5xx are retried with exponential backoff and jitter
-  (`retry_initial_s`, `retry_max_s`, `jitter`), honouring `Retry-After`; for ever, or `max_attempts`. 401, 403 and
-  redirects (refused, so that the token never follows them) are configuration errors: retried and logged as errors,
-  never discarded. Any other 4xx means the record itself is refused: the batch is split to find it and the record goes
-  to the quarantine table (`quarantined()`), never retried.
+  (`retry_initial_s` > 0, `retry_max_s` >= `retry_initial_s`, 0 <= `jitter` < 1), honouring `Retry-After`; for ever,
+  or `max_attempts`. 401, 403, 404, 405, 410, 421 and redirects (refused, so that the token never follows them) are
+  endpoint or configuration errors: retried and logged as errors, never discarded. Any other 4xx may mean that a
+  record is refused: the batch is split and its records sent one by one. A record refused on its own goes to the
+  quarantine table (`quarantined()`, never retried) when another record of the same batch was accepted, when it was
+  alone in its batch, or when it is too large (413). When every record of a batch is refused one by one, the request
+  is taken to be refused (schema or endpoint error), not the records: they are retried.
 - **Bounded.** At most `max_records` pending (default 100 000); beyond, `overflow="drop_oldest"` (default) or
   `"drop_newest"`, and every record lost is counted in `dropped` and logged.
 - **Secrets.** The token is never logged, shown by `repr()` or kept in errors; credentials in the URL are refused and
   the query string is left out of logs. `https` is required (`allow_http=True` for loopback tests only), every request
   has a timeout (`timeout_s`, default 10 s), and system proxies (`HTTPS_PROXY`) apply.
 - `flush(timeout_s)` sends what is pending now and waits; `close(flush=False)` leaves it on disk for the next start.
+  A closed outbox cannot be started again (`RuntimeError`): open a new one on the same directory.
 
 `stats()`: `queued`, `sent`, `retried` (record sends that failed and will be retried), `failed` (moved to the
 quarantine), `dropped`, `replaced`, `requests`, `pending`, `quarantined`, `oldest_pending_age_s`,

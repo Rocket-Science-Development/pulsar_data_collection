@@ -16,6 +16,17 @@ All notable changes to pulsar-data-collection. The format follows
   413 splits the batch. Bounded store with a counted overflow policy (`drop_oldest` or `drop_newest`), `flush()`,
   `close()`, `stats()` counters. The token is never logged, shown in `repr` or stored in errors; https and TLS
   verification are on by default (`ca_bundle` for a private CA); redirects are refused; every request has a timeout.
+- Review of `EvidenceOutbox` before release: a record put again while its old version is in flight is stored as a
+  new row, so the answer to the old version (2xx or rejection) no longer deletes or quarantines the new one; the
+  backoff exponent is capped (no `OverflowError` after about 1 000 failures) and the sending thread can no longer die
+  on an unexpected error (logged once until the next delivery); 404, 405, 410 and 421 are retried as endpoint errors
+  instead of quarantining every record; a record is quarantined only when refused on its own while another record of
+  its batch was accepted, when alone in its batch, or when too large (413), otherwise the batch is retried; 409 counts
+  as delivered; the token is redacted even when the `headers` callable fails; a failed quarantine rolls back; `sent`
+  counts only rows actually deleted (not those dropped or replaced meanwhile); `close()` with a request still in
+  progress lets the thread exit cleanly and `start()` after `close()` raises `RuntimeError`; a timed-out `flush()` no
+  longer disables batching; `retry_initial_s > 0`, `retry_max_s >= retry_initial_s` and `0 <= jitter < 1` are
+  checked (`jitter=1` is now refused).
 
 ## [0.11.0] - 2026-11-04
 

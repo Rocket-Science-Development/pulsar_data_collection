@@ -53,12 +53,60 @@ def resolve_device(device):
         return "cpu"
 
 
-def _pipeline(task: str, model: str, device=None, **kwargs):
+def _on_cpu(device) -> bool:
+    """True for the devices that run on the CPU: None (library default), "cpu", -1"""
+    return device is None or device == -1 or (isinstance(device, str) and device.lower().startswith("cpu"))
+
+
+def _cpu_dtype(device, dtype):
+    """dtype to load a model with: the given one, else float32 on the CPU (half precision is 6-14x slower there, SC-09)
+    and the checkpoint's own dtype elsewhere (None)"""
+    if dtype is not None or not _on_cpu(device):
+        return dtype
+    try:
+        import torch
+    except ImportError:  # pragma: no cover - depends on the environment
+        return None
+    return torch.float32
+
+
+def _pipeline(task: str, model: str, device=None, dtype=None, **kwargs):
     try:
         from transformers import pipeline
     except ImportError as exc:  # pragma: no cover - depends on the environment
         raise ImportError('this detector needs the "detectors" extra: pip install "pulsar-data-collection[detectors]"') from exc
-    return pipeline(task, model=model, device=resolve_device(device), **kwargs)
+    device = resolve_device(device)
+    if "torch_dtype" not in kwargs:  # the name before transformers 4.56; given, it wins
+        dtype = _cpu_dtype(device, dtype)
+        if dtype is not None:
+            kwargs["dtype" if "dtype" in inspect.signature(pipeline).parameters else "torch_dtype"] = dtype
+    return pipeline(task, model=model, device=device, **kwargs)
+
+
+_GLINER_TOKENS = re.compile(r"\w+(?:[-_]\w+)*|\S")  # GLiNER's default ("whitespace") words splitter
+_WORD_SPANS = re.compile(r"\S+")
+
+
+def _token_spans(tokenizer, text: str) -> List[tuple]:
+    """[start, end) character spans of the tokens of `text` (without special tokens); without a fast tokenizer, words
+    stand for tokens"""
+    if tokenizer is not None:
+        try:
+            return [tuple(o) for o in tokenizer(text, add_special_tokens=False, return_offsets_mapping=True)["offset_mapping"]]
+        except (NotImplementedError, KeyError, TypeError, ValueError):  # slow tokenizer: no offsets
+            pass
+    return [m.span() for m in _WORD_SPANS.finditer(text)]
+
+
+def _token_windows(spans: List[tuple], size: int, step: int) -> List[tuple]:
+    """[start, end) character spans of windows of `size` tokens every `step` tokens, the last one ending the text"""
+    windows = []
+    for first in range(0, len(spans), step):
+        last = min(first + size, len(spans)) - 1
+        windows.append((spans[first][0], spans[last][1]))
+        if last == len(spans) - 1:
+            break
+    return windows
 
 
 # --------------------------------------------------------------------------------------------------------------------
@@ -315,8 +363,27 @@ def french_benign_calibration_set() -> List[str]:
 # Text classifiers
 
 
+@dataclass
+class ClassifierScore:
+    """Detail of a classifier score (see `TextClassifierDetector.score_details`)"""
+
+    score: float  # after the calibrator, if any: what `score` returns
+    raw: float  # before the calibrator (max over the windows)
+    n_tokens: int  # tokens of the text, without the special tokens
+    tokens_seen: int  # tokens the model read: all of them unless `truncated`
+    windows: int = 1  # windows scored (more than 1 only with long_text="sliding")
+    truncated: bool = False  # the text was longer than the horizon and only its beginning was scored
+    window_scores: List[float] = field(default_factory=list)  # raw score of each window
+
+
 class TextClassifierDetector:
     """A Hugging Face text classifier as a detector: score = probability mass of the `positive_labels`
+
+    The model reads at most `max_length` tokens, special tokens included (510 text tokens at 512): its **horizon**.
+    Longer texts are either cut at the horizon (`long_text="truncate"`, default: what follows is not scored, a warning
+    is given once per detector and `score_details` reports `truncated`) or scored on sliding windows of the horizon
+    (`long_text="sliding"`: score = maximum over the windows, which raises the score of long benign texts too, so fit
+    the thresholds again in that mode).
 
     Parameters
     ----------
@@ -325,7 +392,7 @@ class TextClassifierDetector:
     device : optional
         None (CPU), "auto", "cpu", "cuda", "cuda:1" or a GPU index
     max_length : int, optional
-        Longer texts are truncated (default 512 tokens)
+        Tokens read by the model per call, special tokens included (default 512)
     name : str, optional
         Detector name, i.e. the span attribute `pulsar.detector.<name>` and the record field `det_<name>`
     positive_labels : sequence of str, optional
@@ -342,6 +409,15 @@ class TextClassifierDetector:
         Compute the score from the model's logits in double precision (default False: the pipeline's single-precision
         softmax). Above about 0.9999998 the single-precision scores are equal: benign texts and attacks that the model
         scores near 1 tie, and no threshold can separate them. Recommended before fitting a threshold
+    long_text : str, optional
+        Texts longer than the horizon: "truncate" (default) or "sliding" (windows of the horizon, maximum score)
+    overlap_tokens : int, optional
+        Tokens shared by two consecutive sliding windows (default 128), so that a payload across a window edge is read
+        whole by one of them
+    **pipeline_kwargs
+        Passed to `transformers.pipeline`, e.g. `dtype=torch.float16` on a GPU (2.5x faster on a T4 for the default
+        injection model, scores within 0.005). Without `dtype`, the model runs in float32 on the CPU and in the dtype of
+        its checkpoint elsewhere
     """
 
     name = "classifier"
@@ -360,8 +436,12 @@ class TextClassifierDetector:
         language: Optional[Callable[[str], str]] = None,
         calibrator: Optional[Callable[[float], float]] = None,
         from_logits: bool = False,
+        long_text: str = "truncate",
+        overlap_tokens: int = 128,
         **pipeline_kwargs,
     ):
+        if long_text not in ("truncate", "sliding"):
+            raise ValueError('long_text must be "truncate" or "sliding"')
         if name is not None:
             self.name = name
         if positive_labels is not None:
@@ -374,12 +454,36 @@ class TextClassifierDetector:
         self.calibrator = calibrator
         self.calibrations: Dict[str, ThresholdCalibration] = {}
         self.from_logits = from_logits
+        self.long_text, self.max_length = long_text, max_length
         if from_logits:
             pipeline_kwargs.update(top_k=None, function_to_apply="none")
         self._all_labels = "top_k" in pipeline_kwargs
         self._classify = _pipeline(
             "text-classification", model, device=device, truncation=True, max_length=max_length, **pipeline_kwargs
         )
+        if not 0 <= overlap_tokens < self.horizon:
+            raise ValueError(f"overlap_tokens must be in [0, {self.horizon})")
+        self.overlap_tokens = overlap_tokens
+        self._truncation_warned = False
+
+    @property
+    def horizon(self) -> int:
+        """Text tokens the model reads in one call: `max_length` minus the special tokens"""
+        tokenizer = getattr(self._classify, "tokenizer", None)
+        try:
+            special = int(tokenizer.num_special_tokens_to_add(pair=False))
+        except (AttributeError, TypeError, ValueError):
+            special = 2
+        return max(self.max_length - special, 1)
+
+    def windows(self, text: str) -> tuple:
+        """(windows, text tokens): the [start, end) character spans scored, one unless long_text="sliding" and the text
+        is longer than the horizon"""
+        spans = _token_spans(getattr(self._classify, "tokenizer", None), text)
+        horizon = self.horizon
+        if self.long_text == "truncate" or len(spans) <= horizon:
+            return [(0, len(text))], len(spans)
+        return _token_windows(spans, horizon, horizon - self.overlap_tokens), len(spans)
 
     def _positive_score(self, result) -> float:
         if self.from_logits:  # softmax of the logits, in double precision
@@ -391,29 +495,63 @@ class TextClassifierDetector:
             return float(sum(r["score"] for r in result if r["label"].upper() in self._positive))
         return float(result["score"] if result["label"].upper() in self._positive else 1 - result["score"])
 
+    def _run(self, chunks: List[str], batch_size: Optional[int]) -> List[float]:
+        """Raw scores of `chunks`; a single chunk without `batch_size` in a single-text call"""
+        if len(chunks) == 1 and batch_size is None:
+            if self._all_labels:  # a list in, one list of every label out per text
+                return [self._positive_score(self._classify([chunks[0]])[0])]
+            return [self._positive_score(self._classify(chunks[0])[0])]
+        return [self._positive_score(r) for r in self._classify(chunks, batch_size=batch_size or 16)]
+
+    def _details(self, texts: List[str], batch_size: Optional[int]) -> List[ClassifierScore]:
+        out: List[Optional[ClassifierScore]] = [None] * len(texts)
+        chunks, owners, sizes = [], [], {}
+        horizon = self.horizon
+        for i, text in enumerate(texts):
+            if not text:
+                out[i] = ClassifierScore(0.0, 0.0, 0, 0, windows=0)
+                continue
+            spans, n_tokens = self.windows(text)
+            sizes[i] = n_tokens
+            for s, e in spans:
+                chunks.append(text[s:e])
+                owners.append(i)
+        raws = self._run(chunks, batch_size) if chunks else []
+        per_text: Dict[int, List[float]] = {}
+        for i, raw in zip(owners, raws):
+            per_text.setdefault(i, []).append(raw)
+        longest = 0
+        for i, scores in per_text.items():
+            raw, n_tokens = max(scores), sizes[i]
+            truncated = len(scores) == 1 and n_tokens > horizon
+            longest = max(longest, n_tokens if truncated else 0)
+            value = float(self.calibrator(raw)) if self.calibrator is not None else raw
+            seen = min(n_tokens, horizon) if truncated else n_tokens
+            out[i] = ClassifierScore(value, raw, n_tokens, seen, len(scores), truncated, scores)
+        if longest and not self._truncation_warned:
+            self._truncation_warned = True
+            warnings.warn(
+                f"{type(self).__name__}: a text of {longest} tokens was cut to its first {horizon} (max_length="
+                f'{self.max_length}); what follows is not scored. Use long_text="sliding" to score every window '
+                "(and fit the thresholds again), or read `score_details(text).truncated`. Warned once per detector",
+                stacklevel=3,
+            )
+        return out
+
+    def score_details(self, text: str) -> ClassifierScore:
+        """Score with its detail: tokens of the text, tokens seen, windows, truncation"""
+        return self._details([text], None)[0]
+
     def raw_score(self, text: str) -> float:
         """Score of the model, before any calibrator"""
-        if not text:
-            return 0.0
-        if self._all_labels:  # a list in, one list of every label out per text
-            return self._positive_score(self._classify([text])[0])
-        return self._positive_score(self._classify(text)[0])
+        return self.score_details(text).raw if text else 0.0
 
     def score(self, text: str) -> float:
-        raw = self.raw_score(text)
-        return float(self.calibrator(raw)) if self.calibrator is not None and text else raw
+        return self.score_details(text).score if text else 0.0
 
     def score_many(self, texts: Sequence[str], batch_size: int = 16) -> List[float]:
-        """Scores of several texts, in one batched call"""
-        texts = list(texts)
-        out = [0.0] * len(texts)
-        idx = [i for i, t in enumerate(texts) if t]
-        if idx:
-            results = self._classify([texts[i] for i in idx], batch_size=batch_size)
-            for i, result in zip(idx, results):
-                raw = self._positive_score(result)
-                out[i] = float(self.calibrator(raw)) if self.calibrator is not None else raw
-        return out
+        """Scores of several texts, in one batched call (every window of every text with long_text="sliding")"""
+        return [d.score for d in self._details(list(texts), batch_size)]
 
     def threshold_for(self, language: Optional[str]) -> float:
         return self.thresholds.get(language, self.threshold) if language else self.threshold
@@ -433,7 +571,8 @@ class TextClassifierDetector:
         """Fit the alert threshold of `language` (or the default one) on benign texts of the deployment (A/A)
 
         The threshold is set so that at most `target_fpr` of the benign texts raise the alert. Pass known positives to
-        read the recall it costs (`.recall`): a tighter threshold for a language also misses more attacks in it.
+        read the recall it costs (`.recall`): a tighter threshold for a language also misses more attacks in it. Fit it
+        in the `long_text` mode the detector will run in: sliding windows raise the scores of long benign texts.
         """
         scores = self.score_many(benign)
         result = calibrate_threshold(scores, target_fpr, "high", self.score_many(positives) if positives else None)
@@ -466,6 +605,11 @@ class InjectionDetector(TextClassifierDetector):
     The default model over-flags benign French imperatives ("Ouvrez-moi un dossier"): fit a French threshold with
     `calibrate(benign_fr, language="fr")` (e.g. on `french_benign_calibration_set()`, then on real traffic). It does
     not detect harmful requests without an injection wrapper: see `ContentSafetyDetector`.
+
+    It reads 510 tokens (`max_length=512`): an injection appended to a 2000-token text was flagged in 10 % of the cases
+    (SC-09). Pass `long_text="sliding"` to score every window of long texts, and fit its thresholds in that mode;
+    `score_details(text)` tells the tokens seen. Half precision on a GPU: `InjectionDetector(device="cuda",
+    dtype=torch.float16)` (any keyword argument reaches `transformers.pipeline`).
     """
 
     name = "injection"

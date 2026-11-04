@@ -10,6 +10,7 @@ import pytest
 
 import pulsar_data_collection.genai.detectors as detectors
 from pulsar_data_collection.genai.detectors import (
+    FaithfulnessScorer,
     InjectionDetector,
     ModelPiiDetector,
     PiiScan,
@@ -222,3 +223,160 @@ def test_scan_many_batches_the_short_texts(token_gliner):
         and many[-2].windows == 0
     )
     assert [Finding("person_name", 20, 28, 0.9)] == list(many[1])
+
+
+# ------------------------------------------------------------------------------------------------------- faithfulness
+
+FACT = "The application fee for the Riverbend renovation permit is 245 dollars, payable at the city office."
+CLAIM = "The Riverbend renovation permit application fee is 245 dollars."
+
+
+def diluting_nli_pipeline(task, model, device=None, **kwargs):
+    """Like the real model, the entailment of a supported claim falls with the unrelated text in its premise"""
+    calls = []
+
+    def one(pair):
+        premise = pair["text"].lower().replace(",", " ").replace(".", " ").split()
+        supported = all(
+            w in premise for w in pair["text_pair"].lower().replace(".", " ").split()
+        )
+        score = 0.9 * min(1.0, 30 / len(premise)) if supported else 0.02
+        return [
+            {"label": "entailment", "score": score},
+            {"label": "neutral", "score": 1 - score},
+        ]
+
+    def nli(pairs, batch_size=None):
+        calls.append(len(pairs))
+        results = [one(p) for p in pairs]
+        return results[0] if len(results) == 1 else results
+
+    nli.calls = calls
+    return nli
+
+
+def test_support_does_not_depend_on_where_the_evidence_falls_with_sentence_premises(
+    monkeypatch,
+):
+    """SC-09 (P2 3.19): in token windows, a supported sentence scored lower in a full window (start of a long context)
+    than in the short last window (end); premises cut at sentence boundaries give the same support at both ends
+    """
+    monkeypatch.setattr(detectors, "_pipeline", diluting_nli_pipeline)
+    filler = " ".join(
+        f"Sentence {i} of the annual report describes another regional office."
+        for i in range(70)
+    )
+    start, end = [FACT + " " + filler], [filler + " " + FACT]
+    tokens = FaithfulnessScorer(lexical_threshold=None)
+    assert (
+        tokens.score(CLAIM, end) - tokens.score(CLAIM, start) > 0.1
+    )  # the limit: support depends on the window
+
+    sentences = FaithfulnessScorer(lexical_threshold=None, premise_split="sentences")
+    at_start, at_end = sentences.details(CLAIM, start), sentences.details(CLAIM, end)
+    assert (
+        at_start.score > 0.8
+        and at_end.score > 0.8
+        and abs(at_start.score - at_end.score) < 0.05
+    )
+    assert at_start.windows == 70 and at_start.premise_tokens == len(
+        (FACT + " " + filler).split()
+    )
+    assert (
+        sentences._nli.calls[-1] == 4
+    )  # the 4 groups closest to the claim, not all 70
+    assert sentences.score(CLAIM, [filler]) == pytest.approx(
+        0.02
+    )  # absent evidence stays unsupported
+    every = FaithfulnessScorer(
+        lexical_threshold=None, premise_split="sentences", top_k_premises=None
+    )
+    assert (
+        every.score(CLAIM, end) == pytest.approx(at_end.score)
+        and every._nli.calls[-1] == 70
+    )
+    with pytest.raises(ValueError):
+        FaithfulnessScorer(premise_split="paragraphs")
+    with pytest.raises(ValueError):
+        FaithfulnessScorer(premise_split="sentences", premise_sentences=0)
+
+
+def test_a_long_sentence_group_is_cut_into_token_windows(monkeypatch):
+    monkeypatch.setattr(detectors, "_pipeline", diluting_nli_pipeline)
+    scorer = FaithfulnessScorer(
+        premise_split="sentences",
+        window_tokens=10,
+        stride_tokens=5,
+        premise_sentences=1,
+    )
+    groups = scorer.premise_groups(
+        ["one two three four five six seven eight nine ten eleven twelve. Short one."]
+    )
+    assert groups == [
+        "one two three four five six seven eight nine ten",
+        "six seven eight nine ten eleven twelve.",
+        "Short one.",
+    ]
+
+
+# -------------------------------------------------------------------------------------------------------------- dtype
+
+
+def test_models_run_in_float32_on_the_cpu_and_take_a_dtype(monkeypatch):
+    """SC-09 (P2 3.13): the NLI checkpoint is float16 and ran so on the CPU, 6-14x slower than float32, with no
+    option; every detector now takes `dtype`, float32 is the CPU default, the checkpoint's dtype is kept elsewhere
+    """
+    seen = []
+
+    def pipeline(task, model=None, device=None, dtype=None, **kwargs):
+        seen.append({"device": device, "dtype": dtype, **kwargs})
+        return lambda *a, **k: None
+
+    def old_pipeline(
+        task, model=None, device=None, torch_dtype=None, **kwargs
+    ):  # transformers < 4.56
+        seen.append({"device": device, "torch_dtype": torch_dtype})
+        return lambda *a, **k: None
+
+    transformers = types.SimpleNamespace(pipeline=pipeline)
+    monkeypatch.setitem(sys.modules, "transformers", transformers)
+    monkeypatch.setitem(
+        sys.modules,
+        "torch",
+        types.SimpleNamespace(float32="float32", float16="float16"),
+    )
+    FaithfulnessScorer()
+    FaithfulnessScorer(device="cuda:0")
+    FaithfulnessScorer(device="cuda:0", dtype="float16")
+    InjectionDetector(device="cpu")
+    InjectionDetector(device=0, dtype="float16")
+    assert [(s["device"], s["dtype"]) for s in seen] == [
+        (None, "float32"),
+        ("cuda:0", None),
+        ("cuda:0", "float16"),
+        ("cpu", "float32"),
+        (0, "float16"),
+    ]
+    assert (
+        seen[0]["top_k"] is None
+        and seen[0]["truncation"]
+        and seen[0]["max_length"] == 512
+    )
+    transformers.pipeline = old_pipeline
+    FaithfulnessScorer()
+    assert seen[-1] == {"device": None, "torch_dtype": "float32"}
+
+    class Gliner(TokenGliner):
+        def parameters(self):
+            return iter(
+                [types.SimpleNamespace(dtype="float16")]
+            )  # a half-precision checkpoint
+
+    monkeypatch.setitem(sys.modules, "gliner", types.SimpleNamespace(GLiNER=Gliner))
+    assert ModelPiiDetector(rules=NoRules())._model.dtypes == ["float32"]
+    assert ModelPiiDetector(rules=NoRules(), device="cuda:0")._model.dtypes == [
+        None
+    ]  # moved, dtype kept
+    assert ModelPiiDetector(
+        rules=NoRules(), device="cuda:0", dtype="float16"
+    )._model.dtypes == [None, "float16"]

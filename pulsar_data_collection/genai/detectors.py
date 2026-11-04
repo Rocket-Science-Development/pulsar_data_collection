@@ -916,7 +916,7 @@ class FaithfulnessResult:
     sentences_total: int = 0  # sentences of at least 3 words in the answer
     sentences_scored: int = 0  # at most max_sentences of them
     premise_tokens: int = 0
-    windows: int = 0  # premise windows (1 when the premise fits)
+    windows: int = 0  # premise windows (1 when the premise fits), or sentence groups with premise_split="sentences"
     truncated: bool = False  # the premise did not fit and was cut (windowing disabled)
 
     @property
@@ -950,6 +950,22 @@ class FaithfulnessScorer:
         entailment of long hypotheses falls with their length
     aggregate : str, optional
         "mean" (default) or "min" (weakest sentence) for `score`
+    premise_split : str, optional
+        "tokens" (default): the token windows above. In a window of 400 tokens, the support of a sentence falls with
+        the unrelated text around its evidence (median 0.32 in a full window against 0.62 in the short last window of a
+        500-token context, SC-09). "sentences": the passages are cut at sentence boundaries into groups of
+        `premise_sentences` consecutive sentences (one group per starting sentence, so neighbours are read together)
+        and each answer sentence is judged against the `top_k_premises` groups that share the most words with it: its
+        support no longer depends on where the evidence falls. Fit the alert threshold again in that mode
+    premise_sentences : int, optional
+        Sentences per premise group (default 2)
+    top_k_premises : int, optional
+        Premise groups judged per answer sentence (default 4; None = all of them, one model call per group)
+    dtype : optional
+        torch dtype of the model; default float32 on the CPU (the default model's checkpoint is float16, 6-14x slower
+        there, SC-09) and the checkpoint's own dtype on a GPU
+    **pipeline_kwargs
+        Passed to `transformers.pipeline`
     """
 
     name = "faithfulness"
@@ -966,12 +982,25 @@ class FaithfulnessScorer:
         max_claim_words: Optional[int] = None,
         aggregate: str = "mean",
         batch_size: int = 16,
+        premise_split: str = "tokens",
+        premise_sentences: int = 2,
+        top_k_premises: Optional[int] = 4,
+        dtype=None,
+        **pipeline_kwargs,
     ):
         if window_tokens is not None and not 0 < stride_tokens <= window_tokens:
             raise ValueError("stride_tokens must be in (0, window_tokens]")
         if aggregate not in ("mean", "min"):
             raise ValueError('aggregate must be "mean" or "min"')
-        self._nli = _pipeline("text-classification", model, device=device, truncation=True, max_length=512, top_k=None)
+        if premise_split not in ("tokens", "sentences"):
+            raise ValueError('premise_split must be "tokens" or "sentences"')
+        if premise_sentences < 1 or (top_k_premises is not None and top_k_premises < 1):
+            raise ValueError("premise_sentences and top_k_premises must be at least 1")
+        pipeline_kwargs.setdefault("truncation", True)
+        pipeline_kwargs.setdefault("max_length", 512)
+        pipeline_kwargs.setdefault("top_k", None)
+        self._nli = _pipeline("text-classification", model, device=device, dtype=dtype, **pipeline_kwargs)
+        self.premise_split, self.premise_sentences, self.top_k_premises = premise_split, premise_sentences, top_k_premises
         self.window_tokens, self.stride_tokens = window_tokens, stride_tokens
         self.max_sentences, self.lexical_threshold, self.max_claim_words = max_sentences, lexical_threshold, max_claim_words
         self.aggregate, self.batch_size = aggregate, batch_size
@@ -984,28 +1013,42 @@ class FaithfulnessScorer:
         return self._entail(self._nli({"text": premise, "text_pair": hypothesis}))
 
     def _token_spans(self, premise: str) -> List[tuple]:
-        tokenizer = getattr(self._nli, "tokenizer", None)
-        if tokenizer is not None:
-            try:
-                return [
-                    tuple(o) for o in tokenizer(premise, add_special_tokens=False, return_offsets_mapping=True)["offset_mapping"]
-                ]
-            except (NotImplementedError, KeyError, TypeError):  # slow tokenizer: no offsets
-                pass
-        return [m.span() for m in _WORD_SPANS.finditer(premise)]  # without a fast tokenizer, words stand for tokens
+        return _token_spans(getattr(self._nli, "tokenizer", None), premise)
 
     def premise_windows(self, premise: str) -> tuple:
         """(windows, premise tokens): the premise cut into overlapping windows of `window_tokens` tokens"""
         spans = self._token_spans(premise)
         if self.window_tokens is None or len(spans) <= self.window_tokens:
             return [premise], len(spans)
-        windows = []
-        for first in range(0, len(spans), self.stride_tokens):
-            last = min(first + self.window_tokens, len(spans)) - 1
-            windows.append(premise[spans[first][0] : spans[last][1]])
-            if last == len(spans) - 1:
-                break
-        return windows, len(spans)
+        return [premise[s:e] for s, e in _token_windows(spans, self.window_tokens, self.stride_tokens)], len(spans)
+
+    def premise_groups(self, context: Sequence[str]) -> List[str]:
+        """The passages cut at sentence boundaries into groups of `premise_sentences` consecutive sentences (one group
+        per starting sentence); a group longer than `window_tokens` (400 if None) is cut into token windows"""
+        sentences = [s for p in context if p for s in _SENTENCES.split(p.strip()) if s]
+        size = self.premise_sentences
+        groups = [" ".join(sentences[i : i + size]) for i in range(max(len(sentences) - size + 1, 1))]
+        limit = self.window_tokens or 400
+        out = []
+        for group in groups:
+            spans = self._token_spans(group)
+            if len(spans) <= limit:
+                out.append(group)
+            else:
+                out += [group[s:e] for s, e in _token_windows(spans, limit, min(self.stride_tokens, limit))]
+        return out
+
+    @staticmethod
+    def _content_words(text: str) -> set:
+        return {w for w in _norm_words(text) if len(w) >= 3 or any(c.isdigit() for c in w)}
+
+    def _closest(self, claim: str, groups: List[str], words: List[set]) -> List[str]:
+        """The `top_k_premises` groups sharing the most content words with `claim` (all of them if None)"""
+        if self.top_k_premises is None or len(groups) <= self.top_k_premises:
+            return groups
+        own = self._content_words(claim)
+        ranked = sorted(range(len(groups)), key=lambda j: (-len(own & words[j]), j))
+        return [groups[j] for j in sorted(ranked[: self.top_k_premises])]
 
     def _claims(self, answer: str) -> List[str]:
         sentences = [s for s in _SENTENCES.split(answer.strip()) if len(s.split()) >= 3]
@@ -1035,7 +1078,10 @@ class FaithfulnessScorer:
         scored = claims if max_sentences is None else claims[:max_sentences]
         if not scored or not premise:
             return FaithfulnessResult(None, None, sentences_total=len(claims))  # nothing to judge
-        windows, n_tokens = self.premise_windows(premise)
+        if self.premise_split == "sentences":
+            windows, n_tokens = self.premise_groups(context), len(self._token_spans(premise))
+        else:
+            windows, n_tokens = self.premise_windows(premise)
         support = [0.0] * len(scored)
         lexical = [False] * len(scored)
         if self.lexical_threshold is not None:
@@ -1044,7 +1090,11 @@ class FaithfulnessScorer:
                 own = _trigrams(_norm_words(s))
                 if own and sum(g in grams for g in own) / len(own) >= self.lexical_threshold:
                     support[i], lexical[i] = 1.0, True
-        pairs = [(i, w) for i in range(len(scored)) if not lexical[i] for w in windows]
+        if self.premise_split == "sentences":
+            words = [self._content_words(w) for w in windows]
+            pairs = [(i, w) for i in range(len(scored)) if not lexical[i] for w in self._closest(scored[i], windows, words)]
+        else:
+            pairs = [(i, w) for i in range(len(scored)) if not lexical[i] for w in windows]
         if pairs:
             outputs = self._nli([{"text": w, "text_pair": scored[i]} for i, w in pairs], batch_size=self.batch_size)
             if outputs and isinstance(outputs[0], dict):

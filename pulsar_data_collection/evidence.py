@@ -11,12 +11,18 @@ Delivery:
 - a background thread POSTs the pending records in batches, oldest first, as one JSON object
   `{"records": [...], "sent_at": "<UTC ISO 8601>"}`. A record leaves the store only when the receiver answered 2xx;
 - delivery is at least once: a record whose answer was lost (timeout, crash after the send) is sent again. The
-  receiver deduplicates on `evidence_id`. A record put again while still pending replaces the pending copy (same id,
-  sent once);
+  receiver deduplicates on `evidence_id`. A record put again while still pending replaces the pending copy (same id;
+  the new version takes a new place at the end of the queue, and the answer to a send of the old version, delivered
+  or rejected, never deletes nor quarantines the new one);
+- 2xx and 409 (the receiver already holds this `evidence_id`) count as delivered;
 - network errors, timeouts, 408, 429 and 5xx are retried for ever (or `max_attempts`) with exponential backoff and
-  jitter, honouring `Retry-After`. 401, 403 and redirects are configuration errors: retried with backoff and logged,
-  never discarded. Any other 4xx rejects the record itself ("poison"): the batch is split to find it, and the record
-  is moved to the quarantine table (kept for inspection, counted in `failed`), never retried;
+  jitter, honouring `Retry-After`. 401, 403, 404, 405, 410, 421 and redirects are endpoint or configuration errors
+  (credentials, URL, method): retried with backoff and logged, never discarded. Any other 4xx may reject the record
+  itself ("poison"): the batch is split and the records sent one by one. A record refused on its own is moved to the
+  quarantine table (kept for inspection, counted in `failed`, never retried) when another record of the same batch
+  was accepted, when it was alone in its batch, or when it is too large (413). When every record of a batch is
+  refused one by one, the receiver is taken to refuse the request rather than the records (schema or endpoint
+  error): they are retried with backoff;
 - the store is bounded (`max_records` pending): beyond it `overflow` decides, "drop_oldest" (default) or
   "drop_newest", and every record lost that way is counted in `dropped` and logged.
 
@@ -45,6 +51,9 @@ logger = logging.getLogger("pulsar_data_collection")
 DATABASE_NAME = "evidence_outbox.sqlite3"
 RETRYABLE_STATUS = (408, 429)  # with every 5xx
 CONFIGURATION_STATUS = (401, 403)  # wrong or expired credentials: retried, never discarded
+ENDPOINT_STATUS = (404, 405, 410, 421)  # wrong URL or method, or endpoint gone: retried like credentials errors
+DELIVERED_STATUS = (409,)  # conflict: the receiver already holds this evidence_id
+MAX_BACKOFF_EXPONENT = 60  # 2 ** (failures - 1) is capped: no float overflow after a long outage
 SPLIT_STATUS = (413,)  # payload too large: the batch is split, a single record too large is quarantined
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS outbox (
@@ -68,7 +77,7 @@ CREATE TABLE IF NOT EXISTS quarantine (
 
 
 class EvidenceRejected(Exception):
-    """The receiver refused a request for its content (4xx other than 401, 403, 408, 429)"""
+    """The receiver refused a request for its content (4xx other than 401, 403, 404, 405, 408, 409, 410, 421, 429)"""
 
 
 class _Secret:
@@ -147,7 +156,8 @@ class EvidenceOutbox:
         CA bundle file to verify the receiver's certificate (private or ministry CA)
     retry_initial_s, retry_max_s, jitter : float, optional
         Backoff after the n-th consecutive failure: min(retry_max_s, retry_initial_s * 2^(n-1)), reduced by a random
-        share of at most `jitter` (default 1 s, 300 s, 0.5)
+        share of at most `jitter` (default 1 s, 300 s, 0.5). retry_initial_s > 0, retry_max_s >= retry_initial_s and
+        0 <= jitter < 1
     max_attempts : int, optional
         Attempts after which a record is moved to the quarantine (default None: retried until delivered)
     poll_interval_s : float, optional
@@ -189,8 +199,10 @@ class EvidenceOutbox:
             raise ValueError("overflow must be 'drop_oldest' or 'drop_newest'")
         if max_records < 1 or batch_size < 1 or timeout_s <= 0:
             raise ValueError("max_records and batch_size must be >= 1, timeout_s > 0")
-        if not 0 <= jitter <= 1:
-            raise ValueError("jitter must be between 0 and 1")
+        if not 0 <= jitter < 1:
+            raise ValueError("jitter must be >= 0 and < 1")
+        if not retry_initial_s > 0 or not retry_max_s >= retry_initial_s:
+            raise ValueError("retry_initial_s must be > 0 and retry_max_s >= retry_initial_s")
         self._url = url
         self.url = _safe_url(url)
         self.directory = Path(directory)
@@ -231,6 +243,8 @@ class EvidenceOutbox:
         self._last_error: Optional[str] = None
         self._flush_requested = False
         self._closing = False
+        self._closed = False  # the store is closed: the thread exits, start() is refused
+        self._unexpected_logged = False  # an unexpected error of the thread is logged once until the next delivery
         self._thread: Optional[threading.Thread] = None
         pending = self._pending_count()
         if pending:
@@ -243,7 +257,9 @@ class EvidenceOutbox:
 
     # ------------------------------------------------------------------ public API
     def start(self) -> None:
-        """Start the sending thread (done by the constructor unless start=False)"""
+        """Start the sending thread (done by the constructor unless start=False); RuntimeError once closed"""
+        if self._closed:
+            raise RuntimeError("evidence outbox is closed: open a new one on the same directory")
         if self._thread is None or not self._thread.is_alive():
             self._closing = False
             self._thread = threading.Thread(target=self._run, name="pulsar-evidence-outbox", daemon=True)
@@ -291,15 +307,19 @@ class EvidenceOutbox:
             self._flush_requested = True
             self._retry_at = 0.0
             self._wake.notify_all()
-        while time.monotonic() < deadline:
+        try:
+            while time.monotonic() < deadline:
+                with self._wake:
+                    if self._pending_count() == 0:
+                        return True
+                    if self._thread is None or not self._thread.is_alive():
+                        return False
+                    self._wake.wait(min(0.05, max(0.0, deadline - time.monotonic())))
             with self._wake:
-                if self._pending_count() == 0:
-                    return True
-                if self._thread is None or not self._thread.is_alive():
-                    return False
-                self._wake.wait(min(0.05, max(0.0, deadline - time.monotonic())))
-        with self._wake:
-            return self._pending_count() == 0
+                return self._pending_count() == 0
+        finally:
+            with self._wake:
+                self._flush_requested = False  # a flush that timed out must not disable the batching of later records
 
     def close(self, timeout_s: float = 10.0, flush: bool = True) -> None:
         """Flush (unless flush=False), stop the thread and close the store; what is still pending stays on disk and is
@@ -311,8 +331,13 @@ class EvidenceOutbox:
             self._wake.notify_all()
         if self._thread is not None:
             self._thread.join(max(timeout_s, self.timeout_s + 1))  # a request in progress ends within timeout_s
+            if self._thread.is_alive():
+                logger.warning("Evidence outbox: the sending thread is still busy at close; it stops after its request")
         with self._lock:
+            if self._closed:
+                return
             pending = self._pending_count()
+            self._closed = True  # set before the close: a thread still in a request then exits without the store
             self._db.close()
         if pending:
             logger.warning("Evidence outbox closed with %d records pending: they will be sent at the next start", pending)
@@ -358,8 +383,12 @@ class EvidenceOutbox:
         return self._db.execute("SELECT COUNT(*) FROM outbox").fetchone()[0]
 
     def _insert(self, evidence_id: str, body: str) -> int:
-        replaced = self._db.execute("UPDATE outbox SET body = ? WHERE evidence_id = ?", (body, evidence_id)).rowcount
-        if replaced:
+        old = self._db.execute("SELECT seq, queued_at FROM outbox WHERE evidence_id = ?", (evidence_id,)).fetchone()
+        if old:
+            # a new row (new seq), not an UPDATE: the answer to a send of the old version, which may be in flight,
+            # deletes or quarantines the old seq only, never the new version
+            self._db.execute("DELETE FROM outbox WHERE seq = ?", (old[0],))
+            self._db.execute("INSERT INTO outbox (evidence_id, body, queued_at) VALUES (?, ?, ?)", (evidence_id, body, old[1]))
             self._stats["replaced"] += 1
             return 1
         if self._pending_count() >= self.max_records:
@@ -386,44 +415,52 @@ class EvidenceOutbox:
             batch.append(row)
         return batch
 
-    def _delete(self, seqs: list[int]) -> None:
-        self._db.executemany("DELETE FROM outbox WHERE seq = ?", [(s,) for s in seqs])
+    def _delete(self, seqs: list[int]) -> int:
+        """Delete delivered rows; returns how many were still pending (not replaced nor dropped meanwhile)"""
+        return self._db.executemany("DELETE FROM outbox WHERE seq = ?", [(s,) for s in seqs]).rowcount
 
     def _quarantine(self, rows: list[tuple], status_code: Optional[int], reason: str) -> None:
-        now = time.time()
+        """Move rows to the quarantine; a row no longer pending (replaced or dropped meanwhile) is skipped"""
+        now, moved = time.time(), []
         self._db.execute("BEGIN IMMEDIATE")
-        for seq, evidence_id, body, _ in rows:
-            queued_at = self._db.execute("SELECT queued_at FROM outbox WHERE seq = ?", (seq,)).fetchone()
-            self._db.execute(
-                "INSERT INTO quarantine (evidence_id, body, queued_at, quarantined_at, status_code, reason) "
-                "VALUES (?, ?, ?, ?, ?, ?)",
-                (evidence_id, body, queued_at[0] if queued_at else now, now, status_code, reason),
-            )
-            self._db.execute("DELETE FROM outbox WHERE seq = ?", (seq,))
-        self._db.execute("COMMIT")
-        self._stats["failed"] += len(rows)
-        logger.error(
-            "Evidence outbox: %d record(s) moved to the quarantine (%s): %s",
-            len(rows),
-            reason,
-            ", ".join(r[1] for r in rows[:5]),
-        )
+        try:
+            for seq, evidence_id, _, _ in rows:
+                row = self._db.execute("SELECT body, queued_at FROM outbox WHERE seq = ?", (seq,)).fetchone()
+                if row is None:
+                    continue
+                self._db.execute(
+                    "INSERT INTO quarantine (evidence_id, body, queued_at, quarantined_at, status_code, reason) "
+                    "VALUES (?, ?, ?, ?, ?, ?)",
+                    (evidence_id, row[0], row[1], now, status_code, reason),
+                )
+                self._db.execute("DELETE FROM outbox WHERE seq = ?", (seq,))
+                moved.append(evidence_id)
+            self._db.execute("COMMIT")
+        except BaseException:
+            self._db.execute("ROLLBACK")
+            raise
+        if not moved:
+            return
+        self._stats["failed"] += len(moved)
+        logger.error("Evidence outbox: %d record(s) moved to the quarantine (%s): %s", len(moved), reason, ", ".join(moved[:5]))
 
     # ------------------------------------------------------------------ sending
-    def _request_headers(self) -> dict:
+    def _bearer_token(self) -> Optional[str]:
+        return self._token.get() or (os.environ.get(self._token_env) if self._token_env else None)
+
+    def _request_headers(self, token: Optional[str]) -> dict:
         headers = {"Content-Type": "application/json", "User-Agent": "pulsar-data-collection evidence outbox"}
-        token = self._token.get() or (os.environ.get(self._token_env) if self._token_env else None)
         if token:
             headers["Authorization"] = f"Bearer {token}"
         if self._headers is not None:
             headers.update(self._headers() or {})
         return headers
 
-    def _secrets(self, headers: dict) -> list[str]:
+    def _secrets(self, headers: dict, token: Optional[str] = None) -> list[str]:
         values = [v for k, v in headers.items() if k.lower() in ("authorization", "proxy-authorization", "x-api-key")]
         values += [v.split(" ", 1)[1] for v in values if " " in v]
-        token = self._token.get()
-        return [s for s in values + ([token] if token else []) if s]
+        tokens = [t for t in (token, self._token.get()) if t]
+        return [s for s in values + tokens if isinstance(s, str) and s]
 
     @staticmethod
     def _redact(text: str, secrets: list[str]) -> str:
@@ -435,10 +472,12 @@ class EvidenceOutbox:
         """(outcome, status, retry_after, error): outcome "sent", "retry", "rejected" or "split" """
         body = '{"records":[' + ",".join(r[2] for r in rows) + '],"sent_at":'
         body += json.dumps(datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")) + "}"
-        headers, secrets = {}, []
+        secrets: list[str] = []
         try:
-            headers = self._request_headers()
-            secrets = self._secrets(headers)
+            token = self._bearer_token()
+            secrets = self._secrets({}, token)  # before the header callable: its error message may hold the token
+            headers = self._request_headers(token)
+            secrets = self._secrets(headers, token)
             request = urllib.request.Request(self._url, data=body.encode("utf-8"), headers=headers, method="POST")
             # the scheme is checked in __init__ (https, or http when allowed): no file:// or custom scheme
             with self._opener.open(request, timeout=self.timeout_s) as response:  # nosec B310
@@ -449,9 +488,11 @@ class EvidenceOutbox:
             retry_after = _retry_after(error.headers.get("Retry-After") if error.headers else None)
             error.close()
             reason = f"HTTP {status} {self._redact(str(error.reason or ''), secrets)}".strip()
+            if status in DELIVERED_STATUS:
+                return "sent", status, None, None
             if status in RETRYABLE_STATUS or status >= 500:
                 return "retry", status, retry_after, reason
-            if status in CONFIGURATION_STATUS or 300 <= status < 400:
+            if status in CONFIGURATION_STATUS or status in ENDPOINT_STATUS or 300 <= status < 400:
                 return "retry", status, retry_after, reason + " (configuration: credentials or URL)"
             if status in SPLIT_STATUS and len(rows) > 1:
                 return "split", status, None, reason
@@ -461,7 +502,8 @@ class EvidenceOutbox:
             return "retry", None, None, text[:500]
 
     def _backoff(self, retry_after: Optional[float]) -> float:
-        delay = min(self.retry_max_s, self.retry_initial_s * 2 ** (self._failures - 1))
+        exponent = min(max(self._failures - 1, 0), MAX_BACKOFF_EXPONENT)
+        delay = min(self.retry_max_s, self.retry_initial_s * 2.0**exponent)
         # jitter, not cryptography
         delay *= 1 - self.jitter * random.random()  # nosec B311
         if retry_after is not None:
@@ -469,70 +511,119 @@ class EvidenceOutbox:
         return delay
 
     def _send(self, rows: list[tuple]) -> None:
-        """Send rows; on a content rejection of several rows, send them one by one to find the poison record"""
+        """Send rows; on a content rejection of several rows, send them one by one to find the poison records"""
         outcome, status, retry_after, error = self._post(rows)
         with self._lock:
             self._stats["requests"] += 1
             if outcome == "sent":
-                self._delete([r[0] for r in rows])
-                self._stats["sent"] += len(rows)
-                if self._failures:
-                    logger.info("Evidence outbox: %s reachable again", self.url)
-                self._failures, self._retry_at, self._last_error = 0, 0.0, None
+                self._delivered(rows)
                 return
             self._last_error = error
             if outcome == "rejected":
                 self._quarantine(rows, status, error)
                 return
             if outcome == "retry":
-                self._failures += 1
-                delay = self._backoff(retry_after)
-                self._retry_at = time.monotonic() + delay
-                self._stats["retried"] += len(rows)
-                self._db.executemany(
-                    "UPDATE outbox SET attempts = attempts + 1, last_error = ? WHERE seq = ?", [(error, r[0]) for r in rows]
-                )
-                log = logger.error if status in CONFIGURATION_STATUS else logger.warning
-                log("Evidence outbox: %d records not sent to %s (%s), retry in %.1f s", len(rows), self.url, error, delay)
-                if self.max_attempts is not None:
-                    spent = [r for r in rows if r[3] + 1 >= self.max_attempts]
-                    if spent:
-                        self._quarantine(spent, status, f"{self.max_attempts} attempts: {error}")
+                self._retry(rows, status, retry_after, error)
                 return
-        for row in rows:  # split: one request per record
+        accepted, refused = 0, []  # split: one request per record
+        for row in rows:
             if self._closing or time.monotonic() < self._retry_at:
-                return
-            self._send([row])
+                break  # the records not sent yet stay pending
+            outcome, status, retry_after, error = self._post([row])
+            with self._lock:
+                self._stats["requests"] += 1
+                if outcome == "sent":
+                    self._delivered([row])
+                    accepted += 1
+                    continue
+                self._last_error = error
+                if outcome == "retry":
+                    self._retry([row], status, retry_after, error)
+                else:
+                    refused.append((row, status, error))
+        with self._lock:
+            # poison: refused on its own while another record of the batch was accepted, or too large on its own
+            poison = [r for r in refused if accepted or r[1] in SPLIT_STATUS]
+            for row, status, error in poison:
+                self._quarantine([row], status, error)
+            rest = [r for r in refused if r not in poison]
+            if rest:
+                # every record refused on its own and none accepted: the request is refused, not the records
+                error = f"{rest[-1][2]} (every record of the batch refused: endpoint or schema error?)"
+                self._last_error = error
+                self._retry([r[0] for r in rest], rest[-1][1], None, error)
+
+    def _delivered(self, rows: list[tuple]) -> None:
+        self._stats["sent"] += self._delete([r[0] for r in rows])  # rows replaced or dropped meanwhile are not counted
+        if self._failures:
+            logger.info("Evidence outbox: %s reachable again", self.url)
+        self._failures, self._retry_at, self._last_error = 0, 0.0, None
+        self._unexpected_logged = False
+
+    def _retry(self, rows: list[tuple], status: Optional[int], retry_after: Optional[float], error: Optional[str]) -> None:
+        self._failures += 1
+        delay = self._backoff(retry_after)
+        self._retry_at = time.monotonic() + delay
+        self._stats["retried"] += len(rows)
+        self._db.executemany(
+            "UPDATE outbox SET attempts = attempts + 1, last_error = ? WHERE seq = ?", [(error, r[0]) for r in rows]
+        )
+        log = logger.error if status in CONFIGURATION_STATUS or status in ENDPOINT_STATUS else logger.warning
+        log("Evidence outbox: %d records not sent to %s (%s), retry in %.1f s", len(rows), self.url, error, delay)
+        if self.max_attempts is not None:
+            spent = [r for r in rows if r[3] + 1 >= self.max_attempts]
+            if spent:
+                self._quarantine(spent, status, f"{self.max_attempts} attempts: {error}")
 
     def _run(self) -> None:
+        """Sending loop: no error ends it, only close()"""
         while True:
-            with self._wake:
-                seen = None  # when pending records were first seen: a partial batch waits poll_interval_s for more
-                while not self._closing:
-                    now = time.monotonic()
-                    pending = self._pending_count()
-                    if pending and now >= self._retry_at:
-                        seen = now if seen is None else seen
-                        if pending >= self.batch_size or self._flush_requested or now >= seen + self.poll_interval_s:
-                            break
-                        self._wake.wait(seen + self.poll_interval_s - now)
-                        continue
-                    seen = None
-                    self._wake.wait(min(max(self._retry_at - now, 0.01), 1.0) if pending else 1.0)
-                if self._closing:
-                    return
-                rows = self._batch()
-                if not rows:
-                    self._flush_requested = False
-                    continue
             try:
-                self._send(rows)
+                if not self._step():
+                    return
             except Exception:  # noqa: BLE001 - the thread must survive any error; the rows stay pending
-                logger.exception("Evidence outbox: unexpected error while sending")
-                with self._wake:
-                    self._failures += 1
-                    self._retry_at = time.monotonic() + self._backoff(None)
-            with self._wake:
-                if self._pending_count() == 0:
-                    self._flush_requested = False
-                self._wake.notify_all()
+                if self._closed:
+                    return  # close() stopped waiting for a request in progress and closed the store
+                self._on_unexpected_error()
+
+    def _on_unexpected_error(self) -> None:
+        if not self._unexpected_logged:
+            self._unexpected_logged = True
+            logger.exception("Evidence outbox: unexpected error while sending (logged once until the next delivery)")
+        else:
+            logger.debug("Evidence outbox: unexpected error while sending, again", exc_info=True)
+        with self._wake:
+            self._failures += 1
+            try:
+                delay = self._backoff(None)
+            except Exception:  # noqa: BLE001 - this path must not fail either
+                delay = self.retry_max_s
+            self._retry_at = time.monotonic() + delay
+
+    def _step(self) -> bool:
+        """Wait for a batch and send it; False when the outbox is closing"""
+        with self._wake:
+            seen = None  # when pending records were first seen: a partial batch waits poll_interval_s for more
+            while not self._closing:
+                now = time.monotonic()
+                pending = self._pending_count()
+                if pending and now >= self._retry_at:
+                    seen = now if seen is None else seen
+                    if pending >= self.batch_size or self._flush_requested or now >= seen + self.poll_interval_s:
+                        break
+                    self._wake.wait(seen + self.poll_interval_s - now)
+                    continue
+                seen = None
+                self._wake.wait(min(max(self._retry_at - now, 0.01), 1.0) if pending else 1.0)
+            if self._closing:
+                return False
+            rows = self._batch()
+            if not rows:
+                self._flush_requested = False
+                return True
+        self._send(rows)
+        with self._wake:
+            if self._pending_count() == 0:
+                self._flush_requested = False
+            self._wake.notify_all()
+        return True

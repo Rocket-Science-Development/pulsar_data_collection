@@ -2,6 +2,7 @@
 
 import json
 import logging
+import sqlite3
 import ssl
 import threading
 import time
@@ -308,3 +309,179 @@ def test_evidence_records_of_pulsar_metrics_shape_are_delivered_unchanged(receiv
     assert set(by_id) == {r["evidence_id"] for r in fixture}
     for original in fixture:
         assert by_id[original["evidence_id"]] == [original, original]  # byte-for-byte content, deduplicable on id
+
+
+def gate_first_request(receiver) -> tuple[threading.Event, threading.Event]:
+    """Hold the first POST until the returned `release` event is set; `entered` is set when it arrives"""
+    handler = receiver.server.RequestHandlerClass
+    original = handler.do_POST
+    entered, release = threading.Event(), threading.Event()
+    calls = {"n": 0}
+
+    def gated(self):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            entered.set()
+            release.wait(30)
+        original(self)
+
+    handler.do_POST = gated
+    return entered, release
+
+
+@pytest.mark.parametrize("first_status", [200, 400])
+def test_record_replaced_while_in_flight_keeps_the_new_version(receiver, tmp_path, first_status):
+    """The answer to the old version (delivered or rejected) must neither delete nor quarantine the new one"""
+    entered, release = gate_first_request(receiver)
+    receiver.script = [first_status]
+    record = records(1)[0]
+    with outbox(receiver.url, tmp_path, timeout_s=30) as box:
+        box.put(record)
+        assert entered.wait(10)
+        assert box.put({**record, "value": 2})  # put again while the first version is in flight
+        release.set()
+        assert box.flush(30)
+        stats, quarantined = box.stats(), box.quarantined()
+    assert [r["value"] for batch in receiver.batches for r in batch][-1] == 2
+    assert stats["replaced"] == 1 and stats["pending"] == 0 and not quarantined
+
+
+def test_backoff_is_capped_after_a_long_outage(tmp_path):
+    box = outbox("http://127.0.0.1:9/evidence", tmp_path, start=False)
+    box._failures = 5000  # hours of outage at retry_max_s: 2 ** 4999 overflowed a float
+    assert 0 < box._backoff(None) <= box.retry_max_s
+    box.close(flush=False)
+
+
+def test_sending_thread_survives_unexpected_errors_and_logs_once(receiver, tmp_path, caplog):
+    caplog.set_level(logging.DEBUG, logger="pulsar_data_collection")
+    box = outbox(receiver.url, tmp_path, start=False)
+    calls = []
+
+    def broken_send(rows):
+        calls.append(1)
+        raise RuntimeError("unexpected")
+
+    def broken_backoff(retry_after):
+        raise OverflowError("backoff")
+
+    box._send, box._backoff = broken_send, broken_backoff
+    box.put(records(1)[0])
+    box.start()
+    assert wait_for(lambda: len(calls) >= 3, timeout_s=30)
+    assert box._thread.is_alive()
+    assert sum("unexpected error" in r.getMessage() and r.levelno >= logging.ERROR for r in caplog.records) == 1
+    del box._send, box._backoff
+    assert box.flush(30)
+    box.close()
+    assert receiver.ids() == ["ev-0000"]
+
+
+@pytest.mark.parametrize("status", [404, 405, 410, 421])
+def test_endpoint_errors_are_retried_not_quarantined(receiver, tmp_path, status):
+    receiver.script = [status, status]
+    with outbox(receiver.url, tmp_path) as box:
+        box.put_many(records(3))
+        assert wait_for(lambda: len(receiver.ids()) == 3, timeout_s=30)
+        stats = box.stats()
+    assert stats["failed"] == 0 and stats["sent"] == 3 and stats["retried"] == 6
+
+
+def test_batch_rejected_record_by_record_is_retried_not_quarantined(receiver, tmp_path):
+    """Every record of the batch refused on its own (none accepted): an endpoint or schema error, not a poison record"""
+    receiver.script = [422] * 4  # the batch, then each of its three records
+    with outbox(receiver.url, tmp_path, batch_size=10) as box:
+        box.put_many(records(3))
+        assert box.flush(30)
+        stats = box.stats()
+    assert sorted(receiver.ids()) == ["ev-0000", "ev-0001", "ev-0002"]
+    assert stats["failed"] == 0 and stats["quarantined"] == 0 and stats["retried"] == 3
+
+
+def test_conflict_counts_as_delivered(receiver, tmp_path):
+    """409: the receiver already holds this evidence_id"""
+    receiver.script = [409]
+    with outbox(receiver.url, tmp_path) as box:
+        box.put(records(1)[0])
+        assert box.flush(30)
+        stats = box.stats()
+    assert stats["sent"] == 1 and stats["failed"] == 0 and stats["quarantined"] == 0
+
+
+@pytest.mark.parametrize("source", ["token", "token_env"])
+def test_token_redacted_when_the_header_callable_fails(tmp_path, caplog, monkeypatch, source):
+    caplog.set_level(logging.DEBUG, logger="pulsar_data_collection")
+    monkeypatch.setenv("PULSAR_TEST_EVIDENCE_TOKEN", TOKEN)
+
+    def headers():
+        raise RuntimeError(f"cannot sign the request with {TOKEN}")
+
+    auth = {"token": TOKEN} if source == "token" else {"token_env": "PULSAR_TEST_EVIDENCE_TOKEN"}
+    box = outbox("http://127.0.0.1:9/evidence", tmp_path, headers=headers, **auth)
+    box.put(records(1)[0])
+    assert wait_for(lambda: box.stats()["retried"] > 0, timeout_s=30)
+    stats = box.stats()
+    box.close(flush=False)
+    assert "cannot sign" in stats["last_error"]
+    assert TOKEN not in stats["last_error"] and TOKEN not in caplog.text
+
+
+def test_failed_quarantine_leaves_the_store_usable(tmp_path):
+    box = outbox("http://127.0.0.1:9/evidence", tmp_path, start=False)
+    box.put(records(1)[0])
+    with box._lock, pytest.raises(sqlite3.IntegrityError):
+        box._quarantine([(1, None, "{}", 0)], 400, "evidence_id NULL: the insert fails")
+    assert box.put(records(2)[1])  # no transaction left open
+    assert box.stats()["pending"] == 2
+    box.close(flush=False)
+
+
+def test_record_dropped_while_in_flight_is_not_counted_sent(receiver, tmp_path):
+    entered, release = gate_first_request(receiver)
+    first, second = records(2)
+    with outbox(receiver.url, tmp_path, max_records=1, timeout_s=30) as box:
+        box.put(first)
+        assert entered.wait(10)
+        box.put(second)  # drop_oldest deletes the in-flight first record
+        release.set()
+        assert box.flush(30)
+        stats = box.stats()
+    assert stats["queued"] == 2 and stats["dropped"] == 1 and stats["sent"] == 1
+
+
+def test_close_with_a_stuck_request_then_start_is_refused(receiver, tmp_path, caplog):
+    caplog.set_level(logging.DEBUG, logger="pulsar_data_collection")
+    entered, release = threading.Event(), threading.Event()
+
+    def stuck_headers():
+        entered.set()
+        release.wait(30)  # e.g. a token service that hangs: the join of close() times out
+        return {}
+
+    box = outbox(receiver.url, tmp_path, headers=stuck_headers, timeout_s=0.2)
+    box.put(records(1)[0])
+    assert entered.wait(30)
+    box.close(timeout_s=0.1, flush=False)  # returns while the thread is still in the header callable
+    thread = box._thread
+    assert thread.is_alive()
+    release.set()
+    assert wait_for(lambda: not thread.is_alive(), timeout_s=30)
+    assert not [r for r in caplog.records if r.levelno >= logging.ERROR]
+    with pytest.raises(RuntimeError, match="closed"):
+        box.start()
+
+
+def test_timed_out_flush_does_not_leave_a_flush_request(tmp_path):
+    box = outbox("http://127.0.0.1:9/evidence", tmp_path)
+    box.put(records(1)[0])
+    assert not box.flush(0.3)
+    assert not box._flush_requested  # partial batches wait poll_interval_s again
+    box.close(flush=False)
+
+
+@pytest.mark.parametrize(
+    "options", [{"retry_initial_s": 0}, {"retry_initial_s": -1}, {"jitter": 1.0}, {"jitter": -0.1}, {"retry_max_s": 0.01}]
+)
+def test_invalid_backoff_parameters_are_refused(tmp_path, options):
+    with pytest.raises(ValueError):
+        outbox("http://127.0.0.1:9/evidence", tmp_path, start=False, **options)

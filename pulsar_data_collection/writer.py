@@ -18,7 +18,7 @@ from typing import Callable, Literal, Optional
 import numpy as np
 import pandas as pd
 
-from .exceptions import StorageRejectedError, StorageWriteTimeoutError
+from .exceptions import StorageRejectedError, StorageWriteTimeoutError, StorageWriteUncertainError
 from .spool import Spool
 
 logger = logging.getLogger("pulsar_data_collection")
@@ -344,7 +344,8 @@ class SharedWriter:
       writing resumes within about a second of the end of an outage.
     - A refused write (HTTP 400 / 422) is counted exactly: from the `dropped=N` of a partial write when the request
       held one batch, otherwise by writing again batch by batch, then in halves down to single rows.
-    - A write that timed out may have been stored: spooled (replaying is idempotent) or counted in `uncertain_rows`.
+    - A write that timed out, or whose connection was cut before the answer, may have been stored: spooled (replaying is
+      idempotent) or counted in `uncertain_rows`.
     """
 
     _default = None
@@ -796,7 +797,7 @@ class SharedWriter:
             endpoint.next_probe = time.monotonic() + (self.probe_interval_s or delay)
             for channel in {id(u.channel): u.channel for u in units}.values():
                 channel._stats["write_errors"] += 1
-                if uncertain:
+                if uncertain and _timeout(error):
                     channel._stats["write_timeouts"] += 1
                 channel._stats["last_error"] = f"{type(error).__name__}: {error}"
         logger.warning("Write to storage failed (%s); next attempt in %.0f s", error, delay)
@@ -892,8 +893,18 @@ class _Batch:
 
 
 def _uncertain(error: BaseException) -> bool:
-    """A timeout after the request was sent: the storage may have stored the rows"""
-    if isinstance(error, (StorageWriteTimeoutError, TimeoutError)):  # builtin TimeoutError: socket read timeout
+    """A timeout or a connection cut after the request was sent: the storage may have stored the rows"""
+    if isinstance(error, (StorageWriteUncertainError, TimeoutError, ConnectionResetError, ConnectionAbortedError)):
+        return True  # builtin TimeoutError: socket read timeout
+    try:
+        from .database_connectors.influxdb import is_connection_cut, is_read_timeout
+    except ImportError:  # pragma: no cover
+        return False
+    return is_read_timeout(error) or is_connection_cut(error)
+
+
+def _timeout(error: BaseException) -> bool:
+    if isinstance(error, (StorageWriteTimeoutError, TimeoutError)):
         return True
     try:
         from .database_connectors.influxdb import is_read_timeout

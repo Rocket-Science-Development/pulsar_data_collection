@@ -6,6 +6,8 @@ types fixed by the first write, partial writes refused with HTTP 422 "dropped=N"
 """
 
 import gzip
+import socket
+import struct
 import subprocess
 import sys
 import threading
@@ -19,7 +21,7 @@ import pytest
 
 import pulsar_data_collection.pulse as pulse_module
 from pulsar_data_collection.database_connectors.influxdb import InfluxdbActions, _dropped, _raise_write_error
-from pulsar_data_collection.exceptions import StorageRejectedError, StorageWriteTimeoutError
+from pulsar_data_collection.exceptions import StorageConnectionResetError, StorageRejectedError, StorageWriteTimeoutError
 from pulsar_data_collection.models import CaptureOptions, DataWithPrediction, PulseParameters
 from pulsar_data_collection.pulse import Pulse
 from pulsar_data_collection.results import StatsReporter, process_health
@@ -355,6 +357,71 @@ def test_read_timeouts_are_recognised():
         _raise_write_error(error, 10)
     with pytest.raises(ConnectionError):
         _raise_write_error(ConnectionError("refused"), 10)
+
+
+class ResettingServer:
+    """HTTP server that reads each request in full (headers and body), then resets the connection without answering:
+    InfluxDB may have stored the rows of a write cut that way"""
+
+    def __init__(self):
+        self.socket = socket.socket()
+        self.socket.bind(("127.0.0.1", 0))
+        self.socket.listen(16)
+        self.url = f"http://127.0.0.1:{self.socket.getsockname()[1]}"
+        self.writes = []  # bodies of the write requests received in full
+        threading.Thread(target=self._serve, daemon=True).start()
+
+    def _serve(self):
+        while True:
+            try:
+                connection, _ = self.socket.accept()
+            except OSError:
+                return
+            data = b""
+            while b"\r\n\r\n" not in data:
+                data += connection.recv(65536)
+            head, body = data.split(b"\r\n\r\n", 1)
+            length = next((int(h.split(b":")[1]) for h in head.split(b"\r\n") if h.lower().startswith(b"content-length")), 0)
+            while len(body) < length:
+                body += connection.recv(65536)
+            if head.startswith(b"POST /api/v2/write"):
+                self.writes.append(body)
+            connection.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0))  # RST, not FIN
+            connection.close()
+
+    def close(self):
+        self.socket.close()
+
+
+def test_a_connection_reset_after_the_request_is_sent_is_uncertain_not_lost():
+    server = ResettingServer()
+    login = {"url": server.url, "token": "t", "org": "o", "bucket_name": "b"}
+    pulse = Pulse(params().model_copy(update={"login": login}), options(probe_interval_s=None))  # starts anyway
+    try:
+        capture(pulse, batch(0))
+        assert pulse.flush(10)
+        stats = pulse.stats()
+    finally:
+        pulse.close(timeout_s=1)
+        server.close()
+    assert len(server.writes) == 1 and server.writes[0].count(b"\n") == N - 1  # the whole request reached the server
+    assert stats["uncertain_rows"] == 50 and stats["dropped_rows"] == 0  # was counted in dropped_rows
+    assert stats["write_errors"] == 1 and stats["write_timeouts"] == 0
+
+
+def test_connection_cuts_are_recognised_but_not_refusals():
+    from http.client import RemoteDisconnected
+
+    from urllib3.exceptions import MaxRetryError, NewConnectionError, ProtocolError
+
+    for cause in (ConnectionResetError(10054, "reset by peer"), RemoteDisconnected("closed without response")):
+        with pytest.raises(StorageConnectionResetError):
+            _raise_write_error(ProtocolError("Connection aborted.", cause), 10)
+    with pytest.raises(StorageConnectionResetError):
+        _raise_write_error(MaxRetryError(None, "/api/v2/write", ProtocolError("Connection aborted.", cause)), 10)
+    refused = NewConnectionError(None, "Failed to establish a new connection: [WinError 10061] refused")
+    with pytest.raises(NewConnectionError):  # never reached the storage: the rows are not stored
+        _raise_write_error(refused, 10)
 
 
 # ---------------------------------------------------------------------------------------------------------- M35

@@ -11,9 +11,15 @@ from influxdb_client.client.write.dataframe_serializer import DataframeSerialize
 from influxdb_client.client.write.point import _ESCAPE_KEY, _ESCAPE_MEASUREMENT, _ESCAPE_STRING
 from influxdb_client.client.write_api import SYNCHRONOUS, PointSettings
 from influxdb_client.rest import ApiException
-from urllib3.exceptions import HTTPError, MaxRetryError, ReadTimeoutError
+from urllib3.exceptions import HTTPError, MaxRetryError, ProtocolError, ReadTimeoutError
 
-from ..exceptions import StorageConfigurationError, StorageRejectedError, StorageUnavailableError, StorageWriteTimeoutError
+from ..exceptions import (
+    StorageConfigurationError,
+    StorageConnectionResetError,
+    StorageRejectedError,
+    StorageUnavailableError,
+    StorageWriteTimeoutError,
+)
 from .database_actions import DatabaseActions, DatabaseActionsFactory
 
 DEFAULT_TIMEOUT_S = 10.0
@@ -43,6 +49,27 @@ def is_read_timeout(error: BaseException) -> bool:
     return False
 
 
+_CUT = (ProtocolError, ConnectionResetError, ConnectionAbortedError, BrokenPipeError)
+
+
+def is_connection_cut(error: BaseException) -> bool:
+    """The connection was reset or closed by the other end once established, while the request was sent or its answer
+    awaited (the rows may have been stored)
+
+    urllib3 reports these as ProtocolError("Connection aborted.", ConnectionResetError / RemoteDisconnected...); a
+    refused connection (NewConnectionError) never reached the storage and is not one of them.
+    """
+    for _ in range(10):
+        if error is None:
+            return False
+        if isinstance(error, (_CUT, StorageConnectionResetError)):
+            return True
+        if isinstance(error, MaxRetryError) and isinstance(error.reason, _CUT):
+            return True
+        error = error.__cause__ or error.__context__
+    return False
+
+
 def _raise_write_error(error: Exception, rows: int):
     """Translate a write failure: refused data (never retryable), timeout (outcome unknown) or unavailable storage"""
     if isinstance(error, ApiException) and error.status in (400, 422):
@@ -54,6 +81,10 @@ def _raise_write_error(error: Exception, rows: int):
     if is_read_timeout(error):
         raise StorageWriteTimeoutError(
             f"InfluxDB did not answer in time, {rows} rows may or may not be stored: {error}"
+        ) from error
+    if is_connection_cut(error):
+        raise StorageConnectionResetError(
+            f"Connection to InfluxDB cut before its answer, {rows} rows may or may not be stored: {error}"
         ) from error
     raise error
 
@@ -334,7 +365,7 @@ class InfluxdbActions(DatabaseActions):
     @staticmethod
     def write_lines(client: InfluxDBClient, bucket_name: str, lines: list) -> None:
         """One synchronous request for lines of any measurement; raises StorageRejectedError (with `dropped` on a partial
-        write), StorageWriteTimeoutError (outcome unknown) or the transport error"""
+        write), StorageWriteTimeoutError or StorageConnectionResetError (outcome unknown) or the transport error"""
         if not lines:
             return
         with client.write_api(write_options=SYNCHRONOUS) as write_api:

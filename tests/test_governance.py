@@ -514,6 +514,31 @@ def test_the_deletion_intent_is_journaled_before_anything_is_deleted(tmp_path):
     assert seen[0] == ["delete.intent"] and [e["action"] for e in controller.journal.entries()] == ["delete.intent", "delete"]
 
 
+
+@pytest.mark.parametrize("case", ["damaged batch", "selected batch without timestamps"])
+def test_a_deletion_that_leaves_spool_files_is_incomplete(tmp_path, monkeypatch, capsys, case):
+    spool_dir = tmp_path / "spool"
+    Spool(spool_dir).save(frame(4), meta("A"))
+    if case == "damaged batch":
+        (spool_dir / "1_abc_2r.json.bad").write_text("not json")
+        start = None
+    else:
+        untimed = meta("A") | {"data_frame_timestamp_column": None}
+        Spool(spool_dir).save(pd.DataFrame({"x": [1.0, 2.0]}), untimed)
+        start = "2026-10-01T00:00:00Z"
+    fake = FakeInflux({"captures": 0, "results": 0})
+    controller = DataController(policy_dict(tmp_path, spool_dirs=[str(spool_dir)]), client=fake)
+    report = controller.delete(DataSelector(system_id="A"), start=start)
+    assert report["status"] == "incomplete" and len(report["spool"][0]["unreadable"]) == 1
+    assert "possibly replayed" in report["errors"][0]
+    assert controller.journal.entries()[-1]["details"]["status"] == "incomplete"
+    (tmp_path / "policy.json").write_text(json.dumps(policy_dict(tmp_path, spool_dirs=[str(spool_dir)])))
+    monkeypatch.setattr("pulsar_data_collection.governance.__main__.DataController", lambda *a, **k: controller)
+    controller.close = lambda: None
+    period = ["--start", start] if start else []
+    assert main(["--policy", str(tmp_path / "policy.json"), "delete", "--system-id", "A", *period]) == 1  # exit 1
+    capsys.readouterr()
+
 def test_controller_needs_a_token_only_to_connect(tmp_path, monkeypatch):
     monkeypatch.delenv("PULSAR_INFLUX_TOKEN", raising=False)
     controller = DataController(policy_dict(tmp_path, central_service="https://user:pw@central.example/api?x=1"))

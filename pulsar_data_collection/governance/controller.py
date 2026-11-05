@@ -280,7 +280,9 @@ class DataController:
         predicate and the counts): a journal that cannot take it (key not set, last line not a complete entry,
         secret-looking selector keys) stops the deletion before any change. The deletion is then verified by counting
         again (`remaining` must be 0) and its outcome journaled as a `delete` entry (`intent_seq` points to the
-        intent), whatever it is: status "ok", "incomplete" or "error". `local=False` leaves the spool and outbox
+        intent), whatever it is: status "ok", "incomplete" or "error". A spool file that could not be read, or a
+        selected batch that could not be purged (no timestamp column for a period), makes the status "incomplete":
+        its rows may still be written to InfluxDB when the spool is replayed. `local=False` leaves the spool and outbox
         stores untouched.
         """
         period = Period(start, stop)
@@ -306,6 +308,7 @@ class DataController:
             if local:
                 report["spool"] = [purge_spool(d, selector, period, dry_run=True) for d in self.policy.spool_dirs]
                 report["outbox"] = [purge_outbox(d, selector, period, dry_run=True) for d in self.policy.outbox_dirs]
+                self._check_spool(report)
             return report
         intent = self.journal.append(
             "delete.intent", self.actor, {**self._journal_view(report), "status": "started", "local": local, "reason": reason}
@@ -327,6 +330,7 @@ class DataController:
             if local:
                 report["spool"] = [purge_spool(d, selector, period) for d in self.policy.spool_dirs]
                 report["outbox"] = [purge_outbox(d, selector, period) for d in self.policy.outbox_dirs]
+                self._check_spool(report)
         except Exception as error:  # noqa: BLE001 - journaled, then raised
             report["status"] = "error"
             report["errors"].append(f"{type(error).__name__}: {str(error)[:300]}")
@@ -335,6 +339,19 @@ class DataController:
             details = {**self._journal_view(report), "intent_seq": intent["seq"], "reason": reason}
             self.journal.append("delete", self.actor, details)
         return report
+
+    @staticmethod
+    def _check_spool(report: dict) -> None:
+        """Status "incomplete" when a spool file was not read or a selected batch not purged: it may be replayed"""
+        for spool in report["spool"]:
+            if spool["unreadable"]:
+                if report["status"] == "ok":
+                    report["status"] = "incomplete"
+                names = ", ".join(spool["unreadable"][:5]) + (" ..." if len(spool["unreadable"]) > 5 else "")
+                report["errors"].append(
+                    f"spool {spool['directory']}: {len(spool['unreadable'])} files not read or not purged, kept and "
+                    f"possibly replayed into InfluxDB: {names}"
+                )
 
     @staticmethod
     def _journal_view(report: dict) -> dict:

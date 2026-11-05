@@ -59,7 +59,9 @@ def purge_spool(directory: os.PathLike, selector: DataSelector, period: Optional
     """Delete the selected rows of the batches of a spool directory
 
     Returns {"directory", "exists", "files_deleted", "files_rewritten", "rows", "unreadable"}: `rows` deleted (or that
-    would be, with dry_run), `unreadable` files that could not be read nor classified (kept, listed by name).
+    would be, with dry_run), `unreadable` files that could not be read nor classified, and selected batches that
+    could not be purged (no timestamp column to apply a period to): kept, listed by name, and possibly replayed into
+    InfluxDB by their Pulse (DataController.delete then reports "incomplete").
     """
     directory = Path(directory)
     report = {"directory": str(directory), "exists": directory.is_dir(), "files_deleted": 0, "files_rewritten": 0, "rows": 0}

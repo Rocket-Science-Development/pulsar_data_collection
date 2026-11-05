@@ -13,7 +13,8 @@ class StorageWriteUncertainError(StorageUnavailableError):
     """The request was sent but its answer never came: the storage may or may not have stored the rows
 
     Writes are idempotent (same measurement, tags and timestamps overwrite the same points), so these rows can be
-    spooled and written again without creating duplicates. Without spool they are counted in `uncertain_rows`.
+    spooled and written again without creating duplicates. Without spool they are written once more from the queue
+    (`retry_uncertain`), then counted in `uncertain_rows` if the outcome is still uncertain.
     """
 
 

@@ -142,6 +142,12 @@ class CaptureOptions(BaseModel):
     replays an outage in a half to a sixth of its duration.
     row_spacing_ns: int
     Spacing of the timestamps of the rows of one capture (default 1 µs; it was 1 ms)
+    retry_uncertain: bool
+    Without spool_dir, write once more the rows of a write that timed out or whose connection was cut after it was
+    sent (default True): InfluxDB may or may not have stored them, and writing the same points again overwrites them
+    (no duplicate). They are counted in retried_uncertain_rows, then in uncertain_rows only if the second write is
+    uncertain too, or if the queue bound or close() drops them. False: counted in uncertain_rows at once (as before
+    0.13.1). With spool_dir these rows are spooled and replayed, whatever this setting.
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -164,6 +170,7 @@ class CaptureOptions(BaseModel):
     spool_compression: Optional[Literal["gzip"]] = None
     replay_max_rows_per_s: Optional[float] = Field(None, gt=0)
     row_spacing_ns: int = Field(1_000, ge=1)
+    retry_uncertain: bool = True
 
     @model_validator(mode="after")
     def check_durability(self):

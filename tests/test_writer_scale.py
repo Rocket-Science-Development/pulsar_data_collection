@@ -326,13 +326,14 @@ def test_dropped_count_is_read_from_the_422_body():
 
 # ---------------------------------------------------------------------------------------------------------- M32
 def test_timeouts_are_uncertain_not_lost(store):
-    store.timeout_after_store = True  # InfluxDB stored the rows but the answer came too late
+    store.timeout_after_store = True  # InfluxDB stored the rows but the answer came too late, every time
     with Pulse(params(), options(probe_interval_s=None)) as pulse:
         capture(pulse, batch(0))
         assert pulse.flush(5)
         stats = pulse.stats()
-    assert stats["dropped_rows"] == 0 and stats["uncertain_rows"] == 50 and stats["write_timeouts"] == 1
-    assert store.count() == 50
+    assert stats["dropped_rows"] == 0 and stats["uncertain_rows"] == 50 and stats["write_timeouts"] == 2
+    assert stats["retried_uncertain_rows"] == 50  # written once more (0.13.1), uncertain again: counted, not retried
+    assert store.count() == 50 and store.requests == 2  # idempotent: no duplicate
 
 
 def test_timed_out_rows_are_spooled_and_replayed_without_duplicates(store, tmp_path):
@@ -404,9 +405,10 @@ def test_a_connection_reset_after_the_request_is_sent_is_uncertain_not_lost():
     finally:
         pulse.close(timeout_s=1)
         server.close()
-    assert len(server.writes) == 1 and server.writes[0].count(b"\n") == N - 1  # the whole request reached the server
+    assert len(server.writes) == 2 and server.writes[0].count(b"\n") == N - 1  # the whole request reached the server
+    assert server.writes[1] == server.writes[0]  # written once more (0.13.1), the same points
     assert stats["uncertain_rows"] == 50 and stats["dropped_rows"] == 0  # was counted in dropped_rows
-    assert stats["write_errors"] == 1 and stats["write_timeouts"] == 0
+    assert stats["write_errors"] == 2 and stats["write_timeouts"] == 0 and stats["retried_uncertain_rows"] == 50
 
 
 def test_connection_cuts_are_recognised_but_not_refusals():
@@ -925,8 +927,9 @@ def test_rows_taken_during_a_back_off_wait_in_the_queue_without_spool():
     assert stats["written_rows"] == 40 and stats["dropped_rows"] == 0 and stats["captured_rows"] == 40
 
 
-def test_timed_out_rows_stay_uncertain_not_requeued():
-    """A timeout may have stored the rows: still counted in uncertain_rows, never written again without spool"""
+def test_timed_out_rows_are_written_once_more_then_uncertain():
+    """A timeout may have stored the rows: without spool they are written once more (0.13.1: idempotent), and counted
+    in uncertain_rows when that write times out too, never written a third time"""
     writer = SharedWriter(flush_interval_s=0.05, concurrency=1, probe_interval_s=None)
     calls = []
 
@@ -939,7 +942,8 @@ def test_timed_out_rows_stay_uncertain_not_requeued():
     assert channel.flush(5)
     stats = channel.stats()
     writer.close()
-    assert stats["uncertain_rows"] == 10 and stats["dropped_rows"] == 0 and calls == [10]
+    assert stats["uncertain_rows"] == 10 and stats["dropped_rows"] == 0 and calls == [10, 10]
+    assert stats["retried_uncertain_rows"] == 10 and stats["write_timeouts"] == 2
 
 
 def test_rows_caught_by_a_back_off_go_back_in_order_within_the_queue_bound():

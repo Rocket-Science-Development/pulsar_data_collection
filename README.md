@@ -168,8 +168,12 @@ Writing to the database must not slow down predictions. By default (`mode="backg
   the points keep their own timestamps.
 - A write that **timed out**, or whose **connection was cut** (reset, closed) once the request was sent and before
   the answer, may have been stored by InfluxDB: with `spool_dir` it is spooled and written again (writes are
-  idempotent: same measurement, tags and timestamp overwrite the same point, no duplicate); without it the rows are
-  counted in `uncertain_rows`, not in `dropped_rows`, and never written again. A failure that certainly stored
+  idempotent: same measurement, tags and timestamp overwrite the same point, no duplicate); without it the rows go
+  back to the queue, in their place, and are written **once more** when the back-off ends (`retry_uncertain=True`, the
+  default since 0.13.1; counted in `retried_uncertain_rows`). They are counted in `uncertain_rows` (not in
+  `dropped_rows`) only if that second write is uncertain too, if the queue bound drops them (they are the oldest
+  rows, so they go first), or if `close()` finds them still waiting; never written a third time.
+  `retry_uncertain=False` counts them in `uncertain_rows` at once, as before. A failure that certainly stored
   nothing (a refused connection, an error answer other than 400 / 422) puts the rows of the failed request back in the
   queue with the batches that follow (or spools them).
 - A batch InfluxDB **refuses** (HTTP 400 / 422, e.g. a field type conflict) is never retried nor spooled. Frames are
@@ -205,7 +209,8 @@ pulse.close()  # at shutdown: writes (or spools) what is still queued
 ```
 
 `pulse.stats()` returns `captured_rows`, `written_rows`, `spooled_rows`, `replayed_rows`, `dropped_rows`,
-`rejected_rows`, `uncertain_rows`, `write_errors`, `write_timeouts`, `last_error`, `queued_rows`, `writer_lag_s` (age
+`rejected_rows`, `uncertain_rows`, `retried_uncertain_rows` (rows of uncertain writes written once more; their
+outcome is in the other counters), `write_errors`, `write_timeouts`, `last_error`, `queued_rows`, `writer_lag_s` (age
 of the oldest queued batch), `last_write_ms` / `max_write_ms` (request latency), `spool_files`, `spool_bytes`,
 `spool_evicted_rows`, `memory_only_rows` (`durability="wal"` batches kept in memory only because the spool was
 full) and `storage_available`. Once everything is flushed, `written_rows + spooled_rows + dropped_rows +
@@ -249,8 +254,10 @@ Failures are handled as for a private writer (see [Non-blocking capture and resi
 the Pulses writing to the same InfluxDB client and bucket share one back-off. While it lasts, each Pulse's batches go
 to its spool or, without `spool_dir`, wait in its own queue up to its `max_queue_rows`, including batches already
 taken for a request when another request in flight failed (0.11 dropped those: 10,000 rows at 300 models and 5,000 at
-500 in the lab, with InfluxDB timing out under load and room left in the queues). Only the rows of requests that
-timed out or were cut are counted (`uncertain_rows`). Rows waiting for one destination neither hold back the requests
+500 in the lab, with InfluxDB timing out under load and room left in the queues). The rows of requests that timed
+out or were cut are written once more, then counted in `uncertain_rows` if still uncertain. A request holding rows of
+several Pulse is retried per Pulse and batch: rows already retried are counted, the others get their own second write.
+Rows waiting for one destination neither hold back the requests
 of the others nor the replay of their spools.
 
 **Memory during an outage.** Without `spool_dir`, each Pulse can hold its full `max_queue_rows` until the end of the
@@ -389,12 +396,13 @@ latencies are higher than on the lab machines):
 - **Latency** (+200 ms, +1 s per request): no effect on the data. Writes take longer, the queues hold a few
   thousand rows more, nothing is dropped.
 - **Lossy link and flapping link** (stalls and connection resets; proxy down 5 s out of 10): a request whose
-  connection is cut after it was sent is counted in `uncertain_rows`. Without `spool_dir` those rows are never
-  written again, even with room in the queue: 5 to 32 % of the traffic was lost this way (all counted; InfluxDB had
-  stored 0 to 10 % of them). A backend that is down behind a port forwarder or a load balancer (Docker, Kubernetes)
-  often accepts the connection and then closes it, which also counts as uncertain, not refused. With `spool_dir`
-  these rows are spooled and replayed: 0 row lost, 0 duplicate. **Set `spool_dir` on any link that can drop
-  connections.**
+  connection is cut after it was sent has an uncertain outcome. Up to 0.13.0, without `spool_dir`, those rows were
+  never written again, even with room in the queue: 5 to 32 % of the traffic was lost this way (all counted in
+  `uncertain_rows`; InfluxDB had stored 0 to 10 % of them). A backend that is down behind a port forwarder or a load
+  balancer (Docker, Kubernetes) often accepts the connection and then closes it, which also counts as uncertain, not
+  refused. Since 0.13.1 these rows are written once more (see above): SC04_AFTER_FIX. With `spool_dir` these rows are
+  spooled and replayed: 0 row lost, 0 duplicate. **Set `spool_dir` on any link that can drop connections**: the
+  single in-memory retry does not cover a second cut, a long outage or a restart.
 - **Bandwidth cap** (1 Mbit/s): a 5,000-row request (about 560 bytes per row, 2.8 MB) needs about 22 s, so with
   `write_timeout_s=5` every request times out, the `/ping` probe answers, the writer tries again, and almost nothing is
   written while the cap lasts (rows uncertain, or spooled and replayed afterwards). Keep

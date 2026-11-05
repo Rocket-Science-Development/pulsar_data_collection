@@ -3,6 +3,37 @@
 All notable changes to pulsar-data-collection. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.13.1] - 2026-11-05
+
+### Fixed
+
+- Without `spool_dir`, the rows of a write that timed out or whose connection was cut after the request was sent
+  (uncertain outcome: InfluxDB may or may not have stored them) were counted in `uncertain_rows` and never written
+  again, even with room in the queue. A backend that is down behind a port forwarder (Docker, Kubernetes) accepts the
+  connection and then closes it, so an outage counts as cuts, not refusals. Lab test SC-04 (Toxiproxy, 10 models at
+  2,000 rows/s, no spool) lost 6,000 to 37,000 rows this way on a lossy link (5 % and 20 %) and on a flapping link
+  (down 5 s every 10 s), with both write profiles. These rows now go back to their queue, in their place, and are
+  written once more when the back-off ends: line-protocol points carry their timestamp, so a second write overwrites
+  the same points (no duplicate). They are counted in `uncertain_rows` only if that second write is uncertain too
+  (never a third write), if the queue bound drops them (they are the oldest rows of the queue, dropped first; counted
+  in `uncertain_rows` rather than `dropped_rows`, since they may be stored), or if `close()` finds them still
+  waiting for the end of a back-off. The caller is never blocked and the queue bound (`max_queue_rows`) is unchanged.
+  Rows already retried and fresh rows sharing one request (`SharedWriter`) are counted apart. With `spool_dir`
+  nothing changes: these rows are spooled and replayed, as before.
+
+### Added
+
+- `CaptureOptions(retry_uncertain=True)` (and `retry_uncertain` of `SharedWriter.register()` and
+  `BackgroundWriter`): `False` counts the rows of an uncertain write in `uncertain_rows` at once, as up to 0.13.0
+  (e.g. for a custom `write` function that is not idempotent).
+- Counter `retried_uncertain_rows` in `stats()`: rows of uncertain writes put back for a second write. It is not part
+  of the completeness identity; their outcome is counted in `written_rows`, `uncertain_rows`, `rejected_rows`...
+  (`written + spooled + dropped + rejected + uncertain = captured` once flushed, unchanged).
+
+### Documentation
+
+- README: "Capacity and degraded networks" (measured capture ceiling, degraded networks after SC-04, memory bound).
+
 ## [0.13.0] - 2026-11-05
 
 ### Added

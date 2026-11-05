@@ -13,6 +13,7 @@ import numpy as np
 import pandas as pd
 import pytest
 from influxdb_client import InfluxDBClient
+from influxdb_client.client.write_api import SYNCHRONOUS
 
 from pulsar_data_collection.governance import DataController, DataSelector, verify_export
 from pulsar_data_collection.governance.__main__ import main
@@ -153,7 +154,8 @@ def test_delete_by_system_removes_only_that_system(controller, buckets):
     exported = controller.export(DataSelector(system_id="SYS-B"), roles=["raw"])
     path = os.path.join(controller.policy.export_dir, os.listdir(controller.policy.export_dir)[0], exported["files"][0]["path"])
     assert pd.read_csv(path)["income"].tolist() == pytest.approx(kept["income"].tolist())
-    entry, _ = controller.journal.entries()
+    intent, entry, _ = controller.journal.entries()
+    assert intent["action"] == "delete.intent" and entry["details"]["intent_seq"] == intent["seq"]
     assert entry["action"] == "delete" and entry["details"]["buckets"]["raw"]["rows"] == 2 * N
     assert entry["details"]["predicate"] == 'system_id="SYS-A"' and controller.journal.verify()["ok"]
 
@@ -195,6 +197,22 @@ def test_export_round_trip_with_checksums(controller, buckets, tmp_path):
     assert entry["action"] == "export" and entry["details"]["reason"] == "client copy"
     with pytest.raises(FileExistsError):
         controller.export(DataSelector(system_id="SYS-A"), out)
+
+
+def test_export_keeps_sparse_integers_and_booleans(controller, buckets, client, tmp_path):
+    big = 2**60 + 1  # not a float64
+    lines = [
+        f'events,system_id=SYS-A n={big}i,flag=true,note="a" {T0.value}',
+        f"events,system_id=SYS-A x=0.5 {T0.value + 1}",  # the same series: n, flag and note are missing here
+    ]
+    client.write_api(write_options=SYNCHRONOUS).write(bucket=buckets["raw"], org=ENV["org"], record=lines)
+    manifest = controller.export(DataSelector(system_id="SYS-A"), tmp_path / "e", roles=["raw"])
+    (item,) = manifest["files"]
+    assert item["columns"]["n"] == "Int64" and item["influx_types"]["n"] == "long"
+    assert item["columns"]["flag"] == "boolean" and item["columns"]["note"] == "string"
+    rows = (tmp_path / "e" / item["path"]).read_text(encoding="utf-8").splitlines()
+    assert rows[0] == '"_time","_measurement","system_id","flag","n","note","x"'
+    assert rows[1].endswith(f',"SYS-A",True,{big},"a",') and rows[2].endswith(',"SYS-A",,,,0.5')
 
 
 def test_export_parquet(controller, buckets, tmp_path):

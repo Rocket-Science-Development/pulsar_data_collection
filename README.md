@@ -1159,7 +1159,11 @@ with DataController("governance.yaml", actor="jdoe") as control:
   records, but those it had already read for a send in progress are still delivered: close the outbox first.
 - **Export.** One file per bucket role and measurement (e.g. `raw/credit_model_1.0_input_data.csv`): `_time` (UTC,
   RFC 3339 with nanoseconds, exact), `_measurement`, the tags, then one column per field; `manifest.json` lists the
-  selector, the period and every file with its rows, columns and types, tags, size and SHA-256. Parquet needs
+  selector, the period and every file with its rows, columns and types (pandas `columns`, InfluxDB `influx_types`),
+  tags, size and SHA-256. Values keep their InfluxDB type, missing values included: integer fields are nullable
+  integers (`Int64` / `UInt64`, exact: 2**60 + 1 is not rounded to a float), booleans and strings nullable too. CSV
+  convention (`csv` in the manifest): strings are quoted, a missing value is an empty unquoted cell; InfluxDB 2.6
+  returns an empty string field like a missing one, so both are exported as missing. Parquet needs
   `pyarrow`. A measurement is held in memory while it is written: export long periods in parts (`start` / `stop`).
 - **Audit journal.** Every retention change, deletion (whatever its outcome, with the error if any) and export
   appends one JSON line, fsynced: sequence number, UTC time, actor, action, details (bucket, predicate, period,

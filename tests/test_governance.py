@@ -7,6 +7,7 @@ from types import SimpleNamespace
 import numpy as np
 import pandas as pd
 import pytest
+from influxdb_client.client.flux_table import FluxColumn, FluxRecord, FluxTable
 from pydantic import ValidationError
 
 from pulsar_data_collection.evidence import DATABASE_NAME, EvidenceOutbox
@@ -558,6 +559,76 @@ def test_a_deletion_that_leaves_spool_files_is_incomplete(tmp_path, monkeypatch,
     period = ["--start", start] if start else []
     assert main(["--policy", str(tmp_path / "policy.json"), "delete", "--system-id", "A", *period]) == 1  # exit 1
     capsys.readouterr()
+
+
+def _flux_table(rows: list, types: dict, tags: dict):
+    """A pivoted Flux table of one series (what the export query returns)"""
+    table = FluxTable()
+    group = {"result": False, "table": False, "_start": True, "_stop": True, "_measurement": True, **dict.fromkeys(tags, True)}
+    all_types = {"result": "string", "table": "long", "_start": "dateTime:RFC3339", "_stop": "dateTime:RFC3339"}
+    all_types |= {"_time": "dateTime:RFC3339", "_measurement": "string", **dict.fromkeys(tags, "string"), **types}
+    all_types["_time_ns"] = "long"
+    table.columns = [
+        FluxColumn(i, label, data_type, group.get(label, False)) for i, (label, data_type) in enumerate(all_types.items())
+    ]
+    for i, row in enumerate(rows):
+        values = {"_measurement": "events", **tags, "_time": None, "_time_ns": T0.value + i, **row}
+        table.records.append(FluxRecord(0, values))
+    return table
+
+
+class FakeExportInflux(FakeInflux):
+    def __init__(self, tables):
+        super().__init__({"captures": 0, "results": 0})
+        self.tables = tables
+
+    def query_api(self):
+        fake = self
+
+        class Api:
+            def query(self, flux, org=None):
+                return fake.tables if '"captures"' in flux else []
+
+        return Api()
+
+
+def _sparse_tables() -> list:
+    first = _flux_table(
+        [{"n": BIG, "flag": True, "note": ""}, {"n": None, "flag": None, "note": None}],
+        {"n": "long", "flag": "boolean", "note": "string"},
+        {"system_id": "A"},
+    )
+    second = _flux_table([{"x": 0.5}], {"x": "double"}, {"system_id": "A"})  # a series without n, flag, note
+    return [first, second]
+
+
+BIG = 2**60 + 1  # not a float64
+
+
+def test_export_keeps_integers_exact_and_null_apart_from_empty_strings(tmp_path):
+    controller = DataController(policy_dict(tmp_path), client=FakeExportInflux(_sparse_tables()))
+    frame = next(controller._frames("captures", DataSelector(system_id="A"), Period()))[1]
+    assert frame["n"].iloc[0] == BIG and frame["n"].isna().tolist() == [False, True, True]
+    assert frame["note"].iloc[0] == "" and frame["note"].isna().tolist() == [False, True, True]
+    assert frame["flag"].tolist()[:1] == [True] and frame["flag"].isna().tolist() == [False, True, True]
+    manifest = controller.export(DataSelector(system_id="A"), tmp_path / "csv", roles=["raw"])
+    (item,) = manifest["files"]
+    assert item["columns"]["n"] == "Int64" and item["columns"]["flag"] == "boolean" and item["columns"]["note"] == "string"
+    assert item["influx_types"]["n"] == "long" and item["influx_types"]["x"] == "double"
+    assert manifest["csv"]["null"].startswith("empty unquoted")
+    lines = (tmp_path / "csv" / item["path"]).read_text(encoding="utf-8").splitlines()
+    assert lines[0] == '"_time","_measurement","system_id","flag","n","note","x"'
+    assert lines[1].endswith(f',True,{BIG},"",') and lines[2].endswith(",,,,0.5") and lines[3].endswith(',"A",,,,')
+
+
+def test_export_parquet_keeps_integers_exact_and_nulls(tmp_path):
+    pytest.importorskip("pyarrow")
+    controller = DataController(policy_dict(tmp_path), client=FakeExportInflux(_sparse_tables()))
+    manifest = controller.export(DataSelector(system_id="A"), tmp_path / "pq", roles=["raw"], format="parquet")
+    frame = pd.read_parquet(tmp_path / "pq" / manifest["files"][0]["path"])
+    assert frame["n"].iloc[0] == BIG and frame["note"].iloc[0] == "" and frame["note"].isna().tolist() == [False, True, True]
+
+
 
 def test_controller_needs_a_token_only_to_connect(tmp_path, monkeypatch):
     monkeypatch.delenv("PULSAR_INFLUX_TOKEN", raising=False)

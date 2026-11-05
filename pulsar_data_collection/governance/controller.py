@@ -3,6 +3,7 @@
 Every retention change, deletion and export is written to the audit journal (see journal.py).
 """
 
+import csv
 import getpass
 import hashlib
 import json
@@ -28,6 +29,14 @@ logger = logging.getLogger("pulsar_data_collection")
 EXPORT_SCHEMA = "pulsar.export/1"
 MANIFEST_NAME = "manifest.json"
 _DROPPED_COLUMNS = ["result", "table", "_start", "_stop"]
+# pandas dtype of each Flux column type: nullable, so that a sparse integer field stays exact (no float64) and a
+# missing boolean or string stays missing
+_FLUX_DTYPES = {"long": "Int64", "unsignedLong": "UInt64", "double": "float64", "boolean": "boolean", "string": "string"}
+CSV_CONVENTION = {
+    "strings": "quoted; an empty string is \"\"",
+    "null": "empty unquoted cell (no value in InfluxDB)",
+    "times": "RFC 3339, UTC, nanoseconds",
+}
 
 
 def _now() -> str:
@@ -68,15 +77,27 @@ def _file_name(measurement: str, used: set) -> str:
     return name
 
 
+def _cell(value):
+    """A CSV cell: None (written as an empty unquoted cell) for a missing value"""
+    if value is None or value is pd.NA or (isinstance(value, float) and value != value):
+        return None
+    return value
+
+
 def _csv(frame: pd.DataFrame, path: Path) -> None:
-    """CSV with the times in RFC 3339 with nanoseconds (UTC), so that nothing is rounded"""
+    """CSV (CSV_CONVENTION): times in RFC 3339 with nanoseconds (UTC) and integers in full, so that nothing is rounded;
+    strings quoted, so that an empty string ("") and a missing value (empty unquoted cell) differ"""
     out = frame.copy()
     for column in out.columns:
         if pd.api.types.is_datetime64_any_dtype(out[column]):
             values = out[column].dt.tz_convert("UTC") if out[column].dt.tz is not None else out[column]
             nanos = values.dt.as_unit("ns").astype("int64") % 1_000_000_000
             out[column] = values.dt.strftime("%Y-%m-%dT%H:%M:%S.") + nanos.astype(str).str.zfill(9) + "Z"
-    out.to_csv(path, index=False)
+    with open(path, "w", encoding="utf-8", newline="") as handle:
+        writer = csv.writer(handle, quoting=csv.QUOTE_STRINGS, lineterminator="\n")
+        writer.writerow([str(c) for c in out.columns])
+        for row in out.itertuples(index=False, name=None):
+            writer.writerow([_cell(v) for v in row])
 
 
 def _string(value: str) -> str:
@@ -383,8 +404,15 @@ class DataController:
         reason: Optional[str] = None,
     ) -> dict:
         """Export the selected data to open files: one file per role and measurement (rows with the timestamp `_time`,
-        the tags and one column per field), plus `manifest.json` with the selector, the period, the columns and types,
-        the row counts and the SHA-256 of every file. Journaled. Returns the manifest.
+        the tags and one column per field), plus `manifest.json` with the selector, the period, the columns and types
+        (pandas `columns`, InfluxDB `influx_types`), the row counts and the SHA-256 of every file. Journaled. Returns
+        the manifest.
+
+        Values keep their InfluxDB type: integer fields are nullable integers (Int64 / UInt64, exact up to 2**64),
+        booleans and strings nullable too; a field whose type differs between series is exported as text values
+        (`influx_types` "mixed:..."). CSV follows `CSV_CONVENTION` (also in the manifest): strings are quoted, a
+        missing value is an empty unquoted cell, an empty string would be "". InfluxDB 2.6 returns an empty string
+        field like a missing one (its query results are annotated CSV): both are exported as missing.
 
         `directory`: an empty or new directory (default: a new `pulsar-export-<time>` in policy.export_dir).
         Parquet needs pyarrow. A measurement is held in memory while it is written: export long periods in parts.
@@ -417,10 +445,12 @@ class DataController:
             "format": format,
             "files": [],
         }
+        if format == "csv":
+            manifest["csv"] = CSV_CONVENTION
         for role in self._roles(roles):
             bucket = self.policy.bucket(role).name
             used: set = set()
-            for measurement, frame, tags in self._frames(bucket, selector, period):
+            for measurement, frame, tags, types in self._frames(bucket, selector, period):
                 (directory / role).mkdir(exist_ok=True)
                 path = directory / role / f"{_file_name(measurement, used)}.{format}"
                 if format == "csv":
@@ -435,6 +465,7 @@ class DataController:
                         "measurement": measurement,
                         "rows": len(frame),
                         "columns": {str(c): str(t) for c, t in frame.dtypes.items()},
+                        "influx_types": types,
                         "tags": tags,
                         "bytes": path.stat().st_size,
                         "sha256": _sha256(path),
@@ -459,9 +490,10 @@ class DataController:
         return manifest
 
     def _frames(self, bucket: str, selector: DataSelector, period: Period):
-        """(measurement, rows, tag columns) of the selection, one frame per measurement, sorted by time
+        """(measurement, rows, tag columns, InfluxDB types) of the selection, one frame per measurement, sorted by time
 
-        Columns: `_time` (UTC, nanoseconds), `_measurement`, the tags, then the fields.
+        Columns: `_time` (UTC, nanoseconds), `_measurement`, the tags, then the fields, each with the nullable dtype of
+        its Flux type (`_FLUX_DTYPES`).
         """
         flux = (
             f"from(bucket: {_string(bucket)}) |> range({period.flux_range()}) |> filter(fn: {selector.flux_filter()})"
@@ -472,21 +504,42 @@ class DataController:
         for table in self._query(flux):  # one table per series: its group key gives the tags
             if not table.records:
                 continue
-            labels = [c.label for c in table.columns]
             tags = [c.label for c in table.columns if c.group and c.label not in ("_start", "_stop", "_measurement")]
-            frame = pd.DataFrame([record.values for record in table.records], columns=labels)
-            frame = frame.drop(columns=[c for c in _DROPPED_COLUMNS if c in frame])
+            types = {c.label: c.data_type for c in table.columns if c.label not in _DROPPED_COLUMNS}
+            columns = {}
+            for label in types:  # built column by column: a list of records would turn sparse integers into floats
+                values = [record.values.get(label) for record in table.records]
+                dtype = _FLUX_DTYPES.get(types[label])
+                columns[label] = pd.array(values, dtype=dtype) if dtype and label != "_time" else values
+            frame = pd.DataFrame(columns)
             frame["_time"] = pd.to_datetime(frame.pop("_time_ns").astype("int64"), unit="ns", utc=True)
-            entry = by_measurement.setdefault(str(frame["_measurement"].iloc[0]), {"frames": [], "tags": set()})
+            types.pop("_time_ns")
+            entry = by_measurement.setdefault(str(frame["_measurement"].iloc[0]), {"frames": [], "tags": set(), "types": {}})
             entry["frames"].append(frame)
             entry["tags"].update(tags)
+            for label, flux_type in types.items():
+                entry["types"].setdefault(label, set()).add(flux_type)
         for measurement in sorted(by_measurement):
             entry = by_measurement[measurement]
-            frame = pd.concat(entry["frames"], ignore_index=True).dropna(axis=1, how="all")
+            types = {
+                label: next(iter(found)) if len(found) == 1 else "mixed:" + ",".join(sorted(found))
+                for label, found in entry["types"].items()
+            }
+            dtypes = {label: _FLUX_DTYPES.get(t, "object") for label, t in types.items() if label != "_time"}
+            frames = []
+            for part in entry["frames"]:  # same columns and dtypes in every part: concat keeps them
+                for label, dtype in dtypes.items():
+                    if label not in part:
+                        part[label] = pd.array([None] * len(part), dtype=dtype)
+                    elif str(part[label].dtype) != dtype:  # a type that differs between series: the values as they are
+                        part[label] = part[label].astype("object")
+                frames.append(part)
+            frame = pd.concat(frames, ignore_index=True).dropna(axis=1, how="all")
             frame = frame.sort_values("_time", kind="stable").reset_index(drop=True)
             tags = sorted(t for t in entry["tags"] if t in frame)
             fields = sorted(c for c in frame.columns if c not in tags and c not in ("_time", "_measurement"))
-            yield measurement, frame[["_time", "_measurement", *tags, *fields]], tags
+            columns = ["_time", "_measurement", *tags, *fields]
+            yield measurement, frame[columns], tags, {c: types[c] for c in columns}
 
     # ------------------------------------------------------------------ residence
     def describe(self, check: bool = True) -> dict:

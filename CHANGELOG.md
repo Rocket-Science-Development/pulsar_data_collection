@@ -13,23 +13,36 @@ All notable changes to pulsar-data-collection. The format follows
   thread-safe: 37 of 40 concurrent `FaithfulnessScorer.score` calls from 4 threads raised
   `RuntimeError: Already borrowed` (0 of 10 sequential calls), and 1 of 240 runs of a demo campaign with
   `--workers 4` failed this way. The calls of one detector run one at a time; give each worker its own detector to
-  score in parallel.
+  score in parallel. The lock is left out of pickles and deep copies (multiprocessing) and recreated in the copy.
 - Without `spool_dir`, the writer (`SharedWriter`, and the private writer of each Pulse, which is built on it) no
-  longer drops the batches taken while the storage is in back-off when the queue still has room: they go back to the
-  front of their queue, in order, and are written once the storage answers again. The queue bound is unchanged:
-  beyond `max_queue_rows`, the oldest batches are dropped and counted ("Capture queue full"). The 0.11 remeasure
-  (SC-01, `SharedWriter(concurrency=4)` shared by 300 and 500 Pulse, InfluxDB timing out under load) dropped 10,000
-  and 5,000 rows this way ("rows dropped (storage unavailable)") with room left in the queues. The rows of the failed
-  request itself are counted as before (`uncertain_rows` after a timeout or a cut connection, `dropped_rows` after a
-  refused connection), and the spool path is unchanged.
+  longer drops rows that were certainly not stored while the queue still has room: the batches taken while the storage
+  is in back-off, and those of a write that failed without a timeout or a cut connection (e.g. a refused connection),
+  go back to their queue, each original batch in its place (by submission order), and are written once the storage
+  answers again. The queue bound is unchanged: beyond `max_queue_rows`, the oldest batches are dropped and counted
+  ("Capture queue full"). The 0.11 remeasure (SC-01, `SharedWriter(concurrency=4)` shared by 300 and 500 Pulse,
+  InfluxDB timing out under load) dropped 10,000 and 5,000 rows this way ("rows dropped (storage unavailable)") with
+  room left in the queues. Rows of a write that timed out or whose connection was cut are still counted in
+  `uncertain_rows` and never written again without spool; the spool path is unchanged.
+- Rows waiting for the end of a back-off no longer count towards `max_batch_rows`: they made every capture of the
+  other Pulse of a `SharedWriter` trigger a request of its own (100 one-row captures, 100 requests), and stopped the
+  replay of the other Pulse's spools.
+- `flush()` and the writer thread no longer wake each other in a loop (a full core for the whole flush timeout) while
+  rows wait for the storage or a request is in flight.
+- `PulseSink.flush(timeout_s)` and `PulsarSpanExporter.force_flush(timeout_millis)` give all record types one
+  deadline together; they flushed them one after another with 30 s each.
+- Test `test_endpoint_errors_are_retried_not_quarantined` of the evidence outbox read the counters before the outbox
+  had handled the 2xx on a loaded machine; it waits for them now.
 
 ### Changed
 
-- Consequence of the fix above, without `spool_dir`: during an outage the rows stay in memory (up to
+- Consequence of the writer fix above, without `spool_dir`: during an outage the rows stay in memory (up to
   `max_queue_rows` per Pulse) instead of being dropped, so `flush()` waits for the storage and returns `False` at its
   timeout instead of returning `True` at once; `close()` does not wait for the end of the back-off: it tries the
-  queued rows once more, then drops and counts them, as before. A crash during an outage can now lose up to
-  `max_queue_rows` rows per Pulse (they were dropped before); use `durability="wal"` to lose none.
+  queued rows once more, then drops and counts them, as before. Memory: number of Pulse x `max_queue_rows` at most
+  (about 3 GB for 300 Pulse at the default 100,000 rows, about 100 bytes per queued row in the lab): lower
+  `max_queue_rows` or set `spool_dir` for many models. A crash during an outage can now lose up to `max_queue_rows`
+  rows per Pulse (they were dropped before); use `durability="wal"` to lose none. A write that keeps failing without
+  a timeout (e.g. 401) is now tried again at each back-off until its rows leave the queue bound or the Pulse closes.
 
 ## [0.12.0] - 2026-11-04
 

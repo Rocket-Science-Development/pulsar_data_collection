@@ -14,6 +14,7 @@ from pulsar_data_collection.governance import (
     AuditJournal,
     DataController,
     DataSelector,
+    JournalError,
     Period,
     load_policy,
     parse_duration,
@@ -435,11 +436,82 @@ def test_delete_counts_deletes_verifies_purges_and_journals(tmp_path):
     assert report["status"] == "ok" and report["buckets"]["raw"]["remaining"] == 0
     assert fake.deleted[0] == ("1677-09-21T00:12:44Z", "2026-12-01T00:00:00Z", 'system_id="A"', "captures", "ministry")
     assert not list(spool_dir.iterdir()) and report["outbox"][0]["pending"] == 1
-    (entry,) = controller.journal.entries()
+    intent, entry = controller.journal.entries()
+    assert intent["action"] == "delete.intent" and intent["details"]["buckets"]["raw"]["points"] == 6
     assert entry["action"] == "delete" and entry["details"]["predicate"] == 'system_id="A"'
     assert entry["details"]["spool"][0]["rows"] == 4 and entry["details"]["reason"] == "request 42"
+    assert entry["details"]["intent_seq"] == intent["seq"]
     text = controller.journal.path.read_text()
     assert TOKEN not in text and '"label"' not in text and '"x"' not in text  # no token, no data value
+
+
+def _unjournalable(tmp_path, monkeypatch, case: str) -> tuple:
+    """A policy and a selector whose deletion entry could not be journaled, and the error expected"""
+    extra, selector, error = {}, DataSelector(system_id="A"), None
+    if case == "key not set":
+        monkeypatch.delenv("PULSAR_TEST_JOURNAL_KEY", raising=False)
+        extra, error = {"journal_key_env": "PULSAR_TEST_JOURNAL_KEY"}, RuntimeError
+    elif case == "secret-looking tag key":
+        selector, error = DataSelector(system_id="A", tags={"token_bucket": "b1"}), ValueError
+    else:  # a write interrupted by a crash
+        AuditJournal(tmp_path / "journal.jsonl").append("export", "dpo", {"rows": 1})
+        with open(tmp_path / "journal.jsonl", "ab") as handle:
+            handle.write(b'{"seq": 2, "at": "2026-11-0')
+        error = JournalError
+    return policy_dict(tmp_path, **extra), selector, error
+
+
+@pytest.mark.parametrize("case", ["key not set", "secret-looking tag key", "torn last line"])
+def test_a_deletion_that_cannot_be_journaled_changes_nothing(tmp_path, monkeypatch, case):
+    policy, selector, error = _unjournalable(tmp_path, monkeypatch, case)
+    spool_dir = tmp_path / "spool"
+    batch = meta("A")
+    batch["tags"]["token_bucket"] = "b1"  # selected in every case
+    Spool(spool_dir).save(frame(4), batch)
+    fake = FakeInflux({"captures": 0, "results": 0})
+    controller = DataController({**policy, "spool_dirs": [str(spool_dir)]}, client=fake)
+    journal_before = controller.journal.path.read_bytes() if controller.journal.path.exists() else b""
+    with pytest.raises(error):
+        controller.delete(selector)
+    assert fake.deleted == [] and len(list(spool_dir.iterdir())) == 1
+    assert (controller.journal.path.read_bytes() if controller.journal.path.exists() else b"") == journal_before
+
+
+def test_a_retention_change_that_cannot_be_journaled_is_not_made(tmp_path, monkeypatch):
+    monkeypatch.delenv("PULSAR_TEST_JOURNAL_KEY", raising=False)
+    fake = FakeInflux({"captures": 0, "results": 2 * 365 * 86400})
+    controller = DataController(policy_dict(tmp_path, journal_key_env="PULSAR_TEST_JOURNAL_KEY"), client=fake)
+    with pytest.raises(RuntimeError):
+        controller.apply_retention()
+    assert fake.updated == []
+
+
+def test_a_torn_last_line_is_reported_never_skipped(tmp_path):
+    journal = AuditJournal(tmp_path / "journal.jsonl")
+    journal.append("export", "dpo", {"rows": 1})
+    with open(journal.path, "ab") as handle:
+        handle.write(b'{"seq": 2, "at": "2026-11-0')
+    torn = journal.path.read_bytes()
+    with pytest.raises(JournalError, match="line 2 is not a complete entry"):
+        journal.append("export", "dpo", {"rows": 2})
+    assert journal.path.read_bytes() == torn and journal.verify()["line"] == 2
+    description = DataController(policy_dict(tmp_path), client=FakeInflux({})).describe()
+    assert "line 2" in description["journal"]["error"]
+
+
+def test_the_deletion_intent_is_journaled_before_anything_is_deleted(tmp_path):
+    fake = FakeInflux({"captures": 0, "results": 0})
+    controller = DataController(policy_dict(tmp_path), client=fake)
+    seen = []
+    delete = fake.delete_api
+
+    def delete_api():
+        seen.append([e["action"] for e in controller.journal.entries()])
+        return delete()
+
+    fake.delete_api = delete_api
+    controller.delete(DataSelector(system_id="A"))
+    assert seen[0] == ["delete.intent"] and [e["action"] for e in controller.journal.entries()] == ["delete.intent", "delete"]
 
 
 def test_controller_needs_a_token_only_to_connect(tmp_path, monkeypatch):

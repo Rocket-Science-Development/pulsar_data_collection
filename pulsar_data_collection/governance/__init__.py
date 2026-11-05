@@ -8,7 +8,7 @@
 """
 
 from .controller import DataController, verify_export
-from .journal import AuditJournal
+from .journal import AuditJournal, JournalError
 from .local import purge_outbox, purge_spool
 from .policy import BucketPolicy, GovernancePolicy, InfluxdbLocation, load_policy, parse_duration
 from .selection import DataSelector, Period
@@ -20,6 +20,7 @@ __all__ = [
     "DataSelector",
     "GovernancePolicy",
     "InfluxdbLocation",
+    "JournalError",
     "Period",
     "load_policy",
     "parse_duration",

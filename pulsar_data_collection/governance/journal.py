@@ -10,6 +10,11 @@ modifying, inserting, removing or reordering an entry breaks the chain from that
 or rewriting the whole file can only be detected against a head kept elsewhere (`verify(expected_head=...)`), or with
 the key. Entries hold who, what, when, the predicate and the counts: never data values, never tokens (details whose
 keys look like secrets are refused).
+
+A last line that is not a complete entry (a write interrupted by a crash) is never skipped nor repaired silently:
+`append` and `check` raise `JournalError` and `verify` reports the line, until an operator keeps a copy of the file,
+removes that line and runs `verify` again. Every operation that changes data checks first that its entry can be
+appended (`check`), so that a refused entry never follows a change already made.
 """
 
 import contextlib
@@ -24,6 +29,10 @@ from typing import Optional
 
 GENESIS = "0" * 64
 _SECRET_WORDS = ("token", "password", "secret", "authorization", "api_key", "apikey")
+
+
+class JournalError(RuntimeError):
+    """The audit journal cannot take a new entry (its last line is not a complete entry)"""
 
 
 def _canonical(entry: dict) -> bytes:
@@ -105,18 +114,40 @@ class AuditJournal:
         return hmac.new(key, data, hashlib.sha256).hexdigest() if key else hashlib.sha256(data).hexdigest()
 
     def _last(self) -> Optional[dict]:
+        """The last entry; JournalError when the last line is not a complete entry (never skipped)"""
         if not self.path.exists():
             return None
-        last = None
+        last, number, count = None, 0, 0
         with open(self.path, "rb") as handle:
             for line in handle:
+                count += 1
                 if line.strip():
-                    last = line
-        return json.loads(last) if last else None
+                    last, number = line, count
+        if last is None:
+            return None
+        try:
+            entry = json.loads(last) if last.endswith(b"\n") else None
+            complete = isinstance(entry, dict) and isinstance(entry.get("seq"), int) and isinstance(entry.get("hash"), str)
+        except ValueError:
+            complete = False
+        if not complete:
+            raise JournalError(
+                f"audit journal {self.path}: line {number} is not a complete entry (interrupted write?); nothing was "
+                "appended. Keep a copy of the file, remove that line, then check it with verify"
+            )
+        return entry
+
+    def check(self, details: Optional[dict] = None) -> None:
+        """Raise when an entry with these details could not be appended now: secret-looking keys (ValueError), key
+        variable not set (RuntimeError), last line not a complete entry (JournalError). Run it before changing data."""
+        _check_no_secret(details or {})
+        self._key()
+        self._last()
 
     def append(self, action: str, actor: str, details: dict) -> dict:
         """Add one entry (written and fsynced before returning); returns it with its hash"""
         _check_no_secret(details)
+        self._key()
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with self._lock, _file_lock(self.path.with_name(self.path.name + ".lock")):
             last = self._last()

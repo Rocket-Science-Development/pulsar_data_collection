@@ -193,7 +193,8 @@ class DataController:
         """Set the declared retention on every bucket in drift; each change is journaled (before and after)
 
         Returns the check_retention rows, with "applied" True for the buckets changed (or that would be, dry_run).
-        A missing bucket is reported, never created.
+        A missing bucket is reported, never created. A journal that could not take the entry (key not set, last line
+        not a complete entry) is found before any bucket is changed.
         """
         report = self.check_retention()
         for row in report:
@@ -204,6 +205,7 @@ class DataController:
             row["applied"] = True
             if dry_run:
                 continue
+            self.journal.check()
             bucket = self._find_bucket(declared.name)
             previous_s = row["actual_s"]
             retention_s, shard_s = declared.retention_s, declared.shard_group_s
@@ -274,9 +276,12 @@ class DataController:
         """Delete the selected data in the buckets (InfluxDB delete API), then in the spool and outbox stores
 
         The period is inclusive; None ends: everything. dry_run counts what would be deleted and changes nothing (not
-        journaled). Otherwise the deletion is verified by counting again (`remaining` must be 0) and journaled, with
-        the predicate and the counts, whatever its outcome (status "ok", "incomplete" or "error").
-        `local=False` leaves the spool and outbox stores untouched.
+        journaled). Otherwise, once counted and before anything is deleted, a `delete.intent` entry is journaled (the
+        predicate and the counts): a journal that cannot take it (key not set, last line not a complete entry,
+        secret-looking selector keys) stops the deletion before any change. The deletion is then verified by counting
+        again (`remaining` must be 0) and its outcome journaled as a `delete` entry (`intent_seq` points to the
+        intent), whatever it is: status "ok", "incomplete" or "error". `local=False` leaves the spool and outbox
+        stores untouched.
         """
         period = Period(start, stop)
         roles = self._roles(roles)
@@ -291,32 +296,44 @@ class DataController:
             "status": "ok",
             "errors": [],
         }
+        for role in roles:
+            name = self.policy.bucket(role).name
+            before = self._count(name, selector, period)
+            entry = {"bucket": name, "points": before["points"], "rows": before["rows"]}
+            entry["measurements"] = {m: c["rows"] for m, c in before["measurements"].items()}
+            report["buckets"][role] = entry
+        if dry_run:
+            if local:
+                report["spool"] = [purge_spool(d, selector, period, dry_run=True) for d in self.policy.spool_dirs]
+                report["outbox"] = [purge_outbox(d, selector, period, dry_run=True) for d in self.policy.outbox_dirs]
+            return report
+        intent = self.journal.append(
+            "delete.intent", self.actor, {**self._journal_view(report), "status": "started", "local": local, "reason": reason}
+        )
         try:
             for role in roles:
-                name = self.policy.bucket(role).name
-                before = self._count(name, selector, period)
-                entry = {"bucket": name, "points": before["points"], "rows": before["rows"]}
-                entry["measurements"] = {m: c["rows"] for m, c in before["measurements"].items()}
-                report["buckets"][role] = entry
-                if dry_run:
-                    continue
-                if before["points"]:
+                entry = report["buckets"][role]
+                if entry["points"]:
                     self._client.delete_api().delete(
-                        Period.rfc3339(period.start), Period.rfc3339(period.stop), selector.predicate(), bucket=name, org=self.org
+                        Period.rfc3339(period.start),
+                        Period.rfc3339(period.stop),
+                        selector.predicate(),
+                        bucket=entry["bucket"],
+                        org=self.org,
                     )
-                entry["remaining"] = self._count(name, selector, period)["points"]
+                entry["remaining"] = self._count(entry["bucket"], selector, period)["points"]
                 if entry["remaining"]:
                     report["status"] = "incomplete"
             if local:
-                report["spool"] = [purge_spool(d, selector, period, dry_run=dry_run) for d in self.policy.spool_dirs]
-                report["outbox"] = [purge_outbox(d, selector, period, dry_run=dry_run) for d in self.policy.outbox_dirs]
+                report["spool"] = [purge_spool(d, selector, period) for d in self.policy.spool_dirs]
+                report["outbox"] = [purge_outbox(d, selector, period) for d in self.policy.outbox_dirs]
         except Exception as error:  # noqa: BLE001 - journaled, then raised
             report["status"] = "error"
             report["errors"].append(f"{type(error).__name__}: {str(error)[:300]}")
             raise
         finally:
-            if not dry_run:
-                self.journal.append("delete", self.actor, {**self._journal_view(report), "reason": reason})
+            details = {**self._journal_view(report), "intent_seq": intent["seq"], "reason": reason}
+            self.journal.append("delete", self.actor, details)
         return report
 
     @staticmethod
@@ -369,6 +386,7 @@ class DataController:
         directory = Path(directory)
         if directory.exists() and any(directory.iterdir()):
             raise FileExistsError(f"export directory {directory} is not empty")
+        self.journal.check({"selector": selector.describe()})  # an export that cannot be journaled is not written
         directory.mkdir(parents=True, exist_ok=True)
         period = Period(start, stop)
         manifest = {
@@ -497,7 +515,10 @@ class DataController:
         if "_error" in actual:
             description["influxdb"]["error"] = actual["_error"]
         if check:
-            description["journal"].update(entries=len(self.journal.entries()), head=self.journal.head())
+            try:
+                description["journal"].update(head=self.journal.head(), entries=len(self.journal.entries()))
+            except (ValueError, RuntimeError) as error:  # a torn last line: reported, see journal verify
+                description["journal"]["error"] = f"{type(error).__name__}: {str(error)[:300]}"
         return description
 
 

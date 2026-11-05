@@ -1163,7 +1163,12 @@ with DataController("governance.yaml", actor="jdoe") as control:
   `pyarrow`. A measurement is held in memory while it is written: export long periods in parts (`start` / `stop`).
 - **Audit journal.** Every retention change, deletion (whatever its outcome, with the error if any) and export
   appends one JSON line, fsynced: sequence number, UTC time, actor, action, details (bucket, predicate, period,
-  counts, reason); never data values, never tokens (details with secret-looking keys are refused). Each entry holds
+  counts, reason); never data values, never tokens (details with secret-looking keys are refused). A deletion writes
+  a `delete.intent` entry (predicate and counts) before deleting anything, then its `delete` outcome entry
+  (`intent_seq`). Before any change, the journal must be able to take the entry: a key variable not set, a
+  secret-looking key in the selector (e.g. a tag named `token_bucket`) or a last line that is not a complete entry
+  (a write interrupted by a crash) stops the operation with nothing changed. A torn last line is never skipped:
+  keep a copy of the file, remove that line, and check the journal with `verify()`. Each entry holds
   the hash of the previous one and its own (SHA-256, or HMAC-SHA256 with `journal_key_env`). `verify()` finds the first
   modified, inserted, removed or reordered entry. Removing the last entries, or rewriting the whole file without the
   key, leaves a valid chain: record the head (`journal.head()`, also in `describe()`) elsewhere, e.g. in the change

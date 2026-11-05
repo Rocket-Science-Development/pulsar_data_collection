@@ -35,6 +35,15 @@ def _now() -> str:
 
 
 def _version() -> str:
+    """Version of the code that runs: the source tree's pyproject.toml when the package is imported from a checkout
+    (an editable install keeps the metadata of the version it was installed at), else the installed metadata"""
+    pyproject = Path(__file__).resolve().parents[2] / "pyproject.toml"
+    text = pyproject.read_text(encoding="utf-8") if pyproject.is_file() else ""
+    if 'name = "pulsar-data-collection"' in text:
+        for line in text.splitlines():
+            key, _, value = line.partition("=")
+            if key.strip() == "version" and value.strip():
+                return value.strip().strip("\"'")
     try:
         return metadata.version("pulsar-data-collection")
     except metadata.PackageNotFoundError:  # pragma: no cover - source checkout without install

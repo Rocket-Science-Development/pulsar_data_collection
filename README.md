@@ -170,7 +170,7 @@ Writing to the database must not slow down predictions. By default (`mode="backg
   the answer, may have been stored by InfluxDB: with `spool_dir` it is spooled and written again (writes are
   idempotent: same measurement, tags and timestamp overwrite the same point, no duplicate); without it the rows go
   back to the queue, in their place, and are written **once more** when the back-off ends and InfluxDB answers its
-  `/ping` (`retry_uncertain=True`, the
+  `/ping` (only these rows wait for it, and are sent anyway after 3 pings without answer; `retry_uncertain=True`, the
   default since 0.13.1; counted in `retried_uncertain_rows`). They are counted in `uncertain_rows` (not in
   `dropped_rows`) only if that second write is uncertain too, if the queue bound drops them (they are the oldest
   rows, so they go first), or if `close()` finds them still waiting; never written a third time.
@@ -402,8 +402,8 @@ latencies are higher than on the lab machines):
   `uncertain_rows`; InfluxDB had stored 0 to 10 % of them). A backend that is down behind a port forwarder or a load
   balancer (Docker, Kubernetes) often accepts the connection and then closes it, which also counts as uncertain, not
   refused. Since 0.13.1 these rows are written once more, once InfluxDB answers `/ping` (see above). Rerun without
-  spool, rows lost (private writers / `SharedWriter`): lossy link 5 %, 200 / 0 (11,700 / 6,050 in 0.13.0); lossy link
-  20 %, 600 / 5,000 (37,100 / 35,650; second write cut too); flapping link, 0 / 0 (41,450 / 39,800). Still 0
+  spool, rows lost (private writers / `SharedWriter`): lossy link 5 %, 0 / 0 (11,700 / 6,050 in 0.13.0); lossy link
+  20 %, 5,200 / 5,000 (37,100 / 35,650; second write cut too); flapping link, 0 / 0 (41,450 / 39,800). Still 0
   duplicate, exact counters, no blocked capture, queues and RSS within their bounds. With `spool_dir` these rows are
   spooled and replayed: 0 row lost, 0 duplicate. **Set `spool_dir` on any link that can drop connections**: the
   single in-memory retry does not cover a second cut, a long outage or a restart.

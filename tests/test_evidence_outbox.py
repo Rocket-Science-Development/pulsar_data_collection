@@ -378,12 +378,24 @@ def test_sending_thread_survives_unexpected_errors_and_logs_once(receiver, tmp_p
 
 
 @pytest.mark.parametrize("status", [404, 405, 410, 421])
-def test_endpoint_errors_are_retried_not_quarantined(receiver, tmp_path, status):
+def test_endpoint_errors_are_retried_not_quarantined(receiver, tmp_path, status, monkeypatch):
     receiver.script = [status, status]
-    with outbox(receiver.url, tmp_path) as box:
+    post = EvidenceOutbox._post
+
+    def slow_post(self, rows):  # a loaded machine: the 2xx is handled well after the receiver stored the records
+        outcome = post(self, rows)
+        if outcome[0] == "sent":
+            time.sleep(0.3)
+        return outcome
+
+    monkeypatch.setattr(EvidenceOutbox, "_post", slow_post)
+    with outbox(receiver.url, tmp_path, timeout_s=30.0) as box:  # no request timeout on a slow machine either
         box.put_many(records(3))
-        assert wait_for(lambda: len(receiver.ids()) == 3, timeout_s=30)
+        # wait for the outbox to have handled the 2xx, not only for the receiver to hold the records: the stats were
+        # read in between on a loaded machine
+        assert wait_for(lambda: box.stats()["sent"] == 3, timeout_s=30)
         stats = box.stats()
+    assert sorted(receiver.ids()) == ["ev-0000", "ev-0001", "ev-0002"]
     assert stats["failed"] == 0 and stats["sent"] == 3 and stats["retried"] == 6
 
 

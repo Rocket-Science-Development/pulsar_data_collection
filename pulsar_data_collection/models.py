@@ -110,7 +110,7 @@ class CaptureOptions(BaseModel):
     Upper bound of the exponential delay before retrying an unavailable storage engine
     spool_dir: Optional[Path]
     Directory where batches are saved while the storage engine is unavailable, then replayed. Without it, these rows
-    are dropped and counted.
+    wait in the in-memory queue (within max_queue_rows; beyond, the oldest batches are dropped and counted).
     strict_startup: bool
     Raise at creation when the storage engine cannot be reached. By default (background mode) Pulse starts anyway and
     spools or drops until the storage is back. Configuration errors (unknown bucket or organization, rejected token)

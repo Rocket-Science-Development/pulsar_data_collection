@@ -10,6 +10,10 @@
 - `FaithfulnessScorer`: how much an answer is supported by the retrieved passages (multilingual NLI entailment on
   overlapping premise windows); default model MoritzLaurer/mDeBERTa-v3-base-xnli-multilingual-nli-2mil7 (MIT).
 
+Each detector can be shared by several threads: its tokenizer and model calls are serialized by a per-instance lock (the
+Hugging Face fast tokenizers raise `RuntimeError: Already borrowed` when two threads use them at once). Calls of one
+detector therefore run one at a time; give each worker its own detector to score in parallel.
+
 The scores are **ranks, not calibrated probabilities**: fit an alert threshold on a benign reference of the deployment
 (`calibrate_threshold`, A/A) or, with labelled data, a calibrator (`ScoreCalibrator`).
 
@@ -23,6 +27,7 @@ writes `pulsar.detector.<name>` on a span, and the `agent_run`, `llm_call` and `
 import inspect
 import math
 import re
+import threading
 import unicodedata
 import warnings
 from dataclasses import dataclass, field
@@ -110,6 +115,20 @@ def _token_windows(spans: List[tuple], size: int, step: int) -> List[tuple]:
         if last == len(spans) - 1:
             break
     return windows
+
+
+class _Locked:
+    """A per-instance lock (`_lock`) around the tokenizer and model calls; pickling and deep copies (multiprocessing)
+    leave it out and give the copy a new one"""
+
+    def __getstate__(self):
+        state = self.__dict__.copy()
+        state.pop("_lock", None)
+        return state
+
+    def __setstate__(self, state):
+        self.__dict__.update(state)
+        self._lock = threading.RLock()
 
 
 # --------------------------------------------------------------------------------------------------------------------
@@ -379,7 +398,7 @@ class ClassifierScore:
     window_scores: List[float] = field(default_factory=list)  # raw score of each window
 
 
-class TextClassifierDetector:
+class TextClassifierDetector(_Locked):
     """A Hugging Face text classifier as a detector: score = probability mass of the `positive_labels`
 
     The model reads at most `max_length` tokens, special tokens included (510 text tokens at 512): its **horizon**.
@@ -445,6 +464,7 @@ class TextClassifierDetector:
     ):
         if long_text not in ("truncate", "sliding"):
             raise ValueError('long_text must be "truncate" or "sliding"')
+        self._lock = threading.RLock()  # the tokenizer and the model are not thread-safe
         if name is not None:
             self.name = name
         if positive_labels is not None:
@@ -474,7 +494,8 @@ class TextClassifierDetector:
         """Text tokens the model reads in one call: `max_length` minus the special tokens"""
         tokenizer = getattr(self._classify, "tokenizer", None)
         try:
-            special = int(tokenizer.num_special_tokens_to_add(pair=False))
+            with self._lock:
+                special = int(tokenizer.num_special_tokens_to_add(pair=False))
         except (AttributeError, TypeError, ValueError):
             special = 2
         return max(self.max_length - special, 1)
@@ -489,7 +510,8 @@ class TextClassifierDetector:
     def windows(self, text: str) -> tuple:
         """(windows, text tokens): the [start, end) character spans scored, one unless long_text="sliding" and the text
         is longer than the horizon"""
-        spans = _token_spans(getattr(self._classify, "tokenizer", None), text)
+        with self._lock:
+            spans = _token_spans(getattr(self._classify, "tokenizer", None), text)
         horizon = self.horizon
         if self.long_text == "truncate" or len(spans) <= horizon:
             return [(0, len(text))], len(spans)
@@ -508,11 +530,12 @@ class TextClassifierDetector:
 
     def _run(self, chunks: List[str], batch_size: Optional[int]) -> List[float]:
         """Raw scores of `chunks`; a single chunk without `batch_size` in a single-text call"""
-        if len(chunks) == 1 and batch_size is None:
-            if self._all_labels:  # a list in, one list of every label out per text
-                return [self._positive_score(self._classify([chunks[0]])[0])]
-            return [self._positive_score(self._classify(chunks[0])[0])]
-        return [self._positive_score(r) for r in self._classify(chunks, batch_size=batch_size or 16)]
+        with self._lock:
+            if len(chunks) == 1 and batch_size is None:
+                if self._all_labels:  # a list in, one list of every label out per text
+                    return [self._positive_score(self._classify([chunks[0]])[0])]
+                return [self._positive_score(self._classify(chunks[0])[0])]
+            return [self._positive_score(r) for r in self._classify(chunks, batch_size=batch_size or 16)]
 
     def _details(self, texts: List[str], batch_size: Optional[int]) -> List[ClassifierScore]:
         out: List[Optional[ClassifierScore]] = [None] * len(texts)
@@ -662,7 +685,7 @@ class PiiScan(list):
         self.windows, self.truncated_windows = windows, truncated_windows
 
 
-class ModelPiiDetector:
+class ModelPiiDetector(_Locked):
     """Rule-based findings (validated identifiers) plus a named-entity model for names and addresses
 
     Parameters
@@ -735,6 +758,7 @@ class ModelPiiDetector:
             from gliner import GLiNER
         except ImportError as exc:  # pragma: no cover - depends on the environment
             raise ImportError('ModelPiiDetector needs the "detectors" extra') from exc
+        self._lock = threading.RLock()  # GLiNER's tokenizer and model are not thread-safe
         self._model = GLiNER.from_pretrained(model)
         device = resolve_device(device)
         if device is not None:
@@ -778,7 +802,8 @@ class ModelPiiDetector:
         splitter = getattr(getattr(self._model, "data_processor", None), "words_splitter", None)
         if callable(splitter):
             try:
-                return [(int(s), int(e)) for _, s, e in splitter(text)]
+                with self._lock:
+                    return [(int(s), int(e)) for _, s, e in splitter(text)]
             except (TypeError, ValueError):  # pragma: no cover - a splitter of another shape
                 pass
         return [m.span() for m in _GLINER_TOKENS.finditer(text)]
@@ -795,11 +820,12 @@ class ModelPiiDetector:
 
     def _predict(self, chunks: List[str], labels: List[str], threshold: float, batch_size: Optional[int] = None) -> List[list]:
         model, batch_size = self._model, batch_size or self.batch_size
-        if callable(getattr(model, "inference", None)):
-            return model.inference(chunks, labels, threshold=threshold, batch_size=batch_size)
-        if callable(getattr(model, "batch_predict_entities", None)):  # gliner < 0.2.20
-            return model.batch_predict_entities(chunks, labels, threshold=threshold)
-        return [model.predict_entities(chunk, labels, threshold=threshold) for chunk in chunks]
+        with self._lock:
+            if callable(getattr(model, "inference", None)):
+                return model.inference(chunks, labels, threshold=threshold, batch_size=batch_size)
+            if callable(getattr(model, "batch_predict_entities", None)):  # gliner < 0.2.20
+                return model.batch_predict_entities(chunks, labels, threshold=threshold)
+            return [model.predict_entities(chunk, labels, threshold=threshold) for chunk in chunks]
 
     def _model_scan(self, texts: Sequence[str], batch_size: Optional[int] = None) -> List[tuple]:
         """(entities, windows, truncated windows) of each text, every window of every text in one model call"""
@@ -936,7 +962,7 @@ class FaithfulnessResult:
         return self.sentences_scored / self.sentences_total if self.sentences_total else None
 
 
-class FaithfulnessScorer:
+class FaithfulnessScorer(_Locked):
     """Share of the answer supported by the context: mean, over the answer's sentences, of the probability that the
     retrieved passages entail the sentence (1 = every sentence is supported). A ranking signal, not a calibrated
     probability: alert on a threshold fitted on an A/A reference (`calibrate_threshold(..., direction="low")`).
@@ -1010,6 +1036,7 @@ class FaithfulnessScorer:
         pipeline_kwargs.setdefault("truncation", True)
         pipeline_kwargs.setdefault("max_length", 512)
         pipeline_kwargs.setdefault("top_k", None)
+        self._lock = threading.RLock()  # the tokenizer and the model are not thread-safe
         self._nli = _pipeline("text-classification", model, device=device, dtype=dtype, **pipeline_kwargs)
         self.premise_split, self.premise_sentences, self.top_k_premises = premise_split, premise_sentences, top_k_premises
         self.window_tokens, self.stride_tokens = window_tokens, stride_tokens
@@ -1021,10 +1048,12 @@ class FaithfulnessScorer:
         return float(next((s["score"] for s in output if s["label"].lower().startswith("entail")), 0.0))
 
     def entailment(self, premise: str, hypothesis: str) -> float:
-        return self._entail(self._nli({"text": premise, "text_pair": hypothesis}))
+        with self._lock:
+            return self._entail(self._nli({"text": premise, "text_pair": hypothesis}))
 
     def _token_spans(self, premise: str) -> List[tuple]:
-        return _token_spans(getattr(self._nli, "tokenizer", None), premise)
+        with self._lock:
+            return _token_spans(getattr(self._nli, "tokenizer", None), premise)
 
     def premise_windows(self, premise: str) -> tuple:
         """(windows, premise tokens): the premise cut into overlapping windows of `window_tokens` tokens"""
@@ -1107,7 +1136,8 @@ class FaithfulnessScorer:
         else:
             pairs = [(i, w) for i in range(len(scored)) if not lexical[i] for w in windows]
         if pairs:
-            outputs = self._nli([{"text": w, "text_pair": scored[i]} for i, w in pairs], batch_size=self.batch_size)
+            with self._lock:
+                outputs = self._nli([{"text": w, "text_pair": scored[i]} for i, w in pairs], batch_size=self.batch_size)
             if outputs and isinstance(outputs[0], dict):
                 outputs = [outputs]  # a single pair comes back unwrapped
             for (i, _), out in zip(pairs, outputs):

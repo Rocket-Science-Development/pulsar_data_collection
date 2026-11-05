@@ -137,3 +137,26 @@ def test_shutdown_assembles_pending_traces():
     exporter.assembler.add(SpanView(5, 6, 77, "a", 0, 10, False, {sc.OPERATION: sc.OP_INVOKE_AGENT}))
     exporter.shutdown()
     assert len(sink.of("agent_run")) == 1
+
+
+class StuckPulse:
+    """A Pulse whose storage is down: flush() waits its whole timeout (rows kept in the queue since 0.12.1)"""
+
+    def __init__(self, timeouts):
+        self.timeouts = timeouts
+
+    def flush(self, timeout_s=30.0):
+        self.timeouts.append(timeout_s)
+        return False
+
+
+def test_force_flush_has_one_deadline_for_every_record_type():
+    """The record types were flushed one after another, each with the 30 s default: 90 s during an outage"""
+    from pulsar_data_collection.genai import PulseSink
+
+    timeouts = []
+    sink = PulseSink.__new__(PulseSink)
+    sink._pulses = {record_type: StuckPulse(timeouts) for record_type in ("agent_run", "tool_call", "llm_call")}
+    assert PulsarSpanExporter(sink).force_flush(timeout_millis=2_000) is False
+    assert len(timeouts) == 3 and all(t <= 2.0 for t in timeouts) and timeouts == sorted(timeouts, reverse=True)
+    assert PulsarSpanExporter(ListSink()).force_flush() is True  # a sink whose flush takes no timeout

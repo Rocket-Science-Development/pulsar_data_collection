@@ -1,5 +1,6 @@
 """OpenTelemetry SpanExporter turning GenAI spans into Pulsar records written with Pulse."""
 
+import inspect
 import logging
 import threading
 import time
@@ -60,9 +61,14 @@ class PulseSink:
             )
         )
 
-    def flush(self) -> None:
+    def flush(self, timeout_s: float = 30.0) -> bool:
+        """Wait for the queued records of every record type, within one deadline for all of them (during an outage
+        the rows wait in the queues, see `Pulse.flush`); True if all were written, spooled or dropped in time"""
+        deadline = time.monotonic() + timeout_s
+        done = True
         for pulse in self._pulses.values():
-            pulse.flush()
+            done = pulse.flush(max(0.0, deadline - time.monotonic())) and done
+        return done
 
     def stats(self) -> dict:
         return {record_type: pulse.stats() for record_type, pulse in self._pulses.items()}
@@ -209,8 +215,14 @@ class PulsarSpanExporter(SpanExporter):
             return self.assembler.stats()
 
     def force_flush(self, timeout_millis: int = 30_000) -> bool:
-        self.sink.flush()
-        return True
+        """Flush the sink within `timeout_millis` when its `flush` takes a `timeout_s` (as `PulseSink.flush`)"""
+        flush = self.sink.flush
+        try:
+            timed = "timeout_s" in inspect.signature(flush).parameters
+        except (TypeError, ValueError):  # pragma: no cover - builtins without a signature
+            timed = False
+        done = flush(timeout_s=timeout_millis / 1000) if timed else flush()
+        return done is not False
 
     def shutdown(self) -> None:
         with self._lock:

@@ -428,22 +428,27 @@ def test_connection_cuts_are_recognised_but_not_refusals():
 def test_writing_resumes_within_a_probe_interval_after_an_outage(store):
     store.down = True
     pulse = Pulse(params(), options(max_retry_delay_s=60, probe_interval_s=0.2))
+    writer = pulse._writer._writer
+    endpoint = pulse._writer._channel.endpoint
+    capture(pulse, batch(0), 0)  # refused: kept in the queue (0.12.1), tried again at each forced attempt
     for k in range(8):  # several failures: the back-off reaches tens of seconds
-        capture(pulse, batch(k * 100), k)
-        assert pulse.flush(5)
-        writer = pulse._writer._channel.endpoint
-        writer.retry_at = 0.0  # force the next attempt, so that the delay keeps growing
-    capture(pulse, batch(5000), 99)
-    assert pulse.flush(5)
-    assert pulse._writer._channel.endpoint.failures >= 8  # next attempt in 60 s without the probe
+        deadline = time.monotonic() + 5
+        while endpoint.failures <= k and time.monotonic() < deadline:
+            time.sleep(0.02)
+        assert endpoint.failures > k
+        with writer._condition:
+            endpoint.retry_at = 0.0  # force the next attempt, so that the delay keeps growing
+            writer._condition.notify_all()
+    assert not pulse.flush(0.3) and endpoint.failures >= 8  # next attempt in 60 s without the probe
+    assert pulse.stats()["dropped_rows"] == 0 and pulse.stats()["queued_rows"] == 50
     store.down = False
     time.sleep(0.5)
     started = time.monotonic()
     capture(pulse, batch(9000), 100)
     deadline = time.monotonic() + 3
-    while pulse.stats()["written_rows"] < 50 and time.monotonic() < deadline:
+    while pulse.stats()["written_rows"] < 100 and time.monotonic() < deadline:
         time.sleep(0.02)
-    assert pulse.stats()["written_rows"] == 50 and time.monotonic() - started < 1.5
+    assert pulse.stats()["written_rows"] == 100 and time.monotonic() - started < 1.5
     assert store.actions.pings >= 1
     pulse.close(timeout_s=1)
 
@@ -874,3 +879,180 @@ def test_an_older_success_does_not_clear_a_newer_back_off():
     writer._record_success(endpoint, endpoint.generation)
     assert endpoint.retry_at == 0.0
     writer.close()
+
+
+# ---------------------------------------------------------------------------------------------------------- L1 (0.11)
+def seq(start: int, rows: int = 10) -> pd.DataFrame:
+    return pd.DataFrame({"seq": range(start, start + rows)})
+
+
+def held(channel) -> None:
+    """Wait for the first failure of the channel's storage, then make its back-off long, whatever the test's pace"""
+    deadline = time.monotonic() + 5
+    while not channel.endpoint.failures and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert channel.endpoint.failures
+    with channel.writer._condition:
+        channel.endpoint.retry_at = time.monotonic() + 3600
+
+
+def test_rows_taken_during_a_back_off_wait_in_the_queue_without_spool():
+    """L1 (SC-01 tuned, 0.11 remeasure): without spool_dir, the batches taken while the storage was in back-off were
+    dropped ("rows dropped (storage unavailable)") although the queue had room; they now wait in the queue (within
+    max_queue_rows) and are written once the storage is back, in order. So does the batch whose refused connection
+    started the back-off: it was certainly not stored"""
+    storage = {"up": False, "rows": []}
+
+    def write(frame, meta):
+        if not storage["up"]:
+            raise ConnectionRefusedError("down")
+        storage["rows"].extend(frame["seq"])
+
+    writer = SharedWriter(flush_interval_s=0.05, concurrency=4, probe_interval_s=0.05)
+    channel = writer.register(Target(write_frame=write, ping=lambda: storage["up"]), {}, max_queue_rows=1000)
+    channel.submit(seq(0))
+    held(channel)
+    for k in range(1, 4):
+        channel.submit(seq(k * 10))
+    assert not channel.flush(0.3)  # the rows wait for the storage
+    waiting = channel.stats()
+    storage["up"] = True  # the probe sees it back
+    assert channel.flush(10)
+    stats = channel.stats()
+    writer.close()
+    assert waiting["dropped_rows"] == 0 and waiting["queued_rows"] == 40 and waiting["written_rows"] == 0
+    assert storage["rows"] == list(range(40))
+    assert stats["written_rows"] == 40 and stats["dropped_rows"] == 0 and stats["captured_rows"] == 40
+
+
+def test_timed_out_rows_stay_uncertain_not_requeued():
+    """A timeout may have stored the rows: still counted in uncertain_rows, never written again without spool"""
+    writer = SharedWriter(flush_interval_s=0.05, concurrency=1, probe_interval_s=None)
+    calls = []
+
+    def write(frame, meta):
+        calls.append(len(frame))
+        raise StorageWriteTimeoutError("timed out")
+
+    channel = writer.register(Target(write_frame=write), {})
+    channel.submit(seq(0))
+    assert channel.flush(5)
+    stats = channel.stats()
+    writer.close()
+    assert stats["uncertain_rows"] == 10 and stats["dropped_rows"] == 0 and calls == [10]
+
+
+def test_rows_caught_by_a_back_off_go_back_in_order_within_the_queue_bound():
+    """Rows taken while the storage was available, then caught by a back-off started by another request, go back to
+    the front of the queue, batch by batch; beyond max_queue_rows the oldest batches are dropped and counted, as for
+    any batch"""
+    sent = []
+    writer = SharedWriter(flush_interval_s=60, concurrency=1, probe_interval_s=None)
+    channel = writer.register(Target(write_frame=lambda f, m: sent.append(list(f["seq"]))), {}, max_queue_rows=30)
+    with writer._condition:
+        channel.endpoint.retry_at = time.monotonic() + 3600  # the writer thread leaves the queue alone
+    channel.submit(seq(0))
+    channel.submit(seq(10))
+    with writer._condition:
+        channel.endpoint.retry_at = 0.0
+        taken = writer._take()  # taken while the storage is available...
+        channel.endpoint.retry_at = time.monotonic() + 3600  # ...then another request fails
+    channel.submit(seq(20))
+    for job in writer._jobs(taken):
+        writer._run_job(job)
+    assert [list(e.frame["seq"]) for e in channel.queue] == [list(range(k, k + 10)) for k in (0, 10, 20)]
+    assert channel.stats()["dropped_rows"] == 0 and channel.pending_rows == 0 and not sent
+    channel.submit(seq(30))  # 40 rows for a bound of 30: the oldest batch goes, counted
+    assert [list(e.frame["seq"]) for e in channel.queue] == [list(range(k, k + 10)) for k in (10, 20, 30)]
+    assert channel.stats()["dropped_rows"] == 10
+    writer.close(timeout_s=5)  # closing during the back-off: the queued rows are dropped and counted, no wait
+    stats = channel.stats()
+    assert stats["dropped_rows"] == 40 and stats["queued_rows"] == 0 and not sent
+
+
+def test_requeued_batches_keep_their_interleaving():
+    """Batches of different columns are written in separate requests; put back after a back-off, they keep their
+    submission order, also when the clock did not move between them (15.6 ms ticks on Windows)"""
+    writer = SharedWriter(flush_interval_s=60, concurrency=1, probe_interval_s=None)
+    channel = writer.register(Target(write_frame=lambda f, m: None), {})
+    with writer._condition:
+        channel.endpoint.retry_at = time.monotonic() + 3600
+    for frame in (seq(0), seq(10).assign(x=1.5), seq(20), seq(30).assign(x=2.5), seq(40)):
+        channel.submit(frame)
+    with writer._condition:
+        channel.endpoint.retry_at = 0.0
+        taken = writer._take()
+        channel.endpoint.retry_at = time.monotonic() + 3600
+    channel.submit(seq(50))
+    for job in writer._jobs(taken):  # one job per set of columns
+        writer._run_job(job)
+    assert [e.frame["seq"].iloc[0] for e in channel.queue] == [0, 10, 20, 30, 40, 50]
+    assert [list(e.frame.columns) for e in channel.queue][:2] == [["seq"], ["seq", "x"]]
+    writer.close(timeout_s=5)
+
+
+def test_rows_held_in_back_off_do_not_wake_the_writer_for_every_capture():
+    """Rows waiting for the end of a back-off counted towards max_batch_rows: every capture of any other Pulse then
+    woke the writer, and went out in a request of its own"""
+    writer = SharedWriter(flush_interval_s=60, max_batch_rows=5000, concurrency=1, probe_interval_s=None)
+    down = writer.register(Target(write_frame=lambda f, m: None), {}, max_queue_rows=100_000)
+    requests = []
+    up = writer.register(Target(write_frame=lambda f, m: requests.append(len(f))), {}, max_queue_rows=100_000)
+    with writer._condition:
+        down.endpoint.retry_at = time.monotonic() + 3600
+    down.submit(seq(0, 6000))  # more than max_batch_rows, held
+    wakes = []
+    notify = writer._condition.notify_all
+
+    def counted():
+        if sys._getframe(1).f_code.co_name == "submit":
+            wakes.append(1)
+        notify()
+
+    writer._condition.notify_all = counted
+    for k in range(100):
+        up.submit(seq(k, 1))
+    # 100 wake-ups before the fix. The writer thread may already be awake from its start and take some of the first
+    # rows in one batch (seen on fast CI machines), so the ready-row count is not asserted exactly
+    assert not wakes
+    assert up.flush(5)
+    writer.close(timeout_s=1)
+    assert sum(requests) == 100 and len(requests) <= 3
+
+
+def test_spools_replay_while_another_channel_holds_rows_in_back_off(tmp_path):
+    """The replay of the spools gives way to live batches; rows held in another channel's back-off are not live ones"""
+    spool = Spool(tmp_path)
+    spool.save(seq(0), {})
+    writer = SharedWriter(flush_interval_s=0.05, max_batch_rows=5000, concurrency=1, probe_interval_s=None)
+    down = writer.register(Target(write_frame=lambda f, m: None), {}, max_queue_rows=100_000)
+    with writer._condition:
+        down.endpoint.retry_at = time.monotonic() + 3600
+    down.submit(seq(0, 6000))
+    healthy = writer.register(Target(write_frame=lambda f, m: None), {}, spool=spool)
+    deadline = time.monotonic() + 5  # replayed within a few writer loops; never before
+    while healthy.stats()["replayed_rows"] < 10 and time.monotonic() < deadline:
+        time.sleep(0.02)
+    stats = healthy.stats()
+    writer.close(timeout_s=1)
+    assert stats["replayed_rows"] == 10 and stats["spool_files"] == 0
+
+
+def test_flush_during_a_back_off_does_not_spin():
+    """flush() and the writer thread woke each other in a loop (a full core) while rows waited for the storage"""
+    writer = SharedWriter(flush_interval_s=1.0, concurrency=4, probe_interval_s=None)
+    channel = writer.register(Target(write_frame=lambda f, m: None), {})
+    with writer._condition:
+        channel.endpoint.retry_at = time.monotonic() + 3600
+    channel.submit(seq(0))
+    loops = []
+    take = writer._take
+
+    def counted():
+        loops.append(1)
+        return take()
+
+    writer._take = counted
+    assert not channel.flush(1.0)
+    writer.close(timeout_s=1)
+    assert len(loops) < 50  # about one per flush_interval_s; tens of thousands before

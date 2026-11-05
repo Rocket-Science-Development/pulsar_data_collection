@@ -50,6 +50,29 @@ HEDGED = [
 ]
 
 
+# answers whose negation is not about the sources: a source as attribution, a fact denied, records found empty
+NEGATED_ANSWERS = [
+    "The insurance policy does not cover dental care, according to the documents.",
+    "According to the documents, the error log says the file was not found.",
+    "There are no records of fraud for this client in the register.",
+    "La loi ne permet pas le cumul des deux allocations, selon les documents fournis.",
+]
+
+
+@pytest.mark.parametrize("answer", NEGATED_ANSWERS)
+def test_a_negation_that_answers_is_not_an_abstention(answer):
+    result = AbstentionDetector().detect(answer)
+    assert not result.abstained and result.kind == "answer"
+
+
+def test_an_answer_after_a_colon_is_hedged():
+    result = AbstentionDetector().detect(
+        "Il n'y a aucune mention de pénalité dans le contrat: le client peut résilier sans frais."
+    )
+    assert not result.abstained and result.kind == "hedged"
+    assert AbstentionDetector().detect("Il n'y a aucune information sur ce contrat :").abstained
+
+
 @pytest.mark.parametrize("answer", ABSTENTIONS)
 def test_abstentions_are_detected_in_french_and_english(answer):
     result = AbstentionDetector().detect(answer)

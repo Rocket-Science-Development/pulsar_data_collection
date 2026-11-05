@@ -20,12 +20,16 @@ How the rules decide (on the answer casefolded, accents and typographic apostrop
 1. leading sentences that only apologise ("Je suis désolé.", "Sorry.") are skipped;
 2. the first remaining sentence must state that the information is missing: a `NOT_FOUND_PATTERNS` match in a
    sentence that names a source (`SOURCE_WORDS`: passages, documents, information, register...), or a
-   `CANNOT_ANSWER_PATTERNS` match. A statement introduced as a justification ("..., car il n'y a pas d'information",
-   "because ...") does not count: the sentence answers and explains why;
-3. what follows must not answer: a later clause after a contrast ("mais", "cependant", "however"...) or a later
-   sentence that is neither another statement of missing information nor filler (`FILLER_PATTERNS`: an offer of help,
-   an invitation to rephrase, related items) makes the answer *hedged*: the agent said it found nothing, then answered
-   anyway. A hedged answer is an answer (`abstained` False, `kind` "hedged"), and so can be an answer without support.
+   `CANNOT_ANSWER_PATTERNS` match. The patterns built on a generic negation (`SOURCE_BOUND`: "ne contiennent pas",
+   "does not mention", "is not found"...) count only when a source word is their subject or object, in the same
+   clause and not as an attribution ("according to the documents", "selon les documents"): "The policy does not
+   cover dental care, according to the documents" answers. A statement introduced as a justification ("..., car il
+   n'y a pas d'information", "because ...") does not count: the sentence answers and explains why;
+3. what follows must not answer: a later clause after a contrast ("mais", "cependant", "however"...) or after a colon
+   ("aucune mention de pénalité : le client peut résilier sans frais"), or a later sentence that is neither another
+   statement of missing information nor filler (`FILLER_PATTERNS`: an offer of help, an invitation to rephrase,
+   related items) makes the answer *hedged*: the agent said it found nothing, then answered anyway. A hedged answer is
+   an answer (`abstained` False, `kind` "hedged"), and so can be an answer without support.
 """
 
 import re
@@ -52,21 +56,22 @@ NOT_FOUND_PATTERNS = (
     (
         "fr_none_found",
         r"\b(?:il n'y a|il n'existe|je n'ai (?:pas )?trouve|je n'ai rien trouve|n'ai trouve|je ne trouve"
-        r"|je n'arrive pas a trouver)\b[^.,;]{0,60}?\b(?:informations?|passages?|documents?|donnees|resultats?|mentions?"
-        r"|mentionne\w*|reponses?|sources?|references?|traces?|enregistrements?|fiches?|precisions?|details?"
-        r"|renseignements?|rien)\b",
+        r"|je n'arrive pas a trouver)\b[^.,;:]{0,60}?\b(?:informations?|passages?|documents?|donnees|resultats?"
+        r"|mentions?|mentionne\w*|reponses?|sources?|references?|traces?|precisions?|details?|renseignements?|rien)\b",
     ),
-    # "aucune information", "aucun document pertinent"
+    # "aucune information", "aucun document pertinent" ("aucun enregistrement de fraude" answers: records are the
+    # content of a register, not missing information)
     (
         "fr_none",
         r"\baucune? (?:\w+ )?(?:informations?|passages?|documents?|donnees|resultats?|mentions?|reponses?|sources?"
-        r"|references?|traces?|enregistrements?|fiches?)\b",
+        r"|references?|traces?)\b",
     ),
-    # "les passages ne contiennent pas", "les informations fournies ne traitent pas", "ne mentionnent aucune"
+    # "les passages ne contiennent pas", "les informations fournies ne concernent pas", "ne mentionnent aucune": verbs
+    # of information only ("la loi ne permet pas" answers), with a source as subject or object (SOURCE_BOUND)
     (
         "fr_source_lacks",
-        r"\bne (?:contien\w*|content\w*|mentionn\w*|fourni\w*|trait\w*|comport\w*|precis\w*|indiqu\w*|parl\w*"
-        r"|repond\w*|permet\w*|donn\w*|concern\w*|port\w*|abord\w*) (?:pas|aucun\w*|rien)\b",
+        r"\bne (?:contien\w*|mentionn\w*|fourni\w*|trait\w*|comport\w*|precis\w*|indiqu\w*|parl\w*|abord\w*|concern\w*)"
+        r" (?:pas|aucun\w*|rien)\b",
     ),
     # "n'est pas (explicitement) mentionné / indiqué / précisé / disponible dans les passages"
     (
@@ -89,18 +94,21 @@ NOT_FOUND_PATTERNS = (
         r"\bn'(?:a|ont|avaient|avait) (?:pas|rien) (?:trouve|fourni|donne|renvoye|retourne|contenu)\b"
         r"|\bn'(?:a|ont) pas (?:de|d') (?:reponse|information)",
     ),
-    # "there is no information", "I could not find any", "no relevant documents"
+    # "there is no information", "I could not find any", "no relevant documents" ("there are no records of fraud in
+    # the register" answers: records are the content of a register, not missing information)
     (
         "en_none_found",
-        r"\b(?:there (?:is|are|was|were) no|i (?:could not|couldn't|cannot|can't|was unable to|am unable to|did not"
-        r"|didn't) find|no (?:relevant |specific |such |further |additional )?(?:information|data|records?|results?"
-        r"|mentions?|entr(?:y|ies)|passages?|documents?|details))\b",
+        r"\b(?:there (?:is|are|was|were) no\b[^.,;:]{0,60}?\b(?:information|data|results?|mentions?|passages?"
+        r"|documents?|details|answers?|sources?|references?)|i (?:could not|couldn't|cannot|can't|was unable to"
+        r"|am unable to|did not|didn't) find|no (?:relevant |specific |such |further |additional )?(?:information|data"
+        r"|results?|mentions?|passages?|documents?|details))\b",
     ),
-    # "the register does not contain / list", "the passages don't mention"
+    # "the register does not contain / list", "the passages don't mention": verbs of information only ("the policy
+    # does not include it" answers), with a source as subject or object (SOURCE_BOUND)
     (
         "en_source_lacks",
-        r"\b(?:does|do|did) not (?:contain|list|include|mention|provide|cover|specify|state|have)\b|\b(?:doesn't|don't"
-        r"|didn't) (?:contain|list|include|mention|provide|cover|specify|state|have)\b",
+        r"\b(?:does|do|did) not (?:contain|list|mention|provide|specify|state|indicate|cover)\b"
+        r"|\b(?:doesn't|don't|didn't) (?:contain|list|mention|provide|specify|state|indicate|cover)\b",
     ),
     # "is not in the register", "is not found / listed / mentioned in the documents", "not available"
     (
@@ -109,6 +117,16 @@ NOT_FOUND_PATTERNS = (
         r"|provided|covered|part of)\b",
     ),
 )
+
+# NOT_FOUND patterns built on a generic negation: they count only with a source word as subject or object, in the
+# same clause ("the file was not found" is a fact, "the date is not found in the documents" missing information)
+SOURCE_BOUND = frozenset({"fr_source_lacks", "fr_not_stated", "fr_not_in", "en_source_lacks", "en_not_in"})
+# a source named as an attribution of the answer, not as the place that lacks the information
+ATTRIBUTION = re.compile(
+    r"\b(?:according to|based on|as per|selon|d'apres|conformement aux?|sur la base d\w*)\s+(?:\w+\s+){0,3}?"
+    + SOURCE_WORDS.pattern
+)
+_CLAUSE = re.compile(r"[,;:]|\s-\s")
 
 # Statements that the agent cannot answer, valid without a source word
 CANNOT_ANSWER_PATTERNS = (
@@ -228,9 +246,10 @@ class AbstentionDetector:
         found = []
         sourced = SOURCE_WORDS.search(sentence) is not None
         for name, pattern in self.cannot_answer + (self.not_found if sourced else ()):
-            match = pattern.search(sentence)
-            if match:
-                found.append((match.start(), match.end(), name))
+            for match in pattern.finditer(sentence):
+                if name not in SOURCE_BOUND or self._source_bound(sentence, match.start(), match.end()):
+                    found.append((match.start(), match.end(), name))
+                    break
         if not found:
             return None
         start, end, name = min(found)
@@ -242,6 +261,14 @@ class AbstentionDetector:
         if contrast is not None and self._answers(prefix[: contrast.start()]):
             return None  # "X pourrait être refusée par Y, mais il n'y a pas de mention...": answered first
         return name, end
+
+    @staticmethod
+    def _source_bound(sentence: str, start: int, end: int) -> bool:
+        """True when the clause of a match names a source other than as an attribution (its subject or object)"""
+        cuts = [m.end() for m in _CLAUSE.finditer(sentence, 0, start)]
+        after = _CLAUSE.search(sentence, end)
+        clause = sentence[cuts[-1] if cuts else 0 : after.start() if after else len(sentence)]
+        return SOURCE_WORDS.search(ATTRIBUTION.sub(" ", clause)) is not None
 
     def _answers(self, text: str) -> bool:
         """True when a clause or sentence gives content: neither missing information nor filler"""
@@ -269,7 +296,12 @@ class AbstentionDetector:
         name, end = first
         rest = sentences[0][end:]
         contrast = CONTRAST.search(rest)
-        hedged = (contrast is not None and self._answers(rest[contrast.end() :])) or any(self._answers(s) for s in sentences[1:])
+        colon = rest.find(":")
+        hedged = (
+            (contrast is not None and self._answers(rest[contrast.end() :]))
+            or (colon >= 0 and self._answers(rest[colon + 1 :]))
+            or any(self._answers(s) for s in sentences[1:])
+        )
         if hedged:
             return AbstentionResult(False, "hedged", name, 0.0)
         return AbstentionResult(True, "abstention", name, 1.0)

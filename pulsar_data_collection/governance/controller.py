@@ -33,7 +33,7 @@ _DROPPED_COLUMNS = ["result", "table", "_start", "_stop"]
 # missing boolean or string stays missing
 _FLUX_DTYPES = {"long": "Int64", "unsignedLong": "UInt64", "double": "float64", "boolean": "boolean", "string": "string"}
 CSV_CONVENTION = {
-    "strings": "quoted; an empty string is \"\"",
+    "strings": 'quoted; an empty string is ""',
     "null": "empty unquoted cell (no value in InfluxDB)",
     "times": "RFC 3339, UTC, nanoseconds",
 }

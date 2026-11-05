@@ -281,7 +281,6 @@ def test_spool_purge_reports_unreadable_files_and_removes_leftovers(tmp_path):
     assert purge_spool(tmp_path / "missing", DataSelector(system_id="A"))["exists"] is False
 
 
-
 def _interrupted_rewrite(directory: Path) -> tuple:
     """A batch of 10 rows and its purged copy of 4 rows (same time and id): a crash before the original was deleted"""
     original = Spool(directory).save(frame(10), meta("A"))
@@ -300,6 +299,7 @@ def test_purge_deletes_a_batch_superseded_by_an_interrupted_rewrite(tmp_path):
     original, purged = _interrupted_rewrite(tmp_path)
     report = purge_spool(tmp_path, DataSelector(system_id="B"))
     assert report["rows"] == 0 and not original.exists() and purged.exists()
+
 
 # ------------------------------------------------------------------ outbox
 def evidence(i: int, system: str, start: str = "2026-10-26T00:00:00Z", end: str = "2026-10-27T00:00:00Z") -> dict:
@@ -535,7 +535,6 @@ def test_the_deletion_intent_is_journaled_before_anything_is_deleted(tmp_path):
     assert seen[0] == ["delete.intent"] and [e["action"] for e in controller.journal.entries()] == ["delete.intent", "delete"]
 
 
-
 @pytest.mark.parametrize("case", ["damaged batch", "selected batch without timestamps"])
 def test_a_deletion_that_leaves_spool_files_is_incomplete(tmp_path, monkeypatch, capsys, case):
     spool_dir = tmp_path / "spool"
@@ -629,7 +628,6 @@ def test_export_parquet_keeps_integers_exact_and_nulls(tmp_path):
     assert frame["n"].iloc[0] == BIG and frame["note"].iloc[0] == "" and frame["note"].isna().tolist() == [False, True, True]
 
 
-
 def test_controller_needs_a_token_only_to_connect(tmp_path, monkeypatch):
     monkeypatch.delenv("PULSAR_INFLUX_TOKEN", raising=False)
     controller = DataController(policy_dict(tmp_path, central_service="https://user:pw@central.example/api?x=1"))
@@ -668,7 +666,9 @@ def test_cli_refuses_an_empty_or_injected_selection(tmp_path, monkeypatch, capsy
     assert not (tmp_path / "journal.jsonl").exists()
 
 
-@pytest.mark.parametrize("period", [["--start", "yesterday"], ["--stop", "2026-13-01"], ["--start", "2026-12-01", "--stop", "2026-11-01"]])
+@pytest.mark.parametrize(
+    "period", [["--start", "yesterday"], ["--stop", "2026-13-01"], ["--start", "2026-12-01", "--stop", "2026-11-01"]]
+)
 def test_cli_refuses_an_invalid_period(tmp_path, monkeypatch, capsys, period):
     (tmp_path / "policy.json").write_text(json.dumps(policy_dict(tmp_path)))
     monkeypatch.setenv("PULSAR_INFLUX_TOKEN", TOKEN)  # never used: refused before any request

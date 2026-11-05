@@ -5,8 +5,11 @@ time, and rows still in a running Pulse's memory would be written after the purg
 
 Spool invariants kept (see spool.py): a batch keeps its time prefix and id, so the replay order does not change; its
 name gives its new row count; a partly selected batch is rewritten through a temporary `.purge` file renamed onto its
-new name before the old file is deleted, so that a crash in between leaves at worst the old batch (purge to run again),
-never a lost or half-written one. A leftover `.purge` file (its original still exists) is deleted.
+new name before the old file is deleted, so that a crash never leaves a lost or half-written batch. A crash before the
+rename leaves the old batch and a `.purge` file, deleted by the next purge (purge to run again). A crash after the
+rename and before the deletion leaves both batches under the same time prefix and id: the next purge, and the next
+start of the spool (`spool.drop_superseded`), delete the one with more rows, so that its deleted rows are not
+replayed.
 
 Outbox: pending and quarantined records are deleted in one transaction. A running outbox copes with rows that
 disappear (a send of a deleted record deletes or quarantines nothing), but the records it had already read for a send
@@ -25,7 +28,7 @@ from typing import Optional
 import pandas as pd
 
 from ..evidence import DATABASE_NAME
-from ..spool import frame_from_json, frame_to_json
+from ..spool import drop_superseded, frame_from_json, frame_to_json
 from .selection import DataSelector, Period
 
 logger = logging.getLogger("pulsar_data_collection")
@@ -73,7 +76,8 @@ def purge_spool(directory: os.PathLike, selector: DataSelector, period: Optional
     for leftover in sorted(directory.glob("*.purge")):
         if not dry_run:
             leftover.unlink(missing_ok=True)
-    for path in sorted(p for p in directory.iterdir() if p.is_file() and _ANY.search(p.name)):
+    superseded = set(drop_superseded(directory, dry_run=dry_run))  # left by an interrupted rewrite
+    for path in sorted(p for p in directory.iterdir() if p.is_file() and _ANY.search(p.name) and p.name not in superseded):
         try:
             frame, meta = _read(path)
         except Exception:  # noqa: BLE001 - incomplete .tmp or damaged batch: reported, never guessed

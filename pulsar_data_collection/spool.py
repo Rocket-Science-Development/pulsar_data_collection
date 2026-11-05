@@ -8,6 +8,10 @@ names sort in the order of the batches even when the clock does not move between
   After a crash (kill -9), the next start turns them into spooled batches, so that they are replayed;
 - `.tmp`: file being written. A `.tmp` left by a crash is recovered at startup if it is complete, deleted otherwise.
 
+Two batches with the same time and id but different row counts are left by a purge (governance) interrupted between
+writing the rewritten batch and deleting the original: at startup the one with more rows is deleted
+(`drop_superseded`), so that the rows the purge removed are not replayed.
+
 A spool directory belongs to one Pulse of one process at a time.
 """
 
@@ -29,6 +33,29 @@ logger = logging.getLogger("pulsar_data_collection")
 SPOOL_SUFFIXES = (".json", ".json.gz")
 WAL_SUFFIXES = (".wal", ".wal.gz")
 _ROWS = re.compile(r"_(\d+)r\.")
+_BATCH = re.compile(r"^(?P<stamp>\d+)_(?P<id>[0-9a-f]+)_(?P<rows>\d+)r(?P<suffix>\.(?:json|wal)(?:\.gz)?(?:\.bad)?)$")
+
+
+def drop_superseded(directory: os.PathLike, dry_run: bool = False) -> list:
+    """Delete the batches superseded by a rewrite with fewer rows (same time, id and suffix); returns their names
+
+    A purge rewrites a batch under the same time and id with its new row count, then deletes the original: a crash in
+    between leaves both, and the original would replay the rows the purge removed. Rows are only ever removed from a
+    batch, so the copy with the fewest rows is the latest one.
+    """
+    groups: dict = {}
+    for path in Path(directory).iterdir():
+        match = _BATCH.match(path.name)
+        if match and path.is_file():
+            groups.setdefault((match["stamp"], match["id"], match["suffix"]), []).append((int(match["rows"]), path))
+    dropped = []
+    for copies in groups.values():
+        for _, path in sorted(copies, key=lambda c: c[0])[1:]:
+            dropped.append(path.name)
+            if not dry_run:
+                path.unlink(missing_ok=True)
+                logger.warning("Spool: batch %s superseded by a purged copy with fewer rows deleted", path.name)
+    return sorted(dropped)
 
 
 def _datetime_unit(dtype: str) -> str:
@@ -107,7 +134,9 @@ class Spool:
 
     # ------------------------------------------------------------------ startup recovery
     def _recover(self) -> None:
-        """Leftovers of a crash: complete `.tmp` files and write-ahead copies become spooled batches"""
+        """Leftovers of a crash: complete `.tmp` files and write-ahead copies become spooled batches, batches superseded by
+        an interrupted purge are deleted"""
+        drop_superseded(self.directory)
         for path in sorted(self.directory.glob("*.tmp")):
             try:
                 text = path.read_bytes()

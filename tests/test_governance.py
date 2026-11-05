@@ -23,7 +23,7 @@ from pulsar_data_collection.governance import (
 )
 from pulsar_data_collection.governance.__main__ import main
 from pulsar_data_collection.governance.policy import BucketPolicy, default_shard_group_s, format_duration
-from pulsar_data_collection.spool import Spool
+from pulsar_data_collection.spool import Spool, frame_to_json
 
 TOKEN = "tok-governance-synthetic-secret"  # synthetic
 
@@ -279,6 +279,26 @@ def test_spool_purge_reports_unreadable_files_and_removes_leftovers(tmp_path):
     assert sorted(p.name for p in tmp_path.iterdir()) == ["1_abc_2r.json.bad", "notes.txt"]
     assert purge_spool(tmp_path / "missing", DataSelector(system_id="A"))["exists"] is False
 
+
+
+def _interrupted_rewrite(directory: Path) -> tuple:
+    """A batch of 10 rows and its purged copy of 4 rows (same time and id): a crash before the original was deleted"""
+    original = Spool(directory).save(frame(10), meta("A"))
+    stamp, batch_id = original.name.split("_")[:2]
+    purged = directory / f"{stamp}_{batch_id}_4r.json"
+    purged.write_text(frame_to_json(frame(4), meta("A")), encoding="utf-8")
+    return original, purged
+
+
+def test_a_batch_superseded_by_an_interrupted_rewrite_is_not_replayed(tmp_path):
+    original, purged = _interrupted_rewrite(tmp_path)
+    assert Spool(tmp_path).files() == [purged] and not original.exists()
+
+
+def test_purge_deletes_a_batch_superseded_by_an_interrupted_rewrite(tmp_path):
+    original, purged = _interrupted_rewrite(tmp_path)
+    report = purge_spool(tmp_path, DataSelector(system_id="B"))
+    assert report["rows"] == 0 and not original.exists() and purged.exists()
 
 # ------------------------------------------------------------------ outbox
 def evidence(i: int, system: str, start: str = "2026-10-26T00:00:00Z", end: str = "2026-10-27T00:00:00Z") -> dict:

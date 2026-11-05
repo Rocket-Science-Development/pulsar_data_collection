@@ -45,6 +45,39 @@ def test_normalized_final_answer(answer, kind, labels, expected):
     assert normalize_answer(answer, kind, labels) == expected
 
 
+def test_yes_no_ignores_a_hyphenated_non():
+    assert normalize_answer("Les non-résidents paient-ils la taxe ? Oui.", "yes_no") == "yes"
+    assert normalize_answer("Le no-show est facturé.", "yes_no") is None
+
+
+@pytest.mark.parametrize(
+    "answer, expected",
+    [("1.234.567", "1234567"), ("1.234.567,5 €", "1234567.5"), ("COVID-19: 5 cases", "5"), ("A4: 3 pages", "3")],
+)
+def test_number_thousands_dots_and_numbers_inside_words(answer, expected):
+    assert normalize_answer(answer, "number") == expected
+
+
+@pytest.mark.parametrize(
+    "answer, kind",
+    [
+        ("Sorry, no, I cannot answer that.", "yes_no"),
+        ("I'm sorry, I can't say yes or no.", "yes_no"),
+        ("Je suis désolé, je ne peux pas répondre: non.", "yes_no"),
+        ("Sorry, I cannot give the 2026 figure.", "number"),
+    ],
+)
+def test_a_refusal_is_not_read_as_a_categorical_answer(answer, kind):
+    question = ConsistencyQuestion("q", "?", answer_type=kind)
+    probe = ConsistencyProbe([question], repeats=2)
+    assert probe._read(answer, question) == ("refusal", None)
+
+
+def test_a_final_answer_marker_after_an_apology_is_read():
+    question = ConsistencyQuestion("q", "?", answer_type="yes_no")
+    assert ConsistencyProbe([question], repeats=2)._read("I'm sorry for the delay. Answer: no", question) == ("ok", "no")
+
+
 def test_normalize_refuses_an_unknown_type():
     with pytest.raises(ValueError):
         normalize_answer("x", "essay")

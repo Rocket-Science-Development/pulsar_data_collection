@@ -44,9 +44,15 @@ ORIGINAL = "original"
 REFUSAL_VALUE = "<refusal>"  # normalized value of a refusal: two refusals agree
 
 _MARKER = re.compile(r"(?:final answer|answer|réponse finale|reponse finale|réponse|reponse)\s*[:：]", re.IGNORECASE)
-_YES_NO = re.compile(r"\b(yes|oui|no|non|true|vrai|false|faux)\b")
+# a whole word: the "non" of "non-résidents" or the "no" of "no-show" is not an answer
+_YES_NO = re.compile(r"\b(yes|oui|no|non|true|vrai|false|faux)\b(?![-‐]\w)")
 _YES = {"yes", "oui", "true", "vrai"}
-_NUMBER = re.compile(r"[-−]?\d{1,3}(?:[   ,]\d{3})+(?:[.,]\d+)?(?!\d)|[-−]?\d+(?:[.,]\d+)?")
+# a sign only outside a word and no number glued to a word ("COVID-19", "A4"); thousands separated by spaces, commas,
+# or at least two dots ("1.234.567")
+_NUMBER = re.compile(
+    r"(?:(?<!\w)[-−])?(?<![\w.,])(?<!\w[-−])"
+    r"(?:\d{1,3}(?:[ \u00a0\u202f,]\d{3})+(?:[.,]\d+)?(?!\d)|\d{1,3}(?:\.\d{3}){2,}(?:,\d+)?(?![\d.])|\d+(?:[.,]\d+)?)"
+)
 _ARTICLE = re.compile(r"^(?:the|a|an|le|la|les|l|un|une)\s+")
 
 
@@ -64,12 +70,15 @@ def _final_segment(text: str) -> str:
 
 
 def parse_number(text: str) -> Optional[float]:
-    """First number of the text: "6 370", "6,370", "6370.5", "3,5" (French decimal comma) and "-2" are read"""
+    """First number of the text: "6 370", "6,370", "1.234.567", "6370.5", "3,5" (French decimal comma) and "-2" are
+    read; a number inside a word ("COVID-19", "A4") is not"""
     match = _NUMBER.search(text)
     if not match:
         return None
-    raw = re.sub(r"[   ]", "", match.group(0)).replace("−", "-")
-    if "," in raw and "." in raw:
+    raw = re.sub(r"[ \u00a0\u202f]", "", match.group(0)).replace("−", "-")
+    if raw.count(".") > 1:  # 1.234.567 or 1.234.567,5: dots separate thousands
+        raw = raw.replace(".", "").replace(",", ".")
+    elif "," in raw and "." in raw:
         raw = raw.replace(",", "") if raw.rfind(".") > raw.rfind(",") else raw.replace(".", "").replace(",", ".")
     elif "," in raw:
         # 6,370 or 1,234,567: thousands; 3,5 or 12,75: decimal comma
@@ -377,7 +386,15 @@ class ConsistencyProbe:
         return out
 
     def _read(self, answer: Any, question: ConsistencyQuestion) -> tuple:
-        """(answer_status, normalized)"""
+        """(answer_status, normalized)
+
+        With the default normalization, a categorical answer that starts with a refusal is a refusal even when a yes /
+        no or a number can be read in it ("Sorry, no, I cannot answer that."), unless an "Answer:" marker gives the
+        answer after it.
+        """
+        if self.normalize is None and question.answer_type in CATEGORICAL_TYPES and is_refusal(answer):
+            if _final_segment(answer) is answer:  # no marker followed by an answer
+                return ANSWER_REFUSAL, None
         if question.answer_type in CATEGORICAL_TYPES or self.normalize is not None:
             value = (
                 self.normalize(answer, question)

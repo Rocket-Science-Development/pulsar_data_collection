@@ -155,14 +155,18 @@ Writing to the database must not slow down predictions. By default (`mode="backg
   rows are waiting, with a request timeout of `write_timeout_s`.
 - When a write fails, the database is considered unavailable for an exponential delay (1 s, 2 s, 4 s... up to
   `max_retry_delay_s`). Meanwhile batches go to the **spool directory** (`spool_dir`) instead of waiting, and are
-  replayed, oldest first, as soon as the database is available again. Without `spool_dir`, these rows are dropped and
-  counted. During the delay InfluxDB is probed (`/ping`) every `probe_interval_s` (1 s): writing resumes about a second
-  after the end of an outage, not up to 60 s later.
+  replayed, oldest first, as soon as the database is available again. Without `spool_dir`, they stay in the in-memory
+  queue, in order, and are written once the database is back; the queue bound applies (`max_queue_rows`, below), so a
+  longer outage drops the oldest batches and counts them in `dropped_rows` (before 0.12.1 every batch taken during the
+  delay was dropped, even with room in the queue). During the delay InfluxDB is probed (`/ping`) every
+  `probe_interval_s` (1 s): writing resumes about a second after the end of an outage, not up to 60 s later.
+  `flush()` waits for the database during the delay (and returns `False` at its timeout); `close()` does not wait:
+  during the delay it drops (or spools) and counts what is still queued.
 - A write that **timed out**, or whose **connection was cut** (reset, closed) once the request was sent and before
   the answer, may have been stored by InfluxDB: with `spool_dir` it is spooled and written again (writes are
   idempotent: same measurement, tags and timestamp overwrite the same point, no duplicate); without it the rows are
-  counted in `uncertain_rows`, not in `dropped_rows`. A refused connection never reached InfluxDB: its rows are dropped
-  (or spooled).
+  counted in `uncertain_rows`, not in `dropped_rows`. A refused connection never reached InfluxDB: the rows of the
+  failed request are dropped (or spooled); the batches that follow wait in the queue, as above.
 - A batch InfluxDB **refuses** (HTTP 400 / 422, e.g. a field type conflict) is never retried nor spooled. Frames are
   written together only when they share their columns *and* dtypes, object columns mixing numbers and strings are split
   by kind, and the counters are exact: on a partial write (422 `dropped=N`) the accepted rows are counted in
@@ -233,6 +237,15 @@ Each Pulse keeps its own queue bound, spool and counters; `max_batch_rows`, `flu
 and `write_concurrency` of its options are replaced by those of the writer. `pulse.close()` detaches the Pulse;
 `writer.close()` stops the thread.
 
+Failures are handled as for a private writer (see [Non-blocking capture and resilience](#non-blocking-capture-and-resilience)):
+the Pulses writing to the same InfluxDB client and bucket share one back-off. While it lasts, each Pulse's batches go
+to its spool or, without `spool_dir`, wait in its own queue up to its `max_queue_rows`, including batches already
+taken for a request when another request in flight failed (0.11 dropped those: 10,000 rows at 300 models and 5,000 at
+500 in the lab, with InfluxDB timing out under load and room left in the queues). Only the rows of the failed
+requests themselves are counted (`uncertain_rows` after a timeout, `dropped_rows` after a refused connection). For a
+multi-model server, set `spool_dir` all the same: memory only holds `max_queue_rows` per Pulse, and nothing survives
+a crash.
+
 **Private writers or shared writer?** The shared writer now drains as fast as private writers (the line protocol
 encoding used to limit it to 13,000 to 19,000 rows/s in the lab, see [Throughput](#throughput-measured)), so the
 choice is about the caller side:
@@ -250,7 +263,7 @@ choice is about the caller side:
 
 | `durability` | Rows lost by a crash of the process (`kill -9`) | Cost |
 |---|---|---|
-| `"memory"` (default) | the in-memory queue and the request in flight: about `flush_interval_s` of traffic at normal load, up to `max_queue_rows` + one batch (`max_batch_rows`, or the writer's) when the writer is saturated or the storage down (lab: up to 100,500 rows with the defaults in a 50k rows/s burst, one 5,000-row batch with the storage down) | none |
+| `"memory"` (default) | the in-memory queue and the request in flight: about `flush_interval_s` of traffic at normal load, up to `max_queue_rows` + one batch (`max_batch_rows`, or the writer's) when the writer is saturated or the storage down (lab: up to 100,500 rows with the defaults in a 50k rows/s burst; with the storage down, one 5,000-row batch in 0.11, up to `max_queue_rows` since 0.12.1, which keeps the rows in the queue during the back-off) | none |
 | `"wal"` (needs `spool_dir`) | none: each batch is written to `spool_dir` before `capture_data()` returns, deleted once stored, replayed at the next start (lab: 0 row lost and 0 duplicate over 9 `kill -9`, 3.4 million rows) | one file write per capture (no fsync: an OS crash or a power loss can still lose the last batches) |
 
 The default loss window on `kill -9` is therefore **`max_queue_rows` + one batch** per Pulse. For a deployment that must

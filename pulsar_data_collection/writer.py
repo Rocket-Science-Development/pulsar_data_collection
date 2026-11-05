@@ -148,6 +148,7 @@ class _Unit:
     files: list = field(default_factory=list)  # write-ahead or spool files holding exactly these rows
     whole: bool = True  # False once split: its files then hold more rows than it does
     lines: Optional[list] = None
+    queued_at: Optional[float] = None  # when its oldest batch was queued, to put it back in order
 
     @property
     def rows(self) -> int:
@@ -169,7 +170,15 @@ class _Unit:
             half = self.rows // 2
             bounds = [(0, half, [half]), (half, self.rows, [self.rows - half])]
         return [
-            _Unit(self.channel, self.frame.iloc[a:b].reset_index(drop=True), self.meta, sizes, self.replay, whole=False)
+            _Unit(
+                self.channel,
+                self.frame.iloc[a:b].reset_index(drop=True),
+                self.meta,
+                sizes,
+                self.replay,
+                whole=False,
+                queued_at=self.queued_at,
+            )
             for a, b, sizes in bounds
             if b > a
         ]
@@ -202,6 +211,7 @@ class Channel:
         self.queue: deque = deque()
         self.queued_rows = 0
         self.pending_rows = 0  # taken by the writer, not resolved yet
+        self.closing = False  # close() started: rows are no longer kept in the queue during a back-off
         self.closed = False
         self._replay_budget = 0.0
         self._replay_at = time.monotonic()
@@ -249,19 +259,47 @@ class Channel:
             self.queue.append(_Entry(frame, self.meta, time.monotonic(), wal))
             self.queued_rows += rows
             writer._queued_rows += rows
-            while self.queued_rows > self.max_queue_rows and len(self.queue) > 1:
-                dropped = self.queue.popleft()
-                size = len(dropped.frame)
-                self.queued_rows -= size
-                writer._queued_rows -= size
-                if dropped.wal is not None:
-                    self.spool.promote(dropped.wal)
-                    self._stats["spooled_rows"] += size
-                else:
-                    self._stats["dropped_rows"] += size
-                    logger.warning("Capture queue full (%d rows): %d oldest rows dropped", self.max_queue_rows, size)
-            if writer._queued_rows >= writer.max_batch_rows:
+            self._bound()
+            if writer._queued_rows >= writer.max_batch_rows and writer._ready(self, time.monotonic()):
                 writer._condition.notify_all()
+
+    def _bound(self) -> None:
+        """Drop (or spool) the oldest batches beyond max_queue_rows; called with the writer's condition held"""
+        while self.queued_rows > self.max_queue_rows and len(self.queue) > 1:
+            dropped = self.queue.popleft()
+            size = len(dropped.frame)
+            self.queued_rows -= size
+            self.writer._queued_rows -= size
+            if dropped.wal is not None:
+                self.spool.promote(dropped.wal)
+                self._stats["spooled_rows"] += size
+            else:
+                self._stats["dropped_rows"] += size
+                logger.warning("Capture queue full (%d rows): %d oldest rows dropped", self.max_queue_rows, size)
+
+    def requeue(self, unit: "_Unit") -> bool:
+        """Put rows not sent because of a back-off back in the queue, in their place (by queue time) and within
+        max_queue_rows like any batch; False when the channel is closing (the caller then drops them)"""
+        writer = self.writer
+        with writer._condition:
+            if self.closing or self.closed:
+                return False
+            frame, rows = unit.frame, unit.rows
+            if rows > self.max_queue_rows:  # as in submit(): only the newest rows fit
+                extra = rows - self.max_queue_rows
+                frame = frame.iloc[extra:].reset_index(drop=True)
+                rows = len(frame)
+                self._stats["dropped_rows"] += extra
+                logger.warning("Capture queue full (%d rows): %d oldest rows dropped", self.max_queue_rows, extra)
+            queued_at = unit.queued_at if unit.queued_at is not None else time.monotonic()
+            position = 0
+            while position < len(self.queue) and self.queue[position].queued_at < queued_at:  # ties: before
+                position += 1
+            self.queue.insert(position, _Entry(frame, unit.meta, queued_at))
+            self.queued_rows += rows
+            writer._queued_rows += rows
+            self._bound()
+            return True
 
     def flush(self, timeout_s: float = 30.0) -> bool:
         """Wait until every submitted row has been written, spooled or dropped; True if done within the timeout"""
@@ -282,7 +320,11 @@ class Channel:
         return True
 
     def close(self, timeout_s: float = 30.0) -> None:
-        """Write (or spool) what is pending, then detach from the writer"""
+        """Write (or spool) what is pending, then detach from the writer; rows kept in the queue during a back-off are
+        tried once more, then spooled or dropped and counted, without waiting for the end of the back-off"""
+        with self.writer._condition:
+            self.closing = True
+            self.writer._condition.notify_all()
         self.flush(timeout_s)
         with self.writer._condition:
             self.closed = True
@@ -341,7 +383,8 @@ class SharedWriter:
     - Frames are grouped by channel, columns and dtypes; channels with the same line-protocol target share requests.
     - After a failed write, the destination is considered unavailable for an exponential delay (1 s, 2 s, 4 s... up to
       `max_retry_delay_s`); every `probe_interval_s` a cheap probe (InfluxDB /ping) checks whether it is back, so that
-      writing resumes within about a second of the end of an outage.
+      writing resumes within about a second of the end of an outage. Meanwhile the batches of its channels go to their
+      spool or, without spool, stay in their queue (within `max_queue_rows`) until it is back.
     - A refused write (HTTP 400 / 422) is counted exactly: from the `dropped=N` of a partial write when the request
       held one batch, otherwise by writing again batch by batch, then in halves down to single rows.
     - A write that timed out, or whose connection was cut before the answer, may have been stored: spooled (replaying is
@@ -446,9 +489,10 @@ class SharedWriter:
 
     # ------------------------------------------------------------------ writer thread
     def _take(self) -> list:
-        """Up to max_batch_rows rows, taking channels in turn"""
+        """Up to max_batch_rows rows, taking channels in turn (not those whose rows wait for the end of a back-off)"""
         taken, rows = [], 0
-        channels = [c for c in self._channels if c.queue]
+        now = time.monotonic()
+        channels = [c for c in self._channels if c.queue and self._ready(c, now)]
         if not channels:
             return taken
         start = self._next % len(channels)
@@ -470,14 +514,24 @@ class SharedWriter:
                     break
         return taken
 
+    @staticmethod
+    def _ready(channel: Channel, now: float) -> bool:
+        """The queued rows of a channel can be taken: its storage is available, or they go to its spool anyway, or it
+        is closing (its rows are then written, spooled or dropped without waiting)"""
+        return now >= channel.endpoint.retry_at or channel.spool is not None or channel.closing
+
+    def _ready_rows(self) -> int:
+        """Queued rows that can be taken now (not those waiting for the end of a back-off); with the condition held"""
+        if not self._queued_rows:
+            return 0
+        now = time.monotonic()
+        return sum(c.queued_rows for c in self._channels if self._ready(c, now))
+
     def _run(self) -> None:
         while True:
             with self._condition:
-                if (
-                    not self._stopping
-                    and self._queued_rows < self.max_batch_rows
-                    and not (self._flush_requests and self._queued_rows)
-                ):
+                ready = self._ready_rows()
+                if not self._stopping and ready < self.max_batch_rows and not (self._flush_requests and ready):
                     self._condition.wait(self.flush_interval_s)
                 while self._inflight >= self.concurrency and not self._stopping:
                     self._condition.wait(0.05)
@@ -520,13 +574,17 @@ class SharedWriter:
             files = [e.wal for e in entries if e.wal is not None]
             # whole only if its files hold all its rows: otherwise a fallback saves the rows instead of promoting
             whole = not files or len(files) == len(entries)
-            top = _Unit(channel, frame, meta, [len(f) for f in frames], replay=replay, files=files, whole=whole)
+            queued_at = min(e.queued_at for e in entries)
+            sizes = [len(f) for f in frames]
+            top = _Unit(channel, frame, meta, sizes, replay=replay, files=files, whole=whole, queued_at=queued_at)
             tops.append(top)
             parts = split_mixed_objects(frame, signature)
             if len(parts) == 1:
                 units.append(top)
             else:
-                units.extend(_Unit(channel, part, meta, [len(part)], replay=replay, whole=False) for part in parts)
+                units.extend(
+                    _Unit(channel, part, meta, [len(part)], replay=replay, whole=False, queued_at=queued_at) for part in parts
+                )
         jobs, shared = [], {}
         for unit in units:
             key = unit.channel.target.key
@@ -686,7 +744,7 @@ class SharedWriter:
         endpoint = units[0].channel.endpoint
         if not self._available(endpoint):
             for unit in units:
-                self._fallback(unit, "storage unavailable")
+                self._fallback(unit, "storage unavailable", backoff=True)
             return
         units = self._encodable(units)
         if not units:
@@ -751,7 +809,9 @@ class SharedWriter:
             unit.channel._stats["rejected_rows"] += rows
         logger.error("%d rows rejected by the storage, not retried: %s", rows, error)
 
-    def _fallback(self, unit: _Unit, reason: str = "storage unavailable", uncertain: bool = False) -> None:
+    def _fallback(self, unit: _Unit, reason: str = "storage unavailable", uncertain: bool = False, backoff: bool = False) -> None:
+        """Rows not written: left to replay, spooled, kept in the queue (not sent because of a back-off, without
+        spool), or counted in uncertain_rows or dropped_rows"""
         channel, spool = unit.channel, unit.channel.spool
         if unit.replay:
             if not unit.whole and spool is not None:  # its original files are deleted: keep these rows in a new one
@@ -771,6 +831,8 @@ class SharedWriter:
                 if saved:
                     channel._stats["spooled_rows"] += unit.rows
                 # refused by a full spool: counted in spool_evicted_rows (part of dropped_rows)
+            return
+        if backoff and channel.requeue(unit):  # never sent: kept in memory until the storage is back
             return
         with self._condition:
             channel._stats["uncertain_rows" if uncertain else "dropped_rows"] += unit.rows
@@ -922,7 +984,7 @@ class BackgroundWriter:
       `concurrency` requests in flight.
     - After a failed write, the storage is considered unavailable for an exponential delay (1 s, 2 s, 4 s... up to
       `max_retry_delay_s`), probed every `probe_interval_s` when the target can be pinged: batches go straight to the
-      spool (or are dropped and counted without spool) instead of waiting for the storage.
+      spool or, without spool, stay in the queue (within `max_queue_rows`) until the storage is back.
     - Spooled batches are replayed, oldest first, once the storage is available, at most `replay_max_rows_per_s`.
     - `durability="wal"`: each batch is also written to the spool directory before submit() returns, so that a crash
       (kill -9) loses nothing; the file is deleted once the batch is written.

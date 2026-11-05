@@ -874,3 +874,65 @@ def test_an_older_success_does_not_clear_a_newer_back_off():
     writer._record_success(endpoint, endpoint.generation)
     assert endpoint.retry_at == 0.0
     writer.close()
+
+
+# ---------------------------------------------------------------------------------------------------------- L1 (0.11)
+def seq(start: int, rows: int = 10) -> pd.DataFrame:
+    return pd.DataFrame({"seq": range(start, start + rows)})
+
+
+def test_rows_taken_during_a_back_off_wait_in_the_queue_without_spool():
+    """L1 (SC-01 tuned, 0.11 remeasure): without spool_dir, the batches taken while the storage was in back-off were
+    dropped ("rows dropped (storage unavailable)") although the queue had room; they now wait in the queue (within
+    max_queue_rows) and are written once the storage is back"""
+    storage = {"up": False, "rows": []}
+
+    def write(frame, meta):
+        if not storage["up"]:
+            raise ConnectionRefusedError("down")
+        storage["rows"].extend(frame["seq"])
+
+    writer = SharedWriter(flush_interval_s=0.05, concurrency=4, probe_interval_s=0.05)
+    channel = writer.register(Target(write_frame=write, ping=lambda: storage["up"]), {}, max_queue_rows=1000)
+    channel.submit(seq(0))
+    assert channel.flush(5)  # a refused connection: dropped and counted, as before; the back-off starts
+    with writer._condition:
+        channel.endpoint.retry_at = time.monotonic() + 3600  # a long back-off, whatever the pace of the test
+    for k in range(1, 4):
+        channel.submit(seq(k * 10))
+    assert not channel.flush(0.3)  # the rows wait for the storage
+    waiting = channel.stats()
+    storage["up"] = True  # the probe sees it back
+    assert channel.flush(10)
+    stats = channel.stats()
+    writer.close()
+    assert waiting["dropped_rows"] == 10 and waiting["queued_rows"] == 30 and waiting["written_rows"] == 0
+    assert storage["rows"] == list(range(10, 40))
+    assert stats["written_rows"] == 30 and stats["dropped_rows"] == 10 and stats["captured_rows"] == 40
+
+
+def test_rows_caught_by_a_back_off_go_back_in_order_within_the_queue_bound():
+    """Rows taken while the storage was available, then caught by a back-off started by another request, go back to
+    the front of the queue; beyond max_queue_rows the oldest batches are dropped and counted, as for any batch"""
+    sent = []
+    writer = SharedWriter(flush_interval_s=60, concurrency=1, probe_interval_s=None)
+    channel = writer.register(Target(write_frame=lambda f, m: sent.append(list(f["seq"]))), {}, max_queue_rows=30)
+    with writer._condition:
+        channel.endpoint.retry_at = time.monotonic() + 3600  # the writer thread leaves the queue alone
+    channel.submit(seq(0))
+    channel.submit(seq(10))
+    with writer._condition:
+        channel.endpoint.retry_at = 0.0
+        taken = writer._take()  # taken while the storage is available...
+        channel.endpoint.retry_at = time.monotonic() + 3600  # ...then another request fails
+    channel.submit(seq(20))
+    for job in writer._jobs(taken):
+        writer._run_job(job)
+    assert [list(e.frame["seq"]) for e in channel.queue] == [list(range(20)), list(range(20, 30))]
+    assert channel.stats()["dropped_rows"] == 0 and channel.pending_rows == 0 and not sent
+    channel.submit(seq(30))  # 40 rows for a bound of 30: the oldest batch goes, counted
+    assert [list(e.frame["seq"]) for e in channel.queue] == [list(range(20, 30)), list(range(30, 40))]
+    assert channel.stats()["dropped_rows"] == 20
+    writer.close(timeout_s=5)  # closing during the back-off: the queued rows are dropped and counted, no wait
+    stats = channel.stats()
+    assert stats["dropped_rows"] == 40 and stats["queued_rows"] == 0 and not sent

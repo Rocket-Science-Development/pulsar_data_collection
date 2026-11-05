@@ -23,6 +23,8 @@ from .spool import Spool
 
 logger = logging.getLogger("pulsar_data_collection")
 
+GATE_PINGS = 3  # failed pings after which the second write of uncertain rows is sent anyway (ping may be unreliable)
+
 WriteFunction = Callable[[pd.DataFrame, dict], None]
 
 
@@ -131,6 +133,10 @@ class _Endpoint:
         self.probing = False
         self.generation = 0  # incremented by every failure: an older success must not clear a newer back-off
         self.held_rows = 0  # queued rows of its channels that wait for the end of a back-off (no spool, not closing)
+        # second writes of uncertain rows wait for an answer to ping (see SharedWriter._may_retry)
+        self.gate_failures = 0
+        self.gate_until = 0.0
+        self.answered_at = None
 
 
 @dataclass
@@ -789,6 +795,8 @@ class SharedWriter:
             up = False
         with self._condition:
             endpoint.probing = False
+            if up:
+                self._answered(endpoint)
             if up and endpoint.retry_at:
                 endpoint.retry_at = 0.0
                 logger.info("Storage answers again: writing resumes")
@@ -837,13 +845,16 @@ class SharedWriter:
         units = self._encodable(units)
         if not units:
             return
-        if endpoint.ping is not None and any(u.retried for u in units) and not self._answers(endpoint):
+        if endpoint.ping is not None and any(u.retried for u in units) and not self._may_retry(endpoint):
             # the single second write of uncertain rows is only spent on a storage that answers: right after a cut,
-            # the back-off often ends while the link is still down (flapping link, backend behind a port forwarder)
-            self._back_off(endpoint)
+            # the back-off often ends while the link is still down (flapping link, backend behind a port forwarder).
+            # Only those rows wait: the other rows of the request are sent now
             for unit in units:
-                self._fallback(unit, "storage not answering", unsent=True)
-            return
+                if unit.retried:
+                    self._fallback(unit, "storage not answering", unsent=True)
+            units = [u for u in units if not u.retried]
+            if not units:
+                return
         with self._condition:
             generation = endpoint.generation
         started = time.perf_counter()
@@ -954,17 +965,38 @@ class SharedWriter:
                 current = channel._stats["max_write_ms"]
                 channel._stats["max_write_ms"] = round(max(current or 0.0, elapsed_ms), 3)
 
-    @staticmethod
-    def _answers(endpoint: _Endpoint) -> bool:
-        try:
-            return bool(endpoint.ping())
-        except Exception:  # noqa: BLE001
-            return False
-
-    def _back_off(self, endpoint: _Endpoint) -> float:
-        """Start (or lengthen) the back-off of a destination; returns its delay. Called without the condition held"""
+    def _may_retry(self, endpoint: _Endpoint) -> bool:
+        """Whether the second write of uncertain rows can be sent: the destination answered its ping (within the last
+        probe interval, or now). A failed ping holds these rows for an exponential delay of their own (the back-off of
+        the destination and the other rows are left alone); after GATE_PINGS failed pings in a row they are sent anyway,
+        since a ping can fail while writes work (a proxy exposing only the write API)"""
+        now = time.monotonic()
         with self._condition:
-            return self._back_off_locked(endpoint)
+            if endpoint.gate_failures >= GATE_PINGS:
+                return True
+            recent = self.probe_interval_s or 1.0
+            if endpoint.answered_at is not None and now - endpoint.answered_at < recent:
+                return True
+            if now < endpoint.gate_until:
+                return False
+        try:
+            answered = bool(endpoint.ping())
+        except Exception:  # noqa: BLE001
+            answered = False
+        with self._condition:
+            if answered:
+                self._answered(endpoint)
+                return True
+            endpoint.gate_failures += 1
+            endpoint.gate_until = time.monotonic() + min(2 ** (endpoint.gate_failures - 1), self.max_retry_delay_s)
+            return endpoint.gate_failures >= GATE_PINGS
+
+    @staticmethod
+    def _answered(endpoint: _Endpoint) -> None:
+        """The destination answered its ping; called with the condition held"""
+        endpoint.answered_at = time.monotonic()
+        endpoint.gate_failures = 0
+        endpoint.gate_until = 0.0
 
     def _back_off_locked(self, endpoint: _Endpoint) -> float:
         endpoint.failures += 1

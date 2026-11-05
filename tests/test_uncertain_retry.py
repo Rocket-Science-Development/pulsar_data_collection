@@ -463,11 +463,42 @@ def test_rows_waiting_for_a_storage_that_never_answers_are_counted_uncertain_at_
         calls.append(len(frame))
         raise StorageConnectionResetError("cut")
 
-    writer = SharedWriter(flush_interval_s=0.02, max_retry_delay_s=0.05, concurrency=1, probe_interval_s=None)
+    writer = SharedWriter(flush_interval_s=0.02, concurrency=1, probe_interval_s=None)
     channel = writer.register(Target(write_frame=write, ping=lambda: False, idempotent=True), {})
     channel.submit(seq(0))
-    assert not channel.flush(0.5)  # the rows wait for the storage
+    assert not channel.flush(0.5)  # the rows wait for the storage (1 s, then 1 s, 2 s... between pings)
     writer.close(timeout_s=1)
     stats = channel.stats()
     assert calls == [10]
     assert stats["uncertain_rows"] == 10 and stats["dropped_rows"] == 0 and accounted(stats) == stats["captured_rows"]
+
+
+def test_a_failed_ping_only_holds_the_rows_to_retry_not_the_others():
+    """A ping that fails (here: always, as behind a proxy exposing only the write API) held back the whole request, and
+    every later one since the rows to retry are the oldest; only those rows wait now, and after a few failed pings
+    they are sent anyway"""
+    sends, pings = [], []
+
+    def send(lines):
+        sends.append(len(lines))
+        if len(sends) == 1:
+            raise StorageConnectionResetError("cut")
+
+    def ping():
+        pings.append(1)
+        return False
+
+    writer = SharedWriter(flush_interval_s=0.02, max_retry_delay_s=0.05, concurrency=1, probe_interval_s=None)
+    target = Target(encode=lambda frame, meta: [str(v) for v in frame["seq"]], send=send, ping=ping, key="k")
+    channel = writer.register(target, {})
+    channel.submit(seq(0))
+    deadline = time.monotonic() + 5
+    while not channel.stats()["retried_uncertain_rows"] and time.monotonic() < deadline:
+        time.sleep(0.01)
+    for k in range(1, 21):
+        channel.submit(seq(k * 10))
+    assert channel.flush(10)
+    stats = channel.stats()
+    writer.close(timeout_s=1)
+    assert stats["written_rows"] == 210 and stats["uncertain_rows"] == 0 and stats["dropped_rows"] == 0
+    assert stats["write_errors"] == 1 and len(pings) == 3  # then sent anyway

@@ -1156,7 +1156,7 @@ with DataController("governance.yaml", actor="jdoe") as control:
   records: the outbox is then left untouched and the report says so. `dry_run=True` counts everything and changes
   nothing. Stop the capture of the system (close its Pulse) before deleting: a spool directory belongs to one running
   Pulse, and rows still in its memory would be written afterwards. A running outbox copes with the deletion of its
-  records.
+  records, but those it had already read for a send in progress are still delivered: close the outbox first.
 - **Export.** One file per bucket role and measurement (e.g. `raw/credit_model_1.0_input_data.csv`): `_time` (UTC,
   RFC 3339 with nanoseconds, exact), `_measurement`, the tags, then one column per field; `manifest.json` lists the
   selector, the period and every file with its rows, columns and types, tags, size and SHA-256. Parquet needs

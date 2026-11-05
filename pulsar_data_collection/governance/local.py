@@ -8,8 +8,9 @@ name gives its new row count; a partly selected batch is rewritten through a tem
 new name before the old file is deleted, so that a crash in between leaves at worst the old batch (purge to run again),
 never a lost or half-written one. A leftover `.purge` file (its original still exists) is deleted.
 
-Outbox: pending and quarantined records are deleted in one transaction. A running outbox already copes with rows that
-disappear (a send of a deleted record deletes or quarantines nothing), so this is safe even while it runs.
+Outbox: pending and quarantined records are deleted in one transaction. A running outbox copes with rows that
+disappear (a send of a deleted record deletes or quarantines nothing), but the records it had already read for a send
+in progress are still delivered: close the outbox (or let it drain) before purging to be sure none leaves.
 """
 
 import gzip
@@ -160,7 +161,8 @@ def purge_outbox(
     Records are selected on their `system_id`, `model_id` and `model_version`, and with a period on their `window`
     (intersecting the period). Selectors with other criteria (data_id, measurement, tags, all_series) do not apply to
     evidence records: the store is left untouched and `skipped` says why. Records already delivered are in the
-    central service, out of reach of this function.
+    central service, out of reach of this function; so are those a running outbox had already read for a send in
+    progress (they are delivered after the purge): close the outbox first.
     """
     path = Path(directory) / DATABASE_NAME
     report = {"directory": str(directory), "exists": path.exists(), "pending": 0, "quarantined": 0, "skipped": None}

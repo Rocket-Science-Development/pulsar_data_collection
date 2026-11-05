@@ -3,6 +3,34 @@
 All notable changes to pulsar-data-collection. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.12.1] - 2026-11-04
+
+### Fixed
+
+- The detectors of `pulsar_data_collection.genai.detectors` (`InjectionDetector`, `ContentSafetyDetector` and any
+  `TextClassifierDetector`, `ModelPiiDetector`, `FaithfulnessScorer`) can be shared by several threads: each one
+  serializes its tokenizer and model calls with a per-instance lock. The Hugging Face fast tokenizers are not
+  thread-safe: 37 of 40 concurrent `FaithfulnessScorer.score` calls from 4 threads raised
+  `RuntimeError: Already borrowed` (0 of 10 sequential calls), and 1 of 240 runs of a demo campaign with
+  `--workers 4` failed this way. The calls of one detector run one at a time; give each worker its own detector to
+  score in parallel.
+- Without `spool_dir`, the writer (`SharedWriter`, and the private writer of each Pulse, which is built on it) no
+  longer drops the batches taken while the storage is in back-off when the queue still has room: they go back to the
+  front of their queue, in order, and are written once the storage answers again. The queue bound is unchanged:
+  beyond `max_queue_rows`, the oldest batches are dropped and counted ("Capture queue full"). The 0.11 remeasure
+  (SC-01, `SharedWriter(concurrency=4)` shared by 300 and 500 Pulse, InfluxDB timing out under load) dropped 10,000
+  and 5,000 rows this way ("rows dropped (storage unavailable)") with room left in the queues. The rows of the failed
+  request itself are counted as before (`uncertain_rows` after a timeout or a cut connection, `dropped_rows` after a
+  refused connection), and the spool path is unchanged.
+
+### Changed
+
+- Consequence of the fix above, without `spool_dir`: during an outage the rows stay in memory (up to
+  `max_queue_rows` per Pulse) instead of being dropped, so `flush()` waits for the storage and returns `False` at its
+  timeout instead of returning `True` at once; `close()` does not wait for the end of the back-off: it tries the
+  queued rows once more, then drops and counts them, as before. A crash during an outage can now lose up to
+  `max_queue_rows` rows per Pulse (they were dropped before); use `durability="wal"` to lose none.
+
 ## [0.12.0] - 2026-11-04
 
 ### Added

@@ -101,6 +101,8 @@ class Pulse:
                     durability=options.durability,
                     replay_max_rows_per_s=options.replay_max_rows_per_s,
                     retry_uncertain=options.retry_uncertain,
+                    spool_overflow=options.spool_overflow,
+                    bound_in_flight=options.bound_in_flight,
                 )
             else:
                 self._writer = BackgroundWriter(
@@ -117,6 +119,10 @@ class Pulse:
                     durability=options.durability,
                     replay_max_rows_per_s=options.replay_max_rows_per_s,
                     retry_uncertain=options.retry_uncertain,
+                    adaptive_batch=options.adaptive_batch,
+                    min_batch_rows=options.min_batch_rows,
+                    spool_overflow=options.spool_overflow,
+                    bound_in_flight=options.bound_in_flight,
                 )
 
     def _target(self) -> Target:

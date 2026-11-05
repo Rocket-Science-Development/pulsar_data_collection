@@ -24,6 +24,7 @@ from .spool import Spool
 logger = logging.getLogger("pulsar_data_collection")
 
 GATE_PINGS = 3  # failed pings after which the second write of uncertain rows is sent anyway (ping may be unreliable)
+SHRINK_FACTOR = 4  # a request that timed out: the rows per request of its destination are divided by this much
 
 WriteFunction = Callable[[pd.DataFrame, dict], None]
 
@@ -125,8 +126,12 @@ class Target:
 class _Endpoint:
     """Availability of one storage destination: exponential back-off after a failure, probed while waiting"""
 
-    def __init__(self, ping):
+    def __init__(self, ping, batch_rows: int):
         self.ping = ping
+        # adaptive batch size: rows per request, lowered after a timed-out request, raised again after fast writes
+        self.batch_rows = batch_rows
+        self.timeout_s = None  # duration of the last request that timed out (the write timeout, as seen)
+        self.shrinks = 0
         self.failures = 0
         self.retry_at = 0.0
         self.next_probe = 0.0
@@ -163,6 +168,8 @@ class _Unit:
     lines: Optional[list] = None
     origins: Optional[list] = None  # (seq, queued_at) of each original batch (one per size), to put it back in order
     retried: bool = False  # as _Entry.retried
+    top: Optional["_Unit"] = None  # unit taken from the queues that holds these rows (None: this one)
+    released: int = 0  # rows of this (top) unit put back in the queue: no longer in flight
 
     @property
     def rows(self) -> int:
@@ -194,6 +201,7 @@ class _Unit:
                 whole=False,
                 origins=part_origins,
                 retried=self.retried,
+                top=self.top or self,
             )
             for a, b, sizes, part_origins in bounds
             if b > a
@@ -214,6 +222,8 @@ class Channel:
         replay_max_rows_per_s: Optional[float],
         endpoint: _Endpoint,
         retry_uncertain: bool = True,
+        spool_overflow: bool = True,
+        bound_in_flight: bool = False,
     ):
         if durability == "wal" and spool is None:
             raise ValueError('durability="wal" needs a spool directory')
@@ -226,9 +236,15 @@ class Channel:
         self.replay_max_rows_per_s = replay_max_rows_per_s
         self.endpoint = endpoint
         self.retry_uncertain = retry_uncertain
+        self.spool_overflow = spool_overflow and spool is not None
+        self.bound_in_flight = bound_in_flight
         self.queue: deque = deque()
         self.queued_rows = 0
-        self.pending_rows = 0  # taken by the writer, not resolved yet
+        self.pending_rows = 0  # taken by the writer, not resolved yet (in flight)
+        self.max_held_rows = 0  # peak of the rows queued and in flight
+        # batches beyond max_queue_rows waiting for the spooler thread (spool_overflow), bounded by max_queue_rows too
+        self.overflow: deque = deque()
+        self.overflow_rows = 0  # rows in `overflow`, plus those of the batch being saved
         self.closing = False  # close() started: rows are no longer kept in the queue during a back-off
         self.closed = False
         self._seq = 0
@@ -243,6 +259,7 @@ class Channel:
             "rejected_rows": 0,
             "uncertain_rows": 0,
             "retried_uncertain_rows": 0,
+            "overflow_spooled_rows": 0,
             "write_errors": 0,
             "write_timeouts": 0,
             "memory_only_rows": 0,
@@ -272,15 +289,19 @@ class Channel:
                     logger.warning("Batch of %d rows larger than max_queue_rows (%d): spooled", rows, self.max_queue_rows)
                     return
                 extra = rows - self.max_queue_rows
+                head = frame.iloc[:extra].reset_index(drop=True)
                 frame = frame.iloc[extra:].reset_index(drop=True)
                 rows = len(frame)
-                self._stats["dropped_rows"] += extra
-                logger.warning("Batch larger than max_queue_rows (%d): its %d oldest rows dropped", self.max_queue_rows, extra)
+                if self.spool_overflow:
+                    self._overflow(_Entry(head, self.meta, time.monotonic(), seq=self._seq + 1))
+                else:
+                    self._stats["dropped_rows"] += extra
+                    logger.warning("Batch larger than max_queue_rows (%d): %d oldest rows dropped", self.max_queue_rows, extra)
             self._seq += 1
             self.queue.append(_Entry(frame, self.meta, time.monotonic(), wal, self._seq))
             self._queued(rows)
             self._bound()
-            if writer._ready(self, time.monotonic()) and writer._ready_rows() >= writer.max_batch_rows:
+            if writer._ready(self, time.monotonic()) and writer._ready_rows() >= writer._trigger_rows:
                 writer._condition.notify_all()
 
     def _queued(self, rows: int) -> None:
@@ -290,17 +311,55 @@ class Channel:
         if self.spool is None and not self.closing:
             self.endpoint.held_rows += rows
 
+    def _held(self) -> int:
+        """Rows counted against max_queue_rows: those queued, plus those in flight with bound_in_flight"""
+        return self.queued_rows + self.pending_rows if self.bound_in_flight else self.queued_rows
+
     def _bound(self) -> None:
         """Drop (or spool) the oldest batches beyond max_queue_rows; called with the writer's condition held"""
-        while self.queued_rows > self.max_queue_rows and len(self.queue) > 1:
+        while self._held() > self.max_queue_rows and len(self.queue) > 1:
             dropped = self.queue.popleft()
             size = len(dropped.frame)
             self._queued(-size)
             if dropped.wal is not None:
                 self.spool.promote(dropped.wal)
                 self._stats["spooled_rows"] += size
+                self._stats["overflow_spooled_rows"] += size
+            elif self.spool_overflow and not self.closed:
+                self._overflow(dropped)
             else:
                 self._lost(size, dropped.retried)
+        if self.queued_rows + self.pending_rows > self.max_held_rows:
+            self.max_held_rows = self.queued_rows + self.pending_rows
+
+    def _overflow(self, entry: "_Entry") -> None:
+        """A batch beyond max_queue_rows, with a spool: saved to the spool by the spooler thread (never in the caller's
+        thread). The batches waiting for it are bounded by max_queue_rows too: beyond, the oldest are dropped and
+        counted. Called with the writer's condition held"""
+        self.overflow.append(entry)
+        self.overflow_rows += len(entry.frame)
+        while self.overflow_rows > self.max_queue_rows and len(self.overflow) > 1:
+            lost = self.overflow.popleft()
+            self.overflow_rows -= len(lost.frame)
+            self._lost(len(lost.frame), lost.retried)
+        self.writer._wake_spooler()
+
+    def _save_overflow(self, entry: "_Entry") -> None:
+        """Save one overflow batch to the spool (without the writer's condition held), then count it"""
+        size = len(entry.frame)
+        try:
+            saved = self.spool.save(entry.frame, entry.meta) is not None  # refused by a full spool: spool_evicted_rows
+        except Exception:  # noqa: BLE001 - disk error: counted, the writer goes on
+            logger.exception("Overflow batch of %d rows could not be spooled", size)
+            saved = None
+        with self.writer._condition:
+            self.overflow_rows -= size
+            if saved:
+                self._stats["spooled_rows"] += size
+                self._stats["overflow_spooled_rows"] += size
+            elif saved is None:
+                self._lost(size, entry.retried)
+            self.writer._condition.notify_all()
 
     def _lost(self, rows: int, retried: bool) -> None:
         """Rows dropped by the queue bound; those of an uncertain write (`retried`: they may be stored) are counted in
@@ -311,6 +370,14 @@ class Channel:
         else:
             self._stats["dropped_rows"] += rows
             logger.warning("Capture queue full (%d rows): %d oldest rows dropped", self.max_queue_rows, rows)
+
+    def _take_head(self, rows: int) -> "_Entry":
+        """The first `rows` rows of the oldest batch, the rest staying at the head of the queue (a request limited by
+        the adaptive batch size); called with the writer's condition held"""
+        entry = self.queue[0]
+        head = _Entry(entry.frame.iloc[:rows].reset_index(drop=True), entry.meta, entry.queued_at, None, entry.seq, entry.retried)
+        entry.frame = entry.frame.iloc[rows:].reset_index(drop=True)
+        return head
 
     def requeue(self, unit: "_Unit", retry: bool = False) -> bool:
         """Put rows back in the queue: rows certainly not stored (not sent because of a back-off, or refused
@@ -333,6 +400,9 @@ class Channel:
         with self.writer._condition:
             if self.closing or self.closed:
                 return False
+            if not unit.replay:  # no longer in flight (the cleanup of its top unit does not count them again)
+                (unit.top or unit).released += unit.rows
+                self.pending_rows -= unit.rows
             retried = unit.retried or retry
             if retry:
                 self._stats["retried_uncertain_rows"] += unit.rows
@@ -370,7 +440,7 @@ class Channel:
             writer._flush_requests += 1
             writer._condition.notify_all()
             try:
-                while self.queue or self.pending_rows:
+                while self.queue or self.pending_rows or self.overflow_rows:
                     remaining = deadline - time.monotonic()
                     if remaining <= 0:
                         return False
@@ -393,6 +463,10 @@ class Channel:
             entries = list(self.queue)
             self.queue.clear()
             self._queued(-self.queued_rows)
+            overflow = list(self.overflow)
+            self.overflow.clear()
+        for entry in overflow:  # the spooler did not finish in time: saved here
+            self._save_overflow(entry)
         for entry in entries:  # the writer did not finish in time
             self.writer._fallback(
                 _Unit(
@@ -411,6 +485,10 @@ class Channel:
         with writer._condition:
             stats = dict(self._stats)
             stats["queued_rows"] = self.queued_rows
+            stats["in_flight_rows"] = self.pending_rows
+            stats["max_held_rows"] = self.max_held_rows
+            stats["batch_limit_rows"] = writer._limit(self.endpoint)
+            stats["batch_shrinks"] = self.endpoint.shrinks
             stats["storage_available"] = time.monotonic() >= self.endpoint.retry_at
             stats["writer_lag_s"] = time.monotonic() - self.queue[0].queued_at if self.queue else 0.0
         if self.spool:
@@ -464,6 +542,13 @@ class SharedWriter:
     - Rows waiting for the end of a back-off neither count towards `max_batch_rows` (they do not trigger requests of
       the other channels) nor delay the replay of the other spools. Without spool, the memory held during an outage is
       bounded per channel only: number of channels x `max_queue_rows`.
+    - Adaptive batch size (`adaptive_batch`, default): a request that timed out divides the rows per request of its
+      destination by 4 (not below `min_batch_rows`), so that a slow link (bandwidth x write timeout smaller than a
+      request) still carries rows instead of timing out forever; a write fast enough to be doubled within half the
+      observed timeout doubles it again, up to `max_batch_rows`. Live requests and spool replays both follow it.
+    - With a spool, the batches beyond `max_queue_rows` of a channel (storage answering, but slower than the traffic)
+      are saved to the spool by a spooler thread instead of being dropped (`spool_overflow`), then replayed once the
+      queue has drained.
     """
 
     _default = None
@@ -477,10 +562,15 @@ class SharedWriter:
         concurrency: int = 2,
         probe_interval_s: Optional[float] = 1.0,
         name: str = "pulsar-data-collection-writer",
+        adaptive_batch: bool = True,
+        min_batch_rows: int = 10,
     ):
-        if concurrency < 1 or max_batch_rows < 1 or flush_interval_s <= 0:
-            raise ValueError("concurrency, max_batch_rows and flush_interval_s must be positive")
+        if concurrency < 1 or max_batch_rows < 1 or flush_interval_s <= 0 or min_batch_rows < 1:
+            raise ValueError("concurrency, max_batch_rows, min_batch_rows and flush_interval_s must be positive")
         self.max_batch_rows = max_batch_rows
+        self.adaptive_batch = adaptive_batch
+        self.min_batch_rows = min(min_batch_rows, max_batch_rows)
+        self._trigger_rows = max_batch_rows  # rows that start a request at once: the smallest adaptive batch size
         self.flush_interval_s = flush_interval_s
         self.max_retry_delay_s = max_retry_delay_s
         self.concurrency = concurrency
@@ -495,6 +585,8 @@ class SharedWriter:
         self._busy = False
         self._stopping = False
         self._next = 0
+        self._name = name
+        self._spooler = None  # thread saving the overflow batches of the channels with a spool, started on first use
         self._executor = (
             ThreadPoolExecutor(max_workers=concurrency, thread_name_prefix=f"{name}-send") if concurrency > 1 else None
         )
@@ -520,16 +612,30 @@ class SharedWriter:
         durability: Literal["memory", "wal"] = "memory",
         replay_max_rows_per_s: Optional[float] = None,
         retry_uncertain: bool = True,
+        spool_overflow: bool = True,
+        bound_in_flight: bool = False,
     ) -> Channel:
         with self._condition:
             if self._stopping:
                 raise RuntimeError("writer is closed")
             if target.key is not None:
-                endpoint = self._endpoints.setdefault(target.key, _Endpoint(target.ping))
+                endpoint = self._endpoints.get(target.key)
+                if endpoint is None:
+                    endpoint = self._endpoints[target.key] = _Endpoint(target.ping, self.max_batch_rows)
             else:
-                endpoint = _Endpoint(target.ping)
+                endpoint = _Endpoint(target.ping, self.max_batch_rows)
             channel = Channel(
-                self, target, meta, max_queue_rows, spool, durability, replay_max_rows_per_s, endpoint, retry_uncertain
+                self,
+                target,
+                meta,
+                max_queue_rows,
+                spool,
+                durability,
+                replay_max_rows_per_s,
+                endpoint,
+                retry_uncertain,
+                spool_overflow=spool_overflow,
+                bound_in_flight=bound_in_flight,
             )
             self._channels.append(channel)
             self._destinations.setdefault(id(endpoint), [endpoint, 0])[1] += 1
@@ -545,6 +651,7 @@ class SharedWriter:
                     destination[1] -= 1
                     if not destination[1]:
                         del self._destinations[id(channel.endpoint)]
+                        self._update_trigger()
             if channel.target.key is not None and not any(c.target.key == channel.target.key for c in self._channels):
                 self._endpoints.pop(channel.target.key, None)
 
@@ -569,6 +676,8 @@ class SharedWriter:
             self._stopping = True
             self._condition.notify_all()
         self._thread.join(max(0.1, deadline - time.monotonic()))
+        if self._spooler is not None:
+            self._spooler.join(max(0.1, deadline - time.monotonic()))
         if self._executor is not None:
             self._executor.shutdown(wait=True)
 
@@ -583,13 +692,27 @@ class SharedWriter:
         start = self._next % len(channels)
         self._next += 1
         order = channels[start:] + channels[:start]
+        per_endpoint: dict = {}  # rows taken for each destination whose adaptive batch size is lowered
         while rows < self.max_batch_rows and order:
             for channel in list(order):
                 if not channel.queue:
                     order.remove(channel)
                     continue
-                entry = channel.queue.popleft()
+                entry = channel.queue[0]
                 size = len(entry.frame)
+                limit = self._limit(channel.endpoint)
+                if limit < self.max_batch_rows:
+                    used = per_endpoint.get(id(channel.endpoint), 0)
+                    if used + size > limit:
+                        if used:  # this request of its destination is full
+                            order.remove(channel)
+                            continue
+                        if entry.wal is None:  # a batch larger than the request: its oldest rows now, the rest later
+                            entry = channel._take_head(limit)
+                            size = limit
+                    per_endpoint[id(channel.endpoint)] = used + size
+                if entry is channel.queue[0]:
+                    channel.queue.popleft()
                 channel._queued(-size)
                 channel.pending_rows += size
                 taken.append((channel, entry))
@@ -616,7 +739,7 @@ class SharedWriter:
         while True:
             with self._condition:
                 ready = self._ready_rows()
-                if not self._stopping and ready < self.max_batch_rows and not (self._flush_requests and ready):
+                if not self._stopping and ready < self._trigger_rows and not (self._flush_requests and ready):
                     self._condition.wait(self.flush_interval_s)
                 while self._inflight >= self.concurrency and not self._stopping:
                     self._condition.wait(0.05)
@@ -669,7 +792,17 @@ class SharedWriter:
                 units.append(top)
             else:
                 units.extend(
-                    _Unit(channel, part, meta, [len(part)], replay=replay, whole=False, origins=origins[:1], retried=retried)
+                    _Unit(
+                        channel,
+                        part,
+                        meta,
+                        [len(part)],
+                        replay=replay,
+                        whole=False,
+                        origins=origins[:1],
+                        retried=retried,
+                        top=top,
+                    )
                     for part in parts
                 )
         jobs, shared = [], {}
@@ -758,7 +891,7 @@ class SharedWriter:
             top.files = []
             with self._condition:
                 if not top.replay:
-                    top.channel.pending_rows -= top.rows
+                    top.channel.pending_rows -= top.rows - top.released
                 self._condition.notify_all()
 
     # ------------------------------------------------------------------ one request
@@ -865,14 +998,18 @@ class SharedWriter:
             self._rejected(units, error, generation)
             return
         except Exception as error:  # noqa: BLE001
-            self._timing(units, started)
+            elapsed = self._timing(units, started)
             uncertain = _uncertain(error)
+            # a request that timed out and is larger than the (new) adaptive batch size: its rows are written again in
+            # smaller requests, even if they had their second write already (bounded: the size goes down each time)
+            resized = uncertain and _timeout(error) and self._shrink(endpoint, sum(u.rows for u in units), elapsed)
             self._record_failure(units, error, uncertain)
             for unit in units:  # certainly not stored unless uncertain: kept in the queue like the rows of the back-off
-                self._fallback(unit, str(error), uncertain=uncertain, unsent=not uncertain)
+                self._fallback(unit, str(error), uncertain=uncertain, unsent=not uncertain, resized=resized)
             return
-        self._timing(units, started)
+        elapsed = self._timing(units, started)
         self._record_success(endpoint, generation)
+        self._grow(endpoint, sum(u.rows for u in units), elapsed)
         for unit in units:
             self._count(unit, unit.rows)
 
@@ -915,13 +1052,21 @@ class SharedWriter:
             unit.channel._stats["rejected_rows"] += rows
         logger.error("%d rows rejected by the storage, not retried: %s", rows, error)
 
-    def _fallback(self, unit: _Unit, reason: str = "storage unavailable", uncertain: bool = False, unsent: bool = False) -> None:
+    def _fallback(
+        self,
+        unit: _Unit,
+        reason: str = "storage unavailable",
+        uncertain: bool = False,
+        unsent: bool = False,
+        resized: bool = False,
+    ) -> None:
         """Rows not written: left to replay, spooled, kept in the queue (`unsent`: certainly not stored, without
         spool), put back in the queue once for a second write (`uncertain`, without spool: line-protocol writes are
         idempotent, a second write overwrites the same points), or counted in uncertain_rows or dropped_rows
 
         Rows already written once with an uncertain outcome (`unit.retried`) are never retried again after another
-        uncertain write, and are counted in uncertain_rows whenever they are lost (they may be stored).
+        uncertain write, unless that write timed out because its request was larger than the adaptive batch size
+        (`resized`), and are counted in uncertain_rows whenever they are lost (they may be stored).
         """
         channel, spool = unit.channel, unit.channel.spool
         if unit.replay:
@@ -945,7 +1090,7 @@ class SharedWriter:
             return
         if unsent and channel.requeue(unit):  # not stored: kept in memory until the storage is back
             return
-        retry = uncertain and not unit.retried and channel.retry_uncertain and channel.target.idempotent
+        retry = uncertain and (resized or not unit.retried) and channel.retry_uncertain and channel.target.idempotent
         if retry and channel.requeue(unit, retry=True):
             logger.warning("%d rows may or may not be stored (%s); written once more (idempotent)", unit.rows, reason)
             return
@@ -957,13 +1102,82 @@ class SharedWriter:
         else:
             logger.warning("%d rows dropped (%s); set spool_dir to keep them", unit.rows, reason)
 
-    def _timing(self, units: list, started: float) -> None:
+    def _timing(self, units: list, started: float) -> float:
         elapsed_ms = (time.perf_counter() - started) * 1000
         with self._condition:
             for channel in {id(u.channel): u.channel for u in units}.values():
                 channel._stats["last_write_ms"] = round(elapsed_ms, 3)
                 current = channel._stats["max_write_ms"]
                 channel._stats["max_write_ms"] = round(max(current or 0.0, elapsed_ms), 3)
+        return elapsed_ms / 1000
+
+    # ------------------------------------------------------------------ adaptive batch size
+    def _limit(self, endpoint: _Endpoint) -> int:
+        """Rows per request to this destination now"""
+        return endpoint.batch_rows if self.adaptive_batch else self.max_batch_rows
+
+    def _update_trigger(self) -> None:
+        """Called with the condition held, after an adaptive batch size changed"""
+        limits = [e.batch_rows for e, _ in self._destinations.values()] if self.adaptive_batch else []
+        self._trigger_rows = min([self.max_batch_rows, *limits])
+
+    def _shrink(self, endpoint: _Endpoint, rows: int, elapsed_s: float) -> bool:
+        """A request of `rows` rows timed out after `elapsed_s`: the next ones to this destination are 4 times smaller
+        (a request needing more than bandwidth x timeout can never succeed, however often it is retried). True when
+        the request was larger than the new size (its rows will go in smaller requests)"""
+        if not self.adaptive_batch:
+            return False
+        with self._condition:
+            endpoint.timeout_s = elapsed_s
+            smaller = max(self.min_batch_rows, min(endpoint.batch_rows, rows // SHRINK_FACTOR))
+            if smaller >= endpoint.batch_rows:
+                return rows > endpoint.batch_rows  # shrunk already by a concurrent request
+            endpoint.batch_rows = smaller
+            endpoint.shrinks += 1
+            self._update_trigger()
+        logger.warning("Write of %d rows timed out after %.1f s: requests now hold %d rows", rows, elapsed_s, smaller)
+        return True
+
+    def _grow(self, endpoint: _Endpoint, rows: int, elapsed_s: float) -> None:
+        """A request of `rows` rows succeeded in `elapsed_s`: double the rows per request of its destination when the
+        doubled request is expected (linearly) to take less than half the timeout that was observed"""
+        if not self.adaptive_batch or rows <= 0:
+            return
+        with self._condition:
+            limit = endpoint.batch_rows
+            if limit >= self.max_batch_rows or endpoint.timeout_s is None:
+                return
+            if elapsed_s * 2 * limit / rows > endpoint.timeout_s / 2:
+                return
+            endpoint.batch_rows = min(self.max_batch_rows, 2 * limit)
+            self._update_trigger()
+            grown = endpoint.batch_rows
+        logger.info("Writes are fast again: requests to this storage now hold %d rows", grown)
+
+    # ------------------------------------------------------------------ overflow spooler
+    def _wake_spooler(self) -> None:
+        """Called with the condition held by a channel that queued an overflow batch"""
+        if self._spooler is None or not self._spooler.is_alive():
+            self._spooler = threading.Thread(target=self._spool_overflow, name=f"{self._name}-spooler", daemon=True)
+            self._spooler.start()
+        self._condition.notify_all()
+
+    def _spool_overflow(self) -> None:
+        """Save the overflow batches of the channels to their spool, oldest first, outside the caller's thread"""
+        while True:
+            with self._condition:
+                work = None
+                while work is None:
+                    work = next(((c, c.overflow.popleft()) for c in self._channels if c.overflow), None)
+                    if work is None:
+                        if self._stopping:
+                            return
+                        self._condition.wait(0.5)
+            channel, entry = work
+            try:
+                channel._save_overflow(entry)
+            except Exception:  # noqa: BLE001 - the spooler must never die
+                logger.exception("Unexpected error in the capture spooler")
 
     def _may_retry(self, endpoint: _Endpoint) -> bool:
         """Whether the second write of uncertain rows can be sent: the destination answered its ping (within the last
@@ -1033,7 +1247,8 @@ class SharedWriter:
         for channel in channels:
             for _ in range(10):  # bounded, so that live batches are not delayed for long
                 with self._condition:
-                    if self._ready_rows() >= self.max_batch_rows or self._stopping:
+                    # live rows first: a full request of them is waiting (adaptive size included)
+                    if self._ready_rows() >= self._trigger_rows or self._stopping:
                         return
                 if not self._available(channel.endpoint):
                     break
@@ -1042,13 +1257,14 @@ class SharedWriter:
 
     def _replay_once(self, channel: Channel) -> bool:
         """Write the oldest spooled batches of a channel (up to max_batch_rows rows); False when nothing was done"""
-        allowance = channel.replay_allowance(time.monotonic(), self.max_batch_rows)
+        limit = self._limit(channel.endpoint)
+        allowance = channel.replay_allowance(time.monotonic(), limit)
         if allowance <= 0:
             return False
         taken, rows = [], 0
         spool = channel.spool
         for path in spool.files():
-            if rows >= min(allowance, self.max_batch_rows):
+            if rows >= min(allowance, limit):
                 break
             if not spool.hold(path):  # evicted meanwhile
                 continue
@@ -1080,10 +1296,12 @@ class SharedWriter:
             top = _Unit(channel, frame, meta, [len(f) for f in frames], replay=True, files=[p for p, _ in items])
             tops.append(top)
             parts = split_mixed_objects(frame)
-            if len(parts) == 1:
+            limit = self._limit(channel.endpoint)
+            if len(parts) == 1 and top.rows <= limit:
                 units.append(top)
-            else:
-                units.extend(_Unit(channel, p, meta, [len(p)], replay=True, whole=False) for p in parts)
+            else:  # a spooled batch larger than the adaptive batch size is replayed in requests of that size
+                chunks = [p.iloc[a : a + limit].reset_index(drop=True) for p in parts for a in range(0, len(p), limit)]
+                units.extend(_Unit(channel, c, meta, [len(c)], replay=True, whole=False) for c in chunks)
         failed = False
         for unit in units:
             before = channel.endpoint.retry_at
@@ -1141,6 +1359,9 @@ class BackgroundWriter:
     - Spooled batches are replayed, oldest first, once the storage is available, at most `replay_max_rows_per_s`.
     - Without spool, the rows of a write that timed out or was cut are written once more (`retry_uncertain`), then
       counted in `uncertain_rows` if the outcome is still uncertain.
+    - A write that timed out makes the next requests smaller (`adaptive_batch`, see SharedWriter); with a spool, the
+      batches beyond `max_queue_rows` are spooled instead of dropped (`spool_overflow`); `bound_in_flight` counts the
+      rows in flight against `max_queue_rows` too.
     - `durability="wal"`: each batch is also written to the spool directory before submit() returns, so that a crash
       (kill -9) loses nothing; the file is deleted once the batch is written.
 
@@ -1162,6 +1383,10 @@ class BackgroundWriter:
         durability: Literal["memory", "wal"] = "memory",
         replay_max_rows_per_s: Optional[float] = None,
         retry_uncertain: bool = True,
+        adaptive_batch: bool = True,
+        min_batch_rows: int = 10,
+        spool_overflow: bool = True,
+        bound_in_flight: bool = False,
     ):
         self._writer = SharedWriter(
             max_batch_rows=max_batch_rows,
@@ -1169,6 +1394,8 @@ class BackgroundWriter:
             max_retry_delay_s=max_retry_delay_s,
             concurrency=concurrency,
             probe_interval_s=probe_interval_s,
+            adaptive_batch=adaptive_batch,
+            min_batch_rows=min_batch_rows,
         )
         self._channel = self._writer.register(
             target or Target(write_frame=write),
@@ -1178,6 +1405,8 @@ class BackgroundWriter:
             durability=durability,
             replay_max_rows_per_s=replay_max_rows_per_s,
             retry_uncertain=retry_uncertain,
+            spool_overflow=spool_overflow,
+            bound_in_flight=bound_in_flight,
         )
 
     def submit(self, frame: pd.DataFrame) -> None:

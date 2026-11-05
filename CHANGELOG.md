@@ -3,6 +3,45 @@
 All notable changes to pulsar-data-collection. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.13.0] - 2026-11-05
+
+### Added
+
+- **Data control by the client** (`pulsar_data_collection.governance`, CLI `python -m pulsar_data_collection.governance`).
+  A policy (dict, JSON or YAML; the InfluxDB token only from an environment variable) declares, per bucket role (raw
+  captures, results), a retention period. `DataController` reports drift between declared and actual retention and
+  applies it through the InfluxDB buckets API (with a valid shard-group duration). It deletes the data of a system or
+  model (tags written by Pulse and ResultsSink) and/or a period through the delete API, with a dry run that counts and
+  a recount after deletion, and purges the same selection from the spool (batches deleted or rewritten without
+  changing the replay order) and from the pending and quarantined records of `EvidenceOutbox`. It exports data to
+  CSV or Parquet with a `manifest.json` of SHA-256 sums (`verify_export`), and `describe()` says where each kind of
+  data lives and what leaves the client (evidence records only). Every retention change, deletion and export is
+  written to a local append-only audit journal chained by hash (SHA-256, or HMAC-SHA256 with a key), verifiable, with
+  no data values nor tokens. A deletion journals its intent (`delete.intent`) before deleting anything, then its
+  outcome; no data is changed when the journal cannot take the entry (key not set, secret-looking selector key, last
+  line torn by a crash: reported, never skipped). A spool file the purge cannot read, or a selected batch it cannot
+  purge, makes the deletion `incomplete` (exit code 1); a batch left twice by an interrupted rewrite is deleted at the
+  next purge or spool start, so that its deleted rows are not replayed. Exports keep the InfluxDB types (nullable
+  `Int64` / `UInt64` / `boolean` / `string`: integers stay exact, `influx_types` in the manifest); CSV strings are
+  quoted and an empty unquoted cell is a missing value. An invalid `--start` / `--stop` exits with code 2.
+  InfluxDB 2.6 limits: delete predicates are `key="value" AND ...` only, disk space comes back at compaction,
+  retention is applied per shard group, an empty string field reads back as missing.
+- **Consistency of repeated answers** (`genai.ConsistencyProbe`): asks each question several times, and its
+  paraphrases when given, to any OpenAI-compatible endpoint (`openai_chat_target`, with an answer-length cap and a
+  client timeout); reads a normalized final answer (yes/no, number, label, short text; an answer that starts with a
+  refusal is a refusal; the "non" of "non-résidents" and the 19 of "COVID-19" are not read; "1.234.567" is 1234567) and scores pairwise
+  agreement: exact for short answers, semantic for free text (`EmbeddingSimilarity`, `EntailmentSimilarity` through
+  `FaithfulnessScorer`). Question texts are not stored; `keep_answers` and `pii_policy` control the answers. Analysed
+  by `pulsar_metrics.genai.consistency` / `consistency_drift`.
+- **Abstentions and answers without support for RAG agents** (`genai.abstention`): `AbstentionDetector` flags
+  answers saying the information is not found, not in the sources, or that the agent cannot answer (French and
+  English rules, optional NLI fallback `NliAbstentionFallback`; a generic negation counts only with a source as its
+  subject or object, not as an attribution, and an answer after a colon is hedged); `answer_support` / `record_answer_support` flag
+  answers given without support (empty retrieval, top score or faithfulness under thresholds calibrated on a
+  reference with `calibrate_support_thresholds`, or a failed application relevance check). `agent_run` records get
+  `det_abstention` and `det_unsupported_answer`. Precision 0.97 [0.85; 0.99] and recall 1.00 [0.90; 1.00] on 102
+  hand-labelled answers. Analysed with the `rate_increase` test of pulsar-metrics 0.14.0.
+
 ## [0.12.1] - 2026-11-04
 
 ### Fixed

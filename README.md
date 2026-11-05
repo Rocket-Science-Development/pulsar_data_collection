@@ -28,6 +28,8 @@ Supported storage: **InfluxDB 2.x** (tested with 2.6.1). The storage layer is a 
 - [LLM applications and agents (OpenTelemetry GenAI)](#llm-applications-and-agents-opentelemetry-genai)
 - [Personal information](#personal-information)
 - [Analysis results for dashboards](#analysis-results-and-capture-statistics-for-dashboards)
+- [Sending evidence records to a central service](#sending-evidence-records-to-a-central-service)
+- [Data control: residence, retention, deletion, export](#data-control-residence-retention-deletion-export)
 - [API reference](#api-reference)
 - [Analyzing the collected data with pulsar-metrics](#analyzing-the-collected-data-with-pulsar-metrics)
 - [Development](#development)
@@ -778,6 +780,96 @@ Parameters:
   few, correlated batches (the lower 95 % bound of 5/5 is near 0.48), and 48 x 10 was never run against fp16: check
   on your own model.
 
+### Consistency of repeated answers
+
+`ConsistencyProbe` asks each question several times (`repeats`, default 3) and, optionally, in other words supplied
+by the user (`paraphrases`, asked `paraphrase_repeats` times, default 1), and scores how much the answers agree. The
+calls go to any `ask(text) -> answer`; `openai_chat_target` builds one for an OpenAI-compatible endpoint (Ollama,
+vLLM, a provider), with a cap on the answer length (`max_tokens`, default 128) and a client timeout (default 120 s).
+Requests are sent round after round, `workers` at a time (default 1). Prefer `127.0.0.1` to `localhost` for a local
+endpoint on Windows: there `localhost` is tried in IPv6 first, and each call waited about 20 s before the fallback.
+
+| `answer_type` | Normalized final answer | Two answers agree when |
+|---|---|---|
+| `yes_no` | `"yes"` / `"no"` (first oui / yes / non / no / vrai / true / faux / false) | the normalized answers are equal |
+| `number` | first number, `"6370"` for "6 370 $" or "6,370", `"3.5"` for "3,5 %" | idem |
+| `label` | the label of `labels` named first (accent- and case-insensitive) | idem |
+| `short` | folded text without punctuation nor leading article | idem |
+| `free` | none | `similarity(a, b)` reaches `agreement_threshold` |
+
+The text after a final "Answer:" or "Réponse :" marker is read when there is one. For free text, `similarity` is
+`EmbeddingSimilarity` (cosine of the embeddings of an OpenAI-compatible `/embeddings` endpoint, e.g. Ollama's
+`nomic-embed-text` or the multilingual `granite-embedding:278m`; threshold 0.9 by default, to fit on your answers),
+`EntailmentSimilarity(FaithfulnessScorer())` (bidirectional NLI entailment, the weaker direction by default; threshold
+0.5) or any callable; the default `LexicalSimilarity` (word overlap) is a weak proxy.
+
+```python
+from pulsar_data_collection.genai import ConsistencyProbe, ConsistencyQuestion, openai_chat_target
+
+ask = openai_chat_target("http://127.0.0.1:11434/v1", "llama3.2:3b", temperature=0.7, max_tokens=48, timeout=180)
+probe = ConsistencyProbe([
+    ConsistencyQuestion("capital-mb", "Quelle est la capitale du Manitoba ? Le nom de la ville seulement.",
+                        answer_type="label", labels=("Winnipeg", "Brandon", "Regina"), expected="Winnipeg"),
+    ConsistencyQuestion("pi-yn", "Le système implique-t-il des renseignements personnels ? Oui ou non.",
+                        paraphrases=("Des renseignements personnels sont-ils utilisés ? Oui ou non.",), answer_type="yes_no"),
+], repeats=3)
+result = probe.run(ask, workers=2)
+result.questions  # one row per question, for pulsar_metrics.genai.consistency / consistency_drift
+```
+
+`result.answers` has one row per call: `question_id`, `variant` (`"original"`, `"paraphrase-1"`...), `repeat`,
+`answer`, `normalized`, `answer_status` (`ok`, `refusal`, `unparsed`, `error`), `error`, `latency_s`; the question
+texts are not stored. `result.questions` has one row per question: `n_answers`, `n_errors`, `n_refusals`,
+`n_unparsed`, `n_pairs`, `agreement` (mean pair score), `agreement_repeats` (pairs of the original wording),
+`agreement_paraphrases` (original x paraphrase), `min_pair`, `full_agreement` (every pair agrees), `majority_answer`
+and `majority_share`, `correct_share` (when `expected` is given), `agreement_method` and `pair_scores`.
+
+- Two refusals of the same question agree, a refusal and an answer do not; an answer whose final answer cannot be
+  read agrees with nothing; failed calls are counted (`n_errors`) and left out.
+- `keep_answers=False` drops the answer texts (the normalized answers stay); `pii_policy=PiiPolicy()` masks (or only
+  counts) personal information in the answers, the normalized answers and the majority answer before they are
+  returned. The scores are computed on the texts as received, in memory.
+
+### Abstentions and answers without support (RAG agents)
+
+`pulsar_data_collection.genai.abstention` judges each run of a retrieval agent on two points, without any model by
+default:
+
+- **abstention**: the answer says the information is not found, not in the sources, or that it cannot answer
+  (`AbstentionDetector`, French and English rules: `NOT_FOUND_PATTERNS`, `CANNOT_ANSWER_PATTERNS` and
+  `FILLER_PATTERNS`, documented in the module). An answer that says the sources lack the information and then answers
+  anyway is *hedged*: it counts as an answer. An optional fallback scores the answers the rules leave undecided, e.g.
+  `NliAbstentionFallback.from_scorer(FaithfulnessScorer())`;
+- **answer without support**: the agent answered although the retrieval was empty, its best score was under a
+  threshold, the application's own relevance check failed (`retrieval_relevant=False`, e.g. the entity named in the
+  question is absent from the passages), or the faithfulness was under a threshold. The thresholds are the lower
+  5 % of a reference of the deployment (`calibrate_support_thresholds`).
+
+`record_answer_support` writes both verdicts (1.0 / 0.0) on the agent span: the `agent_run` record gains
+`det_abstention` and `det_unsupported_answer`. Their rates per window are the hallucination proxy; test them in
+pulsar-metrics with `DriftTestMetric("rate_increase", "det_unsupported_answer")` (one-sided exact test against the
+reference). Only the verdicts reach the spans, never the text.
+
+```python
+from pulsar_data_collection.genai import calibrate_support_thresholds, record_answer_support
+
+# once, on a reference of the deployment: best retrieval scores, faithfulness of the answered runs
+thresholds = calibrate_support_thresholds(reference_top_scores, reference_faithfulness)
+
+with agent_span(tracer, "register-assistant") as run:
+    ...  # the agent searches and answers
+    support = record_answer_support(run, answer, retrieval_empty=not passages, retrieval_top=best_score,
+                                    faithfulness=faithfulness_score, thresholds=thresholds)
+print(support.abstained, support.unsupported, support.reasons)  # e.g. False True ('low_retrieval_score',)
+```
+
+Measured offline on recorded runs (pulsar_demo `lab/replay/signal_abstention.py`, report
+`lab/rapports/rapport_signal_abstention.md`): on 102 hand-labelled answers (33 abstentions) of the LR-03 lab test and
+of the GC AI Register trial, the rules had a precision of 0.97 [0.85-0.99] and a recall of 1.00 [0.90-1.00]
+(Wilson 95 %); the one error is a guess justified by the missing information ("..., car le passage n'a pas fourni
+d'informations"). The patterns were written on the other answers of the same two runs, both from llama3.2:3b and
+granite3.3:2b: other models and other languages need their own check.
+
 ## Personal information
 
 `pulsar_data_collection.privacy` detects personal information with **validated rules** (checksums, valid dates,
@@ -974,6 +1066,130 @@ with EvidenceOutbox(
 quarantine), `dropped`, `replaced`, `requests`, `pending`, `quarantined`, `oldest_pending_age_s`,
 `consecutive_failures`, `receiver_available`, `last_error`.
 
+## Data control: residence, retention, deletion, export
+
+The client controls where the governance data lives and how long it is kept, can take it or delete it at any time,
+and keeps an audit trail of who did what, from a policy file and a command line, without the vendor
+(`pulsar_data_collection.governance`).
+
+### Where the data lives
+
+| Data | Where | Kept until | Leaves the client? |
+|---|---|---|---|
+| Captured rows (features, predictions, tags) | client's InfluxDB, bucket of role `raw` | the bucket's retention | no |
+| Analysis results, capture statistics, process health | client's InfluxDB, bucket of role `results` (may be the same bucket) | the bucket's retention | no |
+| Rows waiting for InfluxDB (spool, write-ahead copies) | `CaptureOptions.spool_dir`, on the capture host | written to InfluxDB | no |
+| Evidence records not yet delivered (and quarantined ones) | `EvidenceOutbox` SQLite store (`evidence_outbox.sqlite3`), on the host running the outbox | delivered (2xx) | **yes, these only** |
+| Audit journal of retention changes, deletions and exports | policy `journal` file | never deleted by Pulsar | no |
+| Exports | policy `export_dir`, or the directory given | managed by the client | no |
+
+Only the evidence records (aggregated results, schema `pulsar.evidence/1`) leave, to the `central_service` of the
+policy; raw rows never do. Once delivered, a record is held by the central service, out of reach of the deletion
+below. `describe()` (or the `describe` command) returns these locations as configured, with the actual retention of
+each bucket and the size of each local store; never a token.
+
+### Policy and command line
+
+```yaml
+# governance.yaml (JSON works too; YAML needs PyYAML). Relative paths are relative to this file.
+influxdb:
+  url: http://influxdb.ministry.internal:8086
+  org: ministry
+  token_env: PULSAR_INFLUX_TOKEN   # the token stays in the environment: a token in the file is refused
+buckets:                           # role -> bucket; retention: 90d, 12h, 2w, 1y (365 days), seconds or infinite
+  raw: {name: captures, retention: 90d, content: raw captured rows}
+  results: {name: results, retention: 2y, content: analysis results and capture statistics}
+spool_dirs: [/var/lib/pulsar/spool]
+outbox_dirs: [/var/lib/pulsar/outbox]
+journal: /var/lib/pulsar/governance/journal.jsonl
+journal_key_env: PULSAR_JOURNAL_KEY   # optional: HMAC-SHA256 chain instead of SHA-256
+export_dir: /var/lib/pulsar/exports
+central_service: https://governance.example/api/evidence
+```
+
+```bash
+export PULSAR_INFLUX_TOKEN=...      # a token allowed to read, write (delete) and update the buckets
+G="python -m pulsar_data_collection.governance --policy governance.yaml --actor jdoe"
+$G describe                                       # where each kind of data lives (--offline: no connection)
+$G retention check                                # declared against actual; exit code 1 on drift
+$G retention apply --reason "CHG-1234"            # set the declared retention on the buckets in drift
+$G delete --system-id SYS-042 --dry-run           # what would be deleted: buckets, measurements, spool, outbox
+$G delete --system-id SYS-042 --reason "request 17"
+$G delete --model-id credit_model --start 2026-01-01 --stop 2026-03-31T23:59:59Z --role raw
+$G export --system-id SYS-042 --start 2026-01-01 --out ./sys-042   # CSV (or --format parquet) and manifest.json
+$G export-verify ./sys-042                        # checksums of the files against the manifest
+$G journal verify --expected-head <hash recorded elsewhere>
+```
+
+Output is JSON; the exit code is 1 when a check fails (retention drift, broken journal, incomplete deletion, altered
+export). The same from Python:
+
+```python
+from pulsar_data_collection.governance import DataController, DataSelector
+
+with DataController("governance.yaml", actor="jdoe") as control:
+    print(control.check_retention())
+    selector = DataSelector(system_id="SYS-042")              # and/or model_id, model_version, data_id, tags=...
+    print(control.delete(selector, dry_run=True)["buckets"])  # counts only
+    control.delete(selector, reason="request 17")
+    control.export(DataSelector(model_id="credit_model"), "./credit", start="2026-01-01")
+    print(control.journal.verify())
+```
+
+- **Retention.** `check_retention()` compares the declared retention of every bucket with its actual retention rule
+  (`ok`, `drift`, `missing`, or `unmanaged` when the policy declares none); `apply_retention()` sets it through the
+  buckets API, with the shard group duration InfluxDB would pick (1 h below 2 days, 1 day below 6 months, 7 days
+  beyond; `shard_group_duration` to choose another), reads it back and journals the old and new values. A missing
+  bucket is reported, never created. InfluxDB refuses retentions shorter than one hour.
+- **Selection.** Rows are selected by the tags Pulse writes (`model_id`, `model_version`, `data_id`, and the
+  `additional_tags`: by convention, give every Pulse of a system `additional_tags={"system_id": ...}`) and the tags
+  given to `ResultsSink` (e.g. `tags={"model_id": ..., "system_id": ...}`), optionally one `measurement`, and a period
+  inclusive at both ends (default: everything). Every criterion must match. A period without any tag criterion needs
+  `all_series=True` (`--all-series`). Values with quotes, backslashes or control characters are refused: they cannot
+  be expressed in a delete predicate.
+- **Deletion.** For each bucket: count, delete through the InfluxDB delete API with the predicate
+  `system_id="SYS-042" AND ...` over the period, count again (`remaining` must be 0, else `status: incomplete`). Then
+  the spool directories: selected batches are deleted, partly selected ones rewritten with the kept rows (same time
+  prefix and id, so the replay order is kept; the old file is deleted only once the new one is in place). Then the
+  outbox stores: pending and quarantined evidence records whose `system_id` / `model_id` / `model_version` match (and
+  whose window intersects the period). Selectors on `data_id`, `measurement` or other tags do not apply to evidence
+  records: the outbox is then left untouched and the report says so. `dry_run=True` counts everything and changes
+  nothing. Stop the capture of the system (close its Pulse) before deleting: a spool directory belongs to one running
+  Pulse, and rows still in its memory would be written afterwards. A running outbox copes with the deletion of its
+  records, but those it had already read for a send in progress are still delivered: close the outbox first.
+- **Export.** One file per bucket role and measurement (e.g. `raw/credit_model_1.0_input_data.csv`): `_time` (UTC,
+  RFC 3339 with nanoseconds, exact), `_measurement`, the tags, then one column per field; `manifest.json` lists the
+  selector, the period and every file with its rows, columns and types (pandas `columns`, InfluxDB `influx_types`),
+  tags, size and SHA-256. Values keep their InfluxDB type, missing values included: integer fields are nullable
+  integers (`Int64` / `UInt64`, exact: 2**60 + 1 is not rounded to a float), booleans and strings nullable too. CSV
+  convention (`csv` in the manifest): strings are quoted, a missing value is an empty unquoted cell; InfluxDB 2.6
+  returns an empty string field like a missing one, so both are exported as missing. Parquet needs
+  `pyarrow`. A measurement is held in memory while it is written: export long periods in parts (`start` / `stop`).
+- **Audit journal.** Every retention change, deletion (whatever its outcome, with the error if any) and export
+  appends one JSON line, fsynced: sequence number, UTC time, actor, action, details (bucket, predicate, period,
+  counts, reason); never data values, never tokens (details with secret-looking keys are refused). A deletion writes
+  a `delete.intent` entry (predicate and counts) before deleting anything, then its `delete` outcome entry
+  (`intent_seq`). Before any change, the journal must be able to take the entry: a key variable not set, a
+  secret-looking key in the selector (e.g. a tag named `token_bucket`) or a last line that is not a complete entry
+  (a write interrupted by a crash) stops the operation with nothing changed. A torn last line is never skipped:
+  keep a copy of the file, remove that line, and check the journal with `verify()`. Each entry holds
+  the hash of the previous one and its own (SHA-256, or HMAC-SHA256 with `journal_key_env`). `verify()` finds the first
+  modified, inserted, removed or reordered entry. Removing the last entries, or rewriting the whole file without the
+  key, leaves a valid chain: record the head (`journal.head()`, also in `describe()`) elsewhere, e.g. in the change
+  ticket, and check it with `verify(expected_head=...)`. Dry runs are not journaled (nothing changes).
+
+Known limits (InfluxDB 2.6):
+
+- the delete predicate accepts only `key="value"` terms joined by `AND` (no `OR`, no regular expression, no field):
+  one system, model or tag combination per call;
+- a deletion applies at once to queries, but the disk space is reclaimed later, by compaction. A retention is
+  enforced by dropping whole shard groups, checked every 30 minutes: rows can stay up to the retention plus one shard
+  group duration;
+- deleting from a large bucket is expensive for InfluxDB (tombstones on every series hit): prefer narrow selectors
+  and periods on a busy server;
+- the token needs read and write permission on the buckets (deleting is a write) and, for `apply_retention`,
+  permission to update them.
+
 ## API reference
 
 ### `PulseParameters`
@@ -1050,6 +1266,8 @@ uv run bandit -c pyproject.toml -r pulsar_data_collection
 The integration tests need a running Docker engine. The tests of the shared writer against a real InfluxDB
 (`tests/test_writer_influxdb.py`) run only when `PULSAR_TEST_INFLUX_URL`, `PULSAR_TEST_INFLUX_TOKEN`,
 `PULSAR_TEST_INFLUX_ORG` and `PULSAR_TEST_INFLUX_BUCKET` point at an instance you own; they are skipped otherwise.
+The data control tests against a real InfluxDB (`tests/test_governance_influxdb.py`) need the first three of these
+variables and a token allowed to create buckets: each test creates its own two buckets and deletes them.
 Continuous integration runs lint, bandit and the tests on
 Python 3.12 to 3.15 with pandas 3, plus Python 3.12 with pandas 2, for every pull request; tests are required to pass. Pushing a tag builds and publishes the
 package.

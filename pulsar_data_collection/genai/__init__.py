@@ -1,6 +1,25 @@
 """Collection for LLM applications and agents, from OpenTelemetry GenAI spans (requires the `genai` extra)."""
 
+from .abstention import (
+    AbstentionDetector,
+    AnswerSupport,
+    NliAbstentionFallback,
+    SupportThresholds,
+    answer_support,
+    calibrate_support_thresholds,
+    record_answer_support,
+)
 from .canary import CanaryProbe
+from .consistency import (
+    ConsistencyProbe,
+    ConsistencyQuestion,
+    ConsistencyResult,
+    EmbeddingSimilarity,
+    EntailmentSimilarity,
+    LexicalSimilarity,
+    normalize_answer,
+    openai_chat_target,
+)
 from .detectors import (
     ContentSafetyDetector,
     FaithfulnessScorer,
@@ -20,7 +39,20 @@ from .semconv import SCHEMA_VERSION
 from .trajectory import TrajectoryAssembler
 
 __all__ = [
+    "AbstentionDetector",
+    "AnswerSupport",
+    "NliAbstentionFallback",
+    "SupportThresholds",
+    "answer_support",
+    "calibrate_support_thresholds",
+    "record_answer_support",
     "CanaryProbe",
+    "ConsistencyProbe",
+    "ConsistencyQuestion",
+    "ConsistencyResult",
+    "EmbeddingSimilarity",
+    "EntailmentSimilarity",
+    "LexicalSimilarity",
     "ContentSafetyDetector",
     "FaithfulnessScorer",
     "InjectionDetector",
@@ -41,6 +73,8 @@ __all__ = [
     "french_benign_calibration_set",
     "guess_language",
     "llm_span",
+    "normalize_answer",
+    "openai_chat_target",
     "record_event",
     "record_llm_response",
     "record_score",

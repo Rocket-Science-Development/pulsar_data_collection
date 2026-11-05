@@ -149,7 +149,8 @@ class EmbeddingSimilarity:
     Parameters
     ----------
     base_url : str, optional
-        Base URL of the API (default the local Ollama, "http://localhost:11434/v1")
+        Base URL of the API (default the local Ollama, "http://127.0.0.1:11434/v1": on Windows, "localhost" first
+        tries IPv6 and each call waited about 20 s before falling back)
     model : str, optional
         Embedding model (default "nomic-embed-text"; "granite-embedding:278m" is multilingual)
     timeout : float, optional
@@ -166,7 +167,7 @@ class EmbeddingSimilarity:
 
     def __init__(
         self,
-        base_url: str = "http://localhost:11434/v1",
+        base_url: str = "http://127.0.0.1:11434/v1",
         model: str = "nomic-embed-text",
         timeout: float = 60.0,
         api_key: Optional[str] = None,

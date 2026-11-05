@@ -753,7 +753,8 @@ Parameters:
 by the user (`paraphrases`, asked `paraphrase_repeats` times, default 1), and scores how much the answers agree. The
 calls go to any `ask(text) -> answer`; `openai_chat_target` builds one for an OpenAI-compatible endpoint (Ollama,
 vLLM, a provider), with a cap on the answer length (`max_tokens`, default 128) and a client timeout (default 120 s).
-Requests are sent round after round, `workers` at a time (default 1).
+Requests are sent round after round, `workers` at a time (default 1). Prefer `127.0.0.1` to `localhost` for a local
+endpoint on Windows: there `localhost` is tried in IPv6 first, and each call waited about 20 s before the fallback.
 
 | `answer_type` | Normalized final answer | Two answers agree when |
 |---|---|---|
@@ -772,7 +773,7 @@ The text after a final "Answer:" or "Réponse :" marker is read when there is on
 ```python
 from pulsar_data_collection.genai import ConsistencyProbe, ConsistencyQuestion, openai_chat_target
 
-ask = openai_chat_target("http://localhost:11434/v1", "llama3.2:3b", temperature=0.7, max_tokens=48, timeout=180)
+ask = openai_chat_target("http://127.0.0.1:11434/v1", "llama3.2:3b", temperature=0.7, max_tokens=48, timeout=180)
 probe = ConsistencyProbe([
     ConsistencyQuestion("capital-mb", "Quelle est la capitale du Manitoba ? Le nom de la ville seulement.",
                         answer_type="label", labels=("Winnipeg", "Brandon", "Regina"), expected="Winnipeg"),

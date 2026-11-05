@@ -100,6 +100,7 @@ class Pulse:
                     spool=spool,
                     durability=options.durability,
                     replay_max_rows_per_s=options.replay_max_rows_per_s,
+                    retry_uncertain=options.retry_uncertain,
                 )
             else:
                 self._writer = BackgroundWriter(
@@ -115,6 +116,7 @@ class Pulse:
                     probe_interval_s=options.probe_interval_s,
                     durability=options.durability,
                     replay_max_rows_per_s=options.replay_max_rows_per_s,
+                    retry_uncertain=options.retry_uncertain,
                 )
 
     def _target(self) -> Target:
@@ -131,7 +133,7 @@ class Pulse:
                 ping=ping,
                 key=(id(client), bucket),
             )
-        return Target(write_frame=self._write, ping=ping)
+        return Target(write_frame=self._write, ping=ping, idempotent=bool(getattr(engine, "idempotent_writes", False)))
 
     def _write(self, frame, write_params: dict):
         supports = getattr(self.storage_engine, "supports_lines", None)
@@ -187,8 +189,8 @@ class Pulse:
         return self._writer.flush(timeout_s) if self._writer and not self._closed else True
 
     def stats(self) -> dict:
-        """Completeness counters: captured, written, spooled, replayed, dropped, rejected and uncertain rows, write errors
-        and timeouts, queue size and lag, spool size, write latency
+        """Completeness counters: captured, written, spooled, replayed, dropped, rejected and uncertain rows, rows of
+        uncertain writes written once more, write errors and timeouts, queue size and lag, spool size, write latency
 
         Still available after close(), with the final values.
         """

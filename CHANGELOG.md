@@ -3,6 +3,48 @@
 All notable changes to pulsar-data-collection. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.13.1] - 2026-11-05
+
+### Fixed
+
+- Without `spool_dir`, the rows of a write that timed out or whose connection was cut after the request was sent
+  (uncertain outcome: InfluxDB may or may not have stored them) were counted in `uncertain_rows` and never written
+  again, even with room in the queue. A backend that is down behind a port forwarder (Docker, Kubernetes) accepts the
+  connection and then closes it, so an outage counts as cuts, not refusals. Lab test SC-04 (Toxiproxy, 10 models at
+  2,000 rows/s, no spool) lost 6,050 to 41,450 rows per case this way (5 to 32 % of the traffic) on a lossy link
+  (5 % and 20 %) and on a flapping link (down 5 s every 10 s), with both write profiles. These rows now go back to
+  their queue, in their place, and are written once more when the back-off ends and the storage answers its ping
+  (`/ping`: right after a cut the back-off often ends while the link is still down, and the single retry was then
+  spent on a dead link). Line-protocol points carry their timestamp, so a second write overwrites the same points
+  (no duplicate). Only these rows wait for the ping (the other rows of the request are sent at once, the back-off of
+  the destination is left alone), and they are sent anyway after 3 pings without answer, since a ping can fail while
+  writes work. SC-04 rerun with 0.13.1, rows lost (private writers / `SharedWriter`): lossy 5 %, 0 / 0; lossy 20 %,
+  5,200 / 5,000 (second write cut too); flapping, 0 / 0; still 0 duplicate and exact counters. They are counted in `uncertain_rows` only if that second write is uncertain too
+  (never a third write), if the queue bound drops them (they are the oldest rows of the queue, dropped first; counted
+  in `uncertain_rows` rather than `dropped_rows`, since they may be stored), or if `close()` finds them still
+  waiting for the end of a back-off. The caller is never blocked and the queue bound (`max_queue_rows`) is unchanged.
+  Rows already retried and fresh rows sharing one request (`SharedWriter`) are counted apart. While the rows wait for
+  their second write, `flush()` waits for them (it returned at once before). Only for targets whose writes are
+  idempotent: line protocol, and the InfluxDB connector; a custom `write_frame` target is not retried unless it is
+  declared `Target(..., idempotent=True)`. With `spool_dir` nothing changes: these rows are spooled and replayed, as
+  before.
+- Rows put back in the queue (back-off, refused connection, uncertain write) go back in one merge by submission
+  order: they were inserted batch by batch, each scanning the queue with the writer's lock held (about 2 s, blocking
+  `capture_data()`, for 5,000 one-row captures put back in front of 5,000 queued ones).
+
+### Added
+
+- `CaptureOptions(retry_uncertain=True)` (and `retry_uncertain` of `SharedWriter.register()` and
+  `BackgroundWriter`), and `Target(idempotent=...)` (default: True for line-protocol targets): `False` counts the rows of an uncertain write in `uncertain_rows` at once, as up to 0.13.0
+  (e.g. for a custom `write` function that is not idempotent).
+- Counter `retried_uncertain_rows` in `stats()`: rows of uncertain writes put back for a second write. It is not part
+  of the completeness identity; their outcome is counted in `written_rows`, `uncertain_rows`, `rejected_rows`...
+  (`written + spooled + dropped + rejected + uncertain = captured` once flushed, unchanged).
+
+### Documentation
+
+- README: "Capacity and degraded networks" (measured capture ceiling, degraded networks after SC-04, memory bound).
+
 ## [0.13.0] - 2026-11-05
 
 ### Added

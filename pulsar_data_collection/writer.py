@@ -23,6 +23,8 @@ from .spool import Spool
 
 logger = logging.getLogger("pulsar_data_collection")
 
+GATE_PINGS = 3  # failed pings after which the second write of uncertain rows is sent anyway (ping may be unreliable)
+
 WriteFunction = Callable[[pd.DataFrame, dict], None]
 
 
@@ -92,7 +94,9 @@ class Target:
     """How a channel writes: frame by frame (`write_frame`), or as line protocol (`encode` + `send`) that can share a
     request with the other channels of the same `key` (same client and bucket)
 
-    `ping` (optional) is used to detect the end of an outage without waiting for the back-off delay.
+    `ping` (optional) is used to detect the end of an outage without waiting for the back-off delay. `idempotent`:
+    writing the same rows twice stores them once (InfluxDB points with their timestamp), so the rows of an uncertain
+    write can be written once more; None (default): True for line-protocol targets, False for `write_frame` ones.
     """
 
     def __init__(
@@ -102,6 +106,7 @@ class Target:
         send: Optional[Callable[[list], None]] = None,
         ping: Optional[Callable[[], bool]] = None,
         key=None,
+        idempotent: Optional[bool] = None,
     ):
         if write_frame is None and (encode is None or send is None):
             raise ValueError("a Target needs write_frame, or encode and send")
@@ -110,6 +115,7 @@ class Target:
         self.send = send
         self.ping = ping
         self.key = key if encode is not None else None
+        self.idempotent = self.lines if idempotent is None else idempotent
 
     @property
     def lines(self) -> bool:
@@ -127,6 +133,10 @@ class _Endpoint:
         self.probing = False
         self.generation = 0  # incremented by every failure: an older success must not clear a newer back-off
         self.held_rows = 0  # queued rows of its channels that wait for the end of a back-off (no spool, not closing)
+        # second writes of uncertain rows wait for an answer to ping (see SharedWriter._may_retry)
+        self.gate_failures = 0
+        self.gate_until = 0.0
+        self.answered_at = None
 
 
 @dataclass
@@ -136,6 +146,7 @@ class _Entry:
     queued_at: float
     wal: Optional[Path] = None
     seq: int = 0  # submission order in the channel, to put rows back in their place
+    retried: bool = False  # sent once with an uncertain outcome (may be stored): never retried again, lost = uncertain
 
 
 @dataclass
@@ -151,6 +162,7 @@ class _Unit:
     whole: bool = True  # False once split: its files then hold more rows than it does
     lines: Optional[list] = None
     origins: Optional[list] = None  # (seq, queued_at) of each original batch (one per size), to put it back in order
+    retried: bool = False  # as _Entry.retried
 
     @property
     def rows(self) -> int:
@@ -181,6 +193,7 @@ class _Unit:
                 self.replay,
                 whole=False,
                 origins=part_origins,
+                retried=self.retried,
             )
             for a, b, sizes, part_origins in bounds
             if b > a
@@ -200,6 +213,7 @@ class Channel:
         durability: Literal["memory", "wal"],
         replay_max_rows_per_s: Optional[float],
         endpoint: _Endpoint,
+        retry_uncertain: bool = True,
     ):
         if durability == "wal" and spool is None:
             raise ValueError('durability="wal" needs a spool directory')
@@ -211,6 +225,7 @@ class Channel:
         self.durability = durability
         self.replay_max_rows_per_s = replay_max_rows_per_s
         self.endpoint = endpoint
+        self.retry_uncertain = retry_uncertain
         self.queue: deque = deque()
         self.queued_rows = 0
         self.pending_rows = 0  # taken by the writer, not resolved yet
@@ -227,6 +242,7 @@ class Channel:
             "dropped_rows": 0,
             "rejected_rows": 0,
             "uncertain_rows": 0,
+            "retried_uncertain_rows": 0,
             "write_errors": 0,
             "write_timeouts": 0,
             "memory_only_rows": 0,
@@ -284,13 +300,24 @@ class Channel:
                 self.spool.promote(dropped.wal)
                 self._stats["spooled_rows"] += size
             else:
-                self._stats["dropped_rows"] += size
-                logger.warning("Capture queue full (%d rows): %d oldest rows dropped", self.max_queue_rows, size)
+                self._lost(size, dropped.retried)
 
-    def requeue(self, unit: "_Unit") -> bool:
-        """Put rows certainly not stored (not sent because of a back-off, or refused connection) back in the queue:
-        each original batch in its place (by submission order), within max_queue_rows like any batch; False when the
-        channel is closing (the caller then drops them)
+    def _lost(self, rows: int, retried: bool) -> None:
+        """Rows dropped by the queue bound; those of an uncertain write (`retried`: they may be stored) are counted in
+        uncertain_rows, the others in dropped_rows. Called with the writer's condition held"""
+        if retried:
+            self._stats["uncertain_rows"] += rows
+            logger.warning("Capture queue full (%d rows): %d rows of an uncertain write not retried", self.max_queue_rows, rows)
+        else:
+            self._stats["dropped_rows"] += rows
+            logger.warning("Capture queue full (%d rows): %d oldest rows dropped", self.max_queue_rows, rows)
+
+    def requeue(self, unit: "_Unit", retry: bool = False) -> bool:
+        """Put rows back in the queue: rows certainly not stored (not sent because of a back-off, or refused
+        connection), or, with `retry`, the rows of an uncertain write for their single second write. Each original
+        batch goes back in its place (by submission order), within max_queue_rows like any batch (beyond, the oldest
+        batches are dropped and counted; rows that may be stored in uncertain_rows); False when the channel is closing
+        (the caller then counts them)
 
         Rows of object columns mixing kinds were split by kind before the write: they go back as one batch per kind,
         in the place of their oldest batch.
@@ -306,19 +333,32 @@ class Channel:
         with self.writer._condition:
             if self.closing or self.closed:
                 return False
-            for frame, (seq, queued_at) in pieces:
+            retried = unit.retried or retry
+            if retry:
+                self._stats["retried_uncertain_rows"] += unit.rows
+            entries = []
+            for frame, (seq, queued_at) in sorted(pieces, key=lambda piece: piece[1][0]):  # stable: same seq kept in order
                 rows = len(frame)
                 if rows > self.max_queue_rows:  # as in submit(): only the newest rows fit
                     extra = rows - self.max_queue_rows
                     frame = frame.iloc[extra:].reset_index(drop=True)
                     rows = len(frame)
-                    self._stats["dropped_rows"] += extra
-                    logger.warning("Capture queue full (%d rows): %d oldest rows dropped", self.max_queue_rows, extra)
-                position = 0
-                while position < len(self.queue) and self.queue[position].seq <= seq:
-                    position += 1
-                self.queue.insert(position, _Entry(frame, unit.meta, queued_at, seq=seq))
+                    self._lost(extra, retried)
+                entries.append(_Entry(frame, unit.meta, queued_at, seq=seq, retried=retried))
                 self._queued(rows)
+            # one merge by submission order (each piece after the queued batches of the same or a lower seq): inserting
+            # piece by piece scanned the deque for each, seconds with the lock held for thousands of one-row captures
+            merged, queued = deque(), iter(self.queue)
+            current = next(queued, None)
+            for entry in entries:
+                while current is not None and current.seq <= entry.seq:
+                    merged.append(current)
+                    current = next(queued, None)
+                merged.append(entry)
+            if current is not None:
+                merged.append(current)
+                merged.extend(queued)
+            self.queue = merged
             self._bound()
             return True
 
@@ -355,7 +395,14 @@ class Channel:
             self._queued(-self.queued_rows)
         for entry in entries:  # the writer did not finish in time
             self.writer._fallback(
-                _Unit(self, entry.frame, entry.meta, [len(entry.frame)], files=[entry.wal] if entry.wal else [])
+                _Unit(
+                    self,
+                    entry.frame,
+                    entry.meta,
+                    [len(entry.frame)],
+                    files=[entry.wal] if entry.wal else [],
+                    retried=entry.retried,
+                )
             )
         self.writer._unregister(self)
 
@@ -409,8 +456,11 @@ class SharedWriter:
     - A refused write (HTTP 400 / 422) is counted exactly: from the `dropped=N` of a partial write when the request
       held one batch, otherwise by writing again batch by batch, then in halves down to single rows.
     - A write that timed out, or whose connection was cut before the answer, may have been stored: spooled (replaying is
-      idempotent) or counted in `uncertain_rows`. A write that failed otherwise stored nothing: its rows go back to the
-      queue (or to the spool) like those of the back-off.
+      idempotent) or, without spool, put back in the queue for one second write, sent once the destination answers its
+      ping (`retry_uncertain`, default; idempotent targets only; counted in
+      `retried_uncertain_rows`), then counted in `uncertain_rows` if that one is uncertain too or cannot be made. A
+      write that failed otherwise stored nothing: its rows go back to the queue (or to the spool) like those of the
+      back-off.
     - Rows waiting for the end of a back-off neither count towards `max_batch_rows` (they do not trigger requests of
       the other channels) nor delay the replay of the other spools. Without spool, the memory held during an outage is
       bounded per channel only: number of channels x `max_queue_rows`.
@@ -469,6 +519,7 @@ class SharedWriter:
         spool: Optional[Spool] = None,
         durability: Literal["memory", "wal"] = "memory",
         replay_max_rows_per_s: Optional[float] = None,
+        retry_uncertain: bool = True,
     ) -> Channel:
         with self._condition:
             if self._stopping:
@@ -477,7 +528,9 @@ class SharedWriter:
                 endpoint = self._endpoints.setdefault(target.key, _Endpoint(target.ping))
             else:
                 endpoint = _Endpoint(target.ping)
-            channel = Channel(self, target, meta, max_queue_rows, spool, durability, replay_max_rows_per_s, endpoint)
+            channel = Channel(
+                self, target, meta, max_queue_rows, spool, durability, replay_max_rows_per_s, endpoint, retry_uncertain
+            )
             self._channels.append(channel)
             self._destinations.setdefault(id(endpoint), [endpoint, 0])[1] += 1
             self._condition.notify_all()
@@ -598,10 +651,10 @@ class SharedWriter:
         """Group the entries by channel, columns and dtypes, then put the line-protocol units of a target together"""
         groups: dict = {}
         for channel, entry in taken:
-            key = (id(channel), id(entry.meta), _signature(entry.frame))
+            key = (id(channel), id(entry.meta), _signature(entry.frame), entry.retried)
             groups.setdefault(key, (channel, entry.meta, []))[2].append(entry)
         tops, units = [], []
-        for (_, _, signature), (channel, meta, entries) in groups.items():
+        for (_, _, signature, retried), (channel, meta, entries) in groups.items():
             frames = [e.frame for e in entries]
             frame = pd.concat(frames, ignore_index=True) if len(frames) > 1 else frames[0]
             files = [e.wal for e in entries if e.wal is not None]
@@ -609,14 +662,15 @@ class SharedWriter:
             whole = not files or len(files) == len(entries)
             origins = [(e.seq, e.queued_at) for e in entries]
             sizes = [len(f) for f in frames]
-            top = _Unit(channel, frame, meta, sizes, replay=replay, files=files, whole=whole, origins=origins)
+            top = _Unit(channel, frame, meta, sizes, replay=replay, files=files, whole=whole, origins=origins, retried=retried)
             tops.append(top)
             parts = split_mixed_objects(frame, signature)
             if len(parts) == 1:
                 units.append(top)
             else:
                 units.extend(
-                    _Unit(channel, part, meta, [len(part)], replay=replay, whole=False, origins=origins[:1]) for part in parts
+                    _Unit(channel, part, meta, [len(part)], replay=replay, whole=False, origins=origins[:1], retried=retried)
+                    for part in parts
                 )
         jobs, shared = [], {}
         for unit in units:
@@ -636,13 +690,20 @@ class SharedWriter:
             size = len(entry.frame)
             try:
                 self._fallback(
-                    _Unit(channel, entry.frame, entry.meta, [size], files=[entry.wal] if entry.wal else []),
+                    _Unit(
+                        channel,
+                        entry.frame,
+                        entry.meta,
+                        [size],
+                        files=[entry.wal] if entry.wal else [],
+                        retried=entry.retried,
+                    ),
                     "unexpected writer error",
                 )
             except Exception:  # noqa: BLE001
                 logger.exception("Rows lost after an unexpected writer error")
                 with self._condition:
-                    channel._stats["dropped_rows"] += size
+                    channel._stats["uncertain_rows" if entry.retried else "dropped_rows"] += size
             finally:
                 with self._condition:
                     channel.pending_rows -= size
@@ -734,6 +795,8 @@ class SharedWriter:
             up = False
         with self._condition:
             endpoint.probing = False
+            if up:
+                self._answered(endpoint)
             if up and endpoint.retry_at:
                 endpoint.retry_at = 0.0
                 logger.info("Storage answers again: writing resumes")
@@ -782,6 +845,16 @@ class SharedWriter:
         units = self._encodable(units)
         if not units:
             return
+        if endpoint.ping is not None and any(u.retried for u in units) and not self._may_retry(endpoint):
+            # the single second write of uncertain rows is only spent on a storage that answers: right after a cut,
+            # the back-off often ends while the link is still down (flapping link, backend behind a port forwarder).
+            # Only those rows wait: the other rows of the request are sent now
+            for unit in units:
+                if unit.retried:
+                    self._fallback(unit, "storage not answering", unsent=True)
+            units = [u for u in units if not u.retried]
+            if not units:
+                return
         with self._condition:
             generation = endpoint.generation
         started = time.perf_counter()
@@ -844,7 +917,12 @@ class SharedWriter:
 
     def _fallback(self, unit: _Unit, reason: str = "storage unavailable", uncertain: bool = False, unsent: bool = False) -> None:
         """Rows not written: left to replay, spooled, kept in the queue (`unsent`: certainly not stored, without
-        spool), or counted in uncertain_rows or dropped_rows"""
+        spool), put back in the queue once for a second write (`uncertain`, without spool: line-protocol writes are
+        idempotent, a second write overwrites the same points), or counted in uncertain_rows or dropped_rows
+
+        Rows already written once with an uncertain outcome (`unit.retried`) are never retried again after another
+        uncertain write, and are counted in uncertain_rows whenever they are lost (they may be stored).
+        """
         channel, spool = unit.channel, unit.channel.spool
         if unit.replay:
             if not unit.whole and spool is not None:  # its original files are deleted: keep these rows in a new one
@@ -867,10 +945,15 @@ class SharedWriter:
             return
         if unsent and channel.requeue(unit):  # not stored: kept in memory until the storage is back
             return
+        retry = uncertain and not unit.retried and channel.retry_uncertain and channel.target.idempotent
+        if retry and channel.requeue(unit, retry=True):
+            logger.warning("%d rows may or may not be stored (%s); written once more (idempotent)", unit.rows, reason)
+            return
+        uncertain = uncertain or unit.retried
         with self._condition:
             channel._stats["uncertain_rows" if uncertain else "dropped_rows"] += unit.rows
         if uncertain:
-            logger.warning("%d rows may or may not be stored (%s); set spool_dir to write them again", unit.rows, reason)
+            logger.warning("%d rows may or may not be stored (%s); set spool_dir to keep them", unit.rows, reason)
         else:
             logger.warning("%d rows dropped (%s); set spool_dir to keep them", unit.rows, reason)
 
@@ -882,14 +965,51 @@ class SharedWriter:
                 current = channel._stats["max_write_ms"]
                 channel._stats["max_write_ms"] = round(max(current or 0.0, elapsed_ms), 3)
 
+    def _may_retry(self, endpoint: _Endpoint) -> bool:
+        """Whether the second write of uncertain rows can be sent: the destination answered its ping (within the last
+        probe interval, or now). A failed ping holds these rows for an exponential delay of their own (the back-off of
+        the destination and the other rows are left alone); after GATE_PINGS failed pings in a row they are sent anyway,
+        since a ping can fail while writes work (a proxy exposing only the write API)"""
+        now = time.monotonic()
+        with self._condition:
+            if endpoint.gate_failures >= GATE_PINGS:
+                return True
+            recent = self.probe_interval_s or 1.0
+            if endpoint.answered_at is not None and now - endpoint.answered_at < recent:
+                return True
+            if now < endpoint.gate_until:
+                return False
+        try:
+            answered = bool(endpoint.ping())
+        except Exception:  # noqa: BLE001
+            answered = False
+        with self._condition:
+            if answered:
+                self._answered(endpoint)
+                return True
+            endpoint.gate_failures += 1
+            endpoint.gate_until = time.monotonic() + min(2 ** (endpoint.gate_failures - 1), self.max_retry_delay_s)
+            return endpoint.gate_failures >= GATE_PINGS
+
+    @staticmethod
+    def _answered(endpoint: _Endpoint) -> None:
+        """The destination answered its ping; called with the condition held"""
+        endpoint.answered_at = time.monotonic()
+        endpoint.gate_failures = 0
+        endpoint.gate_until = 0.0
+
+    def _back_off_locked(self, endpoint: _Endpoint) -> float:
+        endpoint.failures += 1
+        endpoint.generation += 1
+        delay = min(2 ** (endpoint.failures - 1), self.max_retry_delay_s)
+        endpoint.retry_at = time.monotonic() + delay
+        endpoint.next_probe = time.monotonic() + (self.probe_interval_s or delay)
+        return delay
+
     def _record_failure(self, units: list, error: Exception, uncertain: bool) -> None:
         endpoint = units[0].channel.endpoint
         with self._condition:
-            endpoint.failures += 1
-            endpoint.generation += 1
-            delay = min(2 ** (endpoint.failures - 1), self.max_retry_delay_s)
-            endpoint.retry_at = time.monotonic() + delay
-            endpoint.next_probe = time.monotonic() + (self.probe_interval_s or delay)
+            delay = self._back_off_locked(endpoint)
             for channel in {id(u.channel): u.channel for u in units}.values():
                 channel._stats["write_errors"] += 1
                 if uncertain and _timeout(error):
@@ -1019,6 +1139,8 @@ class BackgroundWriter:
       `max_retry_delay_s`), probed every `probe_interval_s` when the target can be pinged: batches go straight to the
       spool or, without spool, stay in the queue (within `max_queue_rows`) until the storage is back.
     - Spooled batches are replayed, oldest first, once the storage is available, at most `replay_max_rows_per_s`.
+    - Without spool, the rows of a write that timed out or was cut are written once more (`retry_uncertain`), then
+      counted in `uncertain_rows` if the outcome is still uncertain.
     - `durability="wal"`: each batch is also written to the spool directory before submit() returns, so that a crash
       (kill -9) loses nothing; the file is deleted once the batch is written.
 
@@ -1039,6 +1161,7 @@ class BackgroundWriter:
         probe_interval_s: Optional[float] = 1.0,
         durability: Literal["memory", "wal"] = "memory",
         replay_max_rows_per_s: Optional[float] = None,
+        retry_uncertain: bool = True,
     ):
         self._writer = SharedWriter(
             max_batch_rows=max_batch_rows,
@@ -1054,6 +1177,7 @@ class BackgroundWriter:
             spool=spool,
             durability=durability,
             replay_max_rows_per_s=replay_max_rows_per_s,
+            retry_uncertain=retry_uncertain,
         )
 
     def submit(self, frame: pd.DataFrame) -> None:

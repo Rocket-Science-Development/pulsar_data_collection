@@ -92,7 +92,9 @@ class Target:
     """How a channel writes: frame by frame (`write_frame`), or as line protocol (`encode` + `send`) that can share a
     request with the other channels of the same `key` (same client and bucket)
 
-    `ping` (optional) is used to detect the end of an outage without waiting for the back-off delay.
+    `ping` (optional) is used to detect the end of an outage without waiting for the back-off delay. `idempotent`:
+    writing the same rows twice stores them once (InfluxDB points with their timestamp), so the rows of an uncertain
+    write can be written once more; None (default): True for line-protocol targets, False for `write_frame` ones.
     """
 
     def __init__(
@@ -102,6 +104,7 @@ class Target:
         send: Optional[Callable[[list], None]] = None,
         ping: Optional[Callable[[], bool]] = None,
         key=None,
+        idempotent: Optional[bool] = None,
     ):
         if write_frame is None and (encode is None or send is None):
             raise ValueError("a Target needs write_frame, or encode and send")
@@ -110,6 +113,7 @@ class Target:
         self.send = send
         self.ping = ping
         self.key = key if encode is not None else None
+        self.idempotent = self.lines if idempotent is None else idempotent
 
     @property
     def lines(self) -> bool:
@@ -326,18 +330,29 @@ class Channel:
             retried = unit.retried or retry
             if retry:
                 self._stats["retried_uncertain_rows"] += unit.rows
-            for frame, (seq, queued_at) in pieces:
+            entries = []
+            for frame, (seq, queued_at) in sorted(pieces, key=lambda piece: piece[1][0]):  # stable: same seq kept in order
                 rows = len(frame)
                 if rows > self.max_queue_rows:  # as in submit(): only the newest rows fit
                     extra = rows - self.max_queue_rows
                     frame = frame.iloc[extra:].reset_index(drop=True)
                     rows = len(frame)
                     self._lost(extra, retried)
-                position = 0
-                while position < len(self.queue) and self.queue[position].seq <= seq:
-                    position += 1
-                self.queue.insert(position, _Entry(frame, unit.meta, queued_at, seq=seq, retried=retried))
+                entries.append(_Entry(frame, unit.meta, queued_at, seq=seq, retried=retried))
                 self._queued(rows)
+            # one merge by submission order (each piece after the queued batches of the same or a lower seq): inserting
+            # piece by piece scanned the deque for each, seconds with the lock held for thousands of one-row captures
+            merged, queued = deque(), iter(self.queue)
+            current = next(queued, None)
+            for entry in entries:
+                while current is not None and current.seq <= entry.seq:
+                    merged.append(current)
+                    current = next(queued, None)
+                merged.append(entry)
+            if current is not None:
+                merged.append(current)
+                merged.extend(queued)
+            self.queue = merged
             self._bound()
             return True
 
@@ -911,7 +926,8 @@ class SharedWriter:
             return
         if unsent and channel.requeue(unit):  # not stored: kept in memory until the storage is back
             return
-        if uncertain and not unit.retried and channel.retry_uncertain and channel.requeue(unit, retry=True):
+        retry = uncertain and not unit.retried and channel.retry_uncertain and channel.target.idempotent
+        if retry and channel.requeue(unit, retry=True):
             logger.warning("%d rows may or may not be stored (%s); written once more (idempotent)", unit.rows, reason)
             return
         uncertain = uncertain or unit.retried

@@ -280,7 +280,7 @@ def test_rows_to_retry_without_room_in_the_queue_are_counted_uncertain_not_dropp
     first; they may be stored, hence counted in uncertain_rows. The caller is never blocked."""
     write = BlockingCut()
     writer = SharedWriter(flush_interval_s=0.02, max_retry_delay_s=0.2, concurrency=1, probe_interval_s=None)
-    channel = writer.register(Target(write_frame=write), {}, max_queue_rows=20)
+    channel = writer.register(Target(write_frame=write, idempotent=True), {}, max_queue_rows=20)
     channel.submit(seq(0))
     assert write.started.wait(5)  # the first batch is in flight
     channel.submit(seq(10))
@@ -304,7 +304,7 @@ def test_rows_waiting_for_their_retry_are_dropped_oldest_first_and_counted_uncer
         calls.append(list(frame["seq"]))
         raise StorageConnectionResetError("cut")
 
-    channel = writer.register(Target(write_frame=write), {}, max_queue_rows=30)
+    channel = writer.register(Target(write_frame=write, idempotent=True), {}, max_queue_rows=30)
     channel.submit(seq(0))
     deadline = time.monotonic() + 5
     while not channel.stats()["retried_uncertain_rows"] and time.monotonic() < deadline:
@@ -334,7 +334,7 @@ def test_rows_waiting_for_their_retry_at_close_are_counted_uncertain():
         calls.append(len(frame))
         raise StorageConnectionResetError("cut")
 
-    channel = writer.register(Target(write_frame=write), {})
+    channel = writer.register(Target(write_frame=write, idempotent=True), {})
     channel.submit(seq(0))
     deadline = time.monotonic() + 5
     while not channel.stats()["retried_uncertain_rows"] and time.monotonic() < deadline:
@@ -376,3 +376,55 @@ def test_a_retried_batch_and_a_fresh_one_in_the_same_request_are_treated_apart()
     fresh = sorted(str(v) for v in range(100, 110))
     assert sent == [first, sorted(first + fresh), fresh]
     assert stats["uncertain_rows"] == 20 and stats["retried_uncertain_rows"] == 20 and stats["dropped_rows"] == 0
+
+
+def test_a_write_frame_target_not_declared_idempotent_is_not_retried():
+    """A custom write function may not be idempotent (e.g. appending rows): its uncertain rows are counted at once,
+    as before 0.13.1, unless the Target declares idempotent=True"""
+    stored = []
+
+    def write(frame, meta):
+        stored.extend(frame["seq"])
+        raise TimeoutError("answer lost after storing")
+
+    writer = SharedWriter(flush_interval_s=0.02, concurrency=1, probe_interval_s=None)
+    channel = writer.register(Target(write_frame=write), {})
+    channel.submit(seq(0))
+    assert channel.flush(5)
+    stats = channel.stats()
+    writer.close(timeout_s=1)
+    assert stored == list(range(10))  # written once, not twice
+    assert stats["uncertain_rows"] == 10 and stats["retried_uncertain_rows"] == 0
+
+
+def test_requeueing_thousands_of_batches_is_one_merge():
+    """Thousands of one-row captures taken in one request, then cut, go back in one merge by submission order: the
+    deque was scanned for each batch with the lock held (2 s for 5,000 batches against 5,000 queued ones), blocking
+    the callers"""
+    writer = SharedWriter(flush_interval_s=60, max_batch_rows=5000, concurrency=1, probe_interval_s=None)
+    channel = writer.register(Target(write_frame=lambda f, m: None), {}, max_queue_rows=100_000)
+    with writer._condition:
+        channel.endpoint.retry_at = time.monotonic() + 3600
+    for k in range(5000):
+        channel.submit(seq(k, 1))
+    with writer._condition:
+        channel.endpoint.retry_at = 0.0
+        taken = writer._take()
+        channel.endpoint.retry_at = time.monotonic() + 3600
+    for k in range(5000, 10_000):
+        channel.submit(seq(k, 1))
+    (job,) = writer._jobs(taken)
+    (unit,) = job.units
+    assert len(unit.sizes) == 5000
+    started = time.perf_counter()
+    assert channel.requeue(unit, retry=True)
+    elapsed = time.perf_counter() - started
+    order = [int(e.frame["seq"].iloc[0]) for e in channel.queue]
+    flags = all(e.retried == (e.seq <= 5000) for e in channel.queue)
+    stats = channel.stats()
+    with writer._condition:
+        channel.pending_rows = 0
+    writer.close(timeout_s=1)
+    assert order == list(range(10_000)) and flags
+    assert stats["queued_rows"] == 10_000 and stats["retried_uncertain_rows"] == 5000
+    assert elapsed < 1.0  # about 2 s before, a few tens of ms now (most of it slicing the frame, outside the lock)

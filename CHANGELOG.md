@@ -18,13 +18,19 @@ All notable changes to pulsar-data-collection. The format follows
   (never a third write), if the queue bound drops them (they are the oldest rows of the queue, dropped first; counted
   in `uncertain_rows` rather than `dropped_rows`, since they may be stored), or if `close()` finds them still
   waiting for the end of a back-off. The caller is never blocked and the queue bound (`max_queue_rows`) is unchanged.
-  Rows already retried and fresh rows sharing one request (`SharedWriter`) are counted apart. With `spool_dir`
-  nothing changes: these rows are spooled and replayed, as before.
+  Rows already retried and fresh rows sharing one request (`SharedWriter`) are counted apart. While the rows wait for
+  their second write, `flush()` waits for them (it returned at once before). Only for targets whose writes are
+  idempotent: line protocol, and the InfluxDB connector; a custom `write_frame` target is not retried unless it is
+  declared `Target(..., idempotent=True)`. With `spool_dir` nothing changes: these rows are spooled and replayed, as
+  before.
+- Rows put back in the queue (back-off, refused connection, uncertain write) go back in one merge by submission
+  order: they were inserted batch by batch, each scanning the queue with the writer's lock held (about 2 s, blocking
+  `capture_data()`, for 5,000 one-row captures put back in front of 5,000 queued ones).
 
 ### Added
 
 - `CaptureOptions(retry_uncertain=True)` (and `retry_uncertain` of `SharedWriter.register()` and
-  `BackgroundWriter`): `False` counts the rows of an uncertain write in `uncertain_rows` at once, as up to 0.13.0
+  `BackgroundWriter`), and `Target(idempotent=...)` (default: True for line-protocol targets): `False` counts the rows of an uncertain write in `uncertain_rows` at once, as up to 0.13.0
   (e.g. for a custom `write` function that is not idempotent).
 - Counter `retried_uncertain_rows` in `stats()`: rows of uncertain writes put back for a second write. It is not part
   of the completeness identity; their outcome is counted in `written_rows`, `uncertain_rows`, `rejected_rows`...

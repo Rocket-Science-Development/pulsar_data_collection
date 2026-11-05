@@ -133,7 +133,7 @@ class Pulse:
                 ping=ping,
                 key=(id(client), bucket),
             )
-        return Target(write_frame=self._write, ping=ping)
+        return Target(write_frame=self._write, ping=ping, idempotent=bool(getattr(engine, "idempotent_writes", False)))
 
     def _write(self, frame, write_params: dict):
         supports = getattr(self.storage_engine, "supports_lines", None)

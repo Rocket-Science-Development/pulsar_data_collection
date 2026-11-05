@@ -254,6 +254,8 @@ shared_clients = _SharedClients()
 class InfluxdbActions(DatabaseActions):
     """Infuxdb database connection"""
 
+    idempotent_writes = True  # points carry their timestamp: writing them again overwrites them, no duplicate
+
     def make_connection(self, **kwargs) -> InfluxDBClient:
         """Makes connection to the Influxdb database
         Parameters

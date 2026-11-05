@@ -937,7 +937,7 @@ def test_timed_out_rows_are_written_once_more_then_uncertain():
         calls.append(len(frame))
         raise StorageWriteTimeoutError("timed out")
 
-    channel = writer.register(Target(write_frame=write), {})
+    channel = writer.register(Target(write_frame=write, idempotent=True), {})
     channel.submit(seq(0))
     assert channel.flush(5)
     stats = channel.stats()

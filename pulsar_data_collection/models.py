@@ -147,7 +147,8 @@ class CaptureOptions(BaseModel):
     sent (default True): InfluxDB may or may not have stored them, and writing the same points again overwrites them
     (no duplicate). They are counted in retried_uncertain_rows, then in uncertain_rows only if the second write is
     uncertain too, or if the queue bound or close() drops them. False: counted in uncertain_rows at once (as before
-    0.13.1). With spool_dir these rows are spooled and replayed, whatever this setting.
+    0.13.1). With spool_dir these rows are spooled and replayed, whatever this setting. Only for storage engines whose
+    writes are idempotent (InfluxDB); while the rows wait for their second write, flush() waits for them.
     """
 
     model_config = ConfigDict(extra="forbid")

@@ -1171,7 +1171,51 @@ with EvidenceOutbox(
 
 `stats()`: `queued`, `sent`, `retried` (record sends that failed and will be retried), `failed` (moved to the
 quarantine), `dropped`, `replaced`, `requests`, `pending`, `quarantined`, `oldest_pending_age_s`,
-`consecutive_failures`, `receiver_available`, `last_error`.
+`consecutive_failures`, `receiver_available`, `last_error`, `fingerprint_mismatches`, `unfingerprinted` (see below).
+
+## Model fingerprint: which exact model was measured
+
+`model_version` is a free label: two different models can carry it. A **model fingerprint** is a digest of the model
+itself, with the schema of the `model_fingerprint` field of the pulsar-metrics (>= 0.16) evidence records:
+`{"algorithm": "sha256", "digest": "<hex>", "source": "artifact" | "endpoint" | "declared", "ref": "<label>"}`.
+`pulsar_data_collection.fingerprint` does not depend on pulsar-metrics; it carries the digest from the capture to
+the results and the evidence:
+
+```python
+from pulsar_data_collection.fingerprint import EndpointFingerprint, fingerprint_path
+
+fp = fingerprint_path("models/credit-1.0.joblib")  # the saved artifact the server loads (file or directory)
+params = PulseParameters(..., model_fingerprint=fp)  # every captured row is tagged model_digest="sha256:<hex>"
+sink = ResultsSink(url, token, org, bucket, model_fingerprint=fp)  # every result point too
+outbox = EvidenceOutbox(url, directory, expected_fingerprint=fp)  # counts records about another model
+
+# LLM endpoints: the digest the server reports for the model it serves, compared with the declared one
+served = EndpointFingerprint("llama3.2:3b", "http://127.0.0.1:11434", declared="sha256:a80c4f17...")
+exporter = PulsarSpanExporter(sink, endpoint_fingerprint=served)  # agent_run, llm_call: endpoint_digest, model_digest_mismatch
+answers = canary.run(ask, fingerprint=served)  # canary.fingerprint: declared, before, after, mismatch, changed
+```
+
+- **Artifacts.** `fingerprint_path` hashes a file as `sha256sum` does, and a directory through its sorted manifest
+  (`directory_manifest`: `<sha256>  <relative path>` per file, hidden files included; links to directories, broken
+  links and special files raise). The digests are those of `pulsar_metrics.fingerprint.fingerprint_path` (tested on
+  a pinned directory). Hash the saved file, not the object in memory: pickle bytes are not stable.
+- **Ollama** reports a digest per model tag (`GET /api/tags`): the sha256 of the model manifest, which names the
+  weights, the template and the parameters, so a re-pull of a changed tag, another quantisation or a changed template
+  gives another digest. `ollama_fingerprint(model, base_url)` reads it (`"llama3.2"` means `"llama3.2:latest"`; the
+  `/v1` base URL is accepted). **OpenAI-compatible** endpoints (OpenAI, vLLM, Ollama's own `/v1/models`) usually
+  report none: `openai_fingerprint` returns None unless `/models/{id}` holds a `digest` or `sha256`; the fingerprint
+  is then `declared` only. `endpoint_fingerprint(kind="auto")` tries Ollama, then the OpenAI-compatible route.
+- **Mismatch.** `EndpointFingerprint` observes the served digest at most every `refresh_s` (default 300 s), and
+  counts `observations`, `failures` (unreachable, no digest), `mismatches` (observed differs from `declared`) and
+  `changes` (observed differs from the previous observation) in `stats()`. A mismatch is a governance signal: the
+  endpoint does not serve the model that was declared or assessed. It is recorded (`model_digest_mismatch=True` in
+  the agent_run and llm_call records, `mismatch` in the canary metadata, warnings in the log), never raised. An
+  unknown digest is not reported as "same": the fields are left out.
+- **Evidence.** The records are built by pulsar-metrics (`to_evidence(..., model_fingerprint=fp)`, or the
+  `model_fingerprint` of its analyzers): their `evidence_id` hashes the fingerprint, so the outbox cannot add it
+  afterwards. `EvidenceOutbox(expected_fingerprint=...)` checks the records it is given: a different fingerprint is
+  counted in `fingerprint_mismatches` and logged, a missing one in `unfingerprinted`, and both are still sent
+  unchanged; a malformed `model_fingerprint` is refused (ValueError).
 
 ## Data control: residence, retention, deletion, export
 
@@ -1313,6 +1357,7 @@ Known limits (InfluxDB 2.6):
 | `additional_tags` | `dict`, optional | Extra tags written with every row (environment, region...) |
 | `features_metadata` | `dict`, optional | Feature name to type |
 | `timestamp_column_name` | `str` | Name of the timestamp column; use `"_time"` for InfluxDB |
+| `model_fingerprint` | `ModelFingerprint`, dict or `"sha256:<hex>"`, optional | Digest of the served model: every row is tagged `model_digest` (see [Model fingerprint](#model-fingerprint-which-exact-model-was-measured)) |
 
 Unknown fields are rejected with a pydantic `ValidationError`, so that a misspelt field is not silently lost (for
 example `other_labels` instead of `additional_tags`). The same applies to `DataWithPrediction`.

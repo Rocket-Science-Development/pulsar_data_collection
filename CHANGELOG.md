@@ -3,7 +3,34 @@
 All notable changes to pulsar-data-collection. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
-## [Unreleased]
+## [0.14.0] - 2026-11-05
+
+### Added
+
+- **Model fingerprint** (`pulsar_data_collection.fingerprint`), with the schema of the `model_fingerprint` field of
+  the pulsar-metrics 0.16 evidence records (`{"algorithm", "digest", "source": "artifact" | "endpoint" | "declared",
+  "ref"}`), without depending on pulsar-metrics. `fingerprint_path` hashes a saved model file or directory (the
+  digests of `pulsar_metrics.fingerprint.fingerprint_path`). `ollama_fingerprint` reads the digest Ollama reports per
+  model tag (`/api/tags`, sha256 of the manifest: weights, template, parameters); `openai_fingerprint` reads a
+  `digest` / `sha256` of an OpenAI-compatible `/models/{id}` when there is one (usually none: the fingerprint is then
+  declared only); `endpoint_fingerprint` tries both. `EndpointFingerprint` observes the served digest (cached
+  `refresh_s`), compares it with the declared one and counts observations, failures, mismatches and changes: a
+  mismatch is recorded as a governance signal, never raised.
+- Carried from the capture configuration: `PulseParameters(model_fingerprint=...)` tags every row `model_digest`;
+  `ResultsSink(model_fingerprint=...)` tags every result point; `EvidenceOutbox(expected_fingerprint=...)` counts the
+  records about another model (`fingerprint_mismatches`) or without fingerprint (`unfingerprinted`) and refuses a
+  malformed `model_fingerprint`; `PulsarSpanExporter(endpoint_fingerprint=...)` adds `endpoint_digest` and
+  `model_digest_mismatch` to the agent_run and llm_call records; `CanaryProbe.run(..., fingerprint=...)` observes the
+  digest before and after the canary (`CanaryProbe.fingerprint`: mismatch, changed) and `CanaryProbe.save(...,
+  fingerprint=...)` keeps it in the metadata. Without these arguments nothing changes.
+- **Rows in flight and the memory bound (SC-04 R4).** `CaptureOptions(bound_in_flight=True)` (default `False`)
+  counts the rows in flight (taken for a request, not resolved yet) against `max_queue_rows`, so that queued and
+  in-flight rows together stay within it (plus the newest batch). New stats: `in_flight_rows`, `max_held_rows` (peak of
+  queued + in-flight rows). Rows put back in the queue after a failed write are no longer counted in flight at the same
+  time (`in_flight_rows` was too high until the request was cleaned up). The adaptive batch size also shrinks the
+  rows in flight on a slow link.
+- `SharedWriter(adaptive_batch=True, min_batch_rows=10)`, `CaptureOptions(adaptive_batch, min_batch_rows,
+  spool_overflow, bound_in_flight)`.
 
 ### Fixed
 
@@ -27,17 +54,6 @@ All notable changes to pulsar-data-collection. The format follows
   `overflow_spooled_rows`) by a spooler thread, never in `capture_data()`, and replayed once the queue has drained
   (the replay waits while a full request of live rows is queued). Same case rerun: 0 row dropped, 0 lost. The batches
   waiting for the spooler are bounded by `max_queue_rows` too. `spool_overflow=False` drops them, as before.
-
-### Added
-
-- **Rows in flight and the memory bound (SC-04 R4).** `CaptureOptions(bound_in_flight=True)` (default `False`)
-  counts the rows in flight (taken for a request, not resolved yet) against `max_queue_rows`, so that queued and
-  in-flight rows together stay within it (plus the newest batch). New stats: `in_flight_rows`, `max_held_rows` (peak of
-  queued + in-flight rows). Rows put back in the queue after a failed write are no longer counted in flight at the same
-  time (`in_flight_rows` was too high until the request was cleaned up). The adaptive batch size also shrinks the
-  rows in flight on a slow link.
-- `SharedWriter(adaptive_batch=True, min_batch_rows=10)`, `CaptureOptions(adaptive_batch, min_batch_rows,
-  spool_overflow, bound_in_flight)`.
 
 ## [0.13.1] - 2026-11-05
 

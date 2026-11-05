@@ -1,5 +1,6 @@
 """Collection for LLM applications and agents, from OpenTelemetry GenAI spans (requires the `genai` extra)."""
 
+from ..fingerprint import EndpointFingerprint
 from .abstention import (
     AbstentionDetector,
     AnswerSupport,
@@ -51,6 +52,7 @@ __all__ = [
     "ConsistencyQuestion",
     "ConsistencyResult",
     "EmbeddingSimilarity",
+    "EndpointFingerprint",
     "EntailmentSimilarity",
     "LexicalSimilarity",
     "ContentSafetyDetector",

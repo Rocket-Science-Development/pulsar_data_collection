@@ -172,6 +172,21 @@ class CaptureOptions(BaseModel):
     or close() drops them. False: counted in uncertain_rows at once (as before 0.13.1). With spool_dir these rows
     are spooled and replayed, whatever this setting. Only for storage engines whose writes are idempotent
     (InfluxDB); while the rows wait for their second write, flush() waits for them.
+    adaptive_batch: bool
+    A write that timed out divides the rows per request (max_batch_rows) by 8, down to min_batch_rows; a write fast
+    enough doubles them again, up to max_batch_rows (default True). On a link slower than max_batch_rows x bytes per
+    row / write_timeout_s, requests otherwise time out forever. Current size: stats()["batch_limit_rows"]. Private
+    writer only: a SharedWriter has its own adaptive_batch and min_batch_rows.
+    min_batch_rows: int
+    Floor of the adaptive batch size (default 10)
+    spool_overflow: bool
+    With spool_dir, the batches beyond max_queue_rows (storage answering, but slower than the traffic) are saved to the
+    spool by a background thread and replayed later, instead of being dropped (default True; counted in spooled_rows
+    and overflow_spooled_rows). False: dropped and counted in dropped_rows, as before. No effect without spool_dir.
+    bound_in_flight: bool
+    Count the rows in flight (taken from the queue and being written, or waiting for their answer) against
+    max_queue_rows too, so that queued + in-flight rows stay within it (default False: in-flight rows come on top,
+    up to max_batch_rows x concurrency per writer). Size max_queue_rows to at least twice max_batch_rows with it.
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -195,6 +210,10 @@ class CaptureOptions(BaseModel):
     replay_max_rows_per_s: Optional[float] = Field(None, gt=0)
     row_spacing_ns: int = Field(1_000, ge=1)
     retry_uncertain: bool = True
+    adaptive_batch: bool = True
+    min_batch_rows: int = Field(10, gt=0)
+    spool_overflow: bool = True
+    bound_in_flight: bool = False
 
     @model_validator(mode="after")
     def check_durability(self):

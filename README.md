@@ -182,8 +182,24 @@ Writing to the database must not slow down predictions. By default (`mode="backg
   by kind, and the counters are exact: on a partial write (422 `dropped=N`) the accepted rows are counted in
   `written_rows` and the refused ones in `rejected_rows`; when the response gives no count, the request is written
   again batch by batch, then in halves down to single rows.
+- A write that **timed out** makes the next requests to that InfluxDB 8 times smaller (`adaptive_batch=True`, the
+  default; not below `min_batch_rows`, 10), and a write fast enough makes them twice as large again, up to
+  `max_batch_rows`. On a slow link, a request of `max_batch_rows` rows can need more than `write_timeout_s` (at
+  1 Mbit/s, 5,000 rows of 560 bytes need about 22 s): it then timed out at every attempt and almost nothing was
+  written while the link stayed slow. The rows of a request that timed out because it was too large are written again
+  in the smaller requests, even if they had their second write already (the size goes down each time, so this ends).
+  The spool replay uses the same size. Current size: `stats()["batch_limit_rows"]`.
 - The queue is bounded (`max_queue_rows`): if it is full, the oldest batches are dropped and counted rather than
   blocking the caller or exhausting memory. A single capture larger than `max_queue_rows` keeps only its newest rows.
+  **With `spool_dir`**, these batches are saved to the spool instead (`spool_overflow=True`, the default; up to 0.13.1
+  they were dropped; counted in `spooled_rows` and `overflow_spooled_rows`), by a background thread (never in
+  `capture_data()`), and replayed once the queue has drained: a link that answers, but slower than the traffic, no
+  longer loses rows when there is a spool. The batches waiting for that thread are bounded by `max_queue_rows` too
+  (beyond, the oldest are dropped and counted; it only happens if the disk is slower than the traffic).
+- The rows **in flight** (taken from the queue for a request, up to `max_batch_rows` × concurrency per writer) come on
+  top of `max_queue_rows` by default. `bound_in_flight=True` counts them in it, so that rows queued and in flight
+  together stay within `max_queue_rows` (plus the newest batch, always kept); size `max_queue_rows` to at least twice
+  `max_batch_rows` then, or new batches are dropped while a large request is in flight.
 - If InfluxDB is unreachable when `Pulse` is created, the service starts anyway (warning in the logs) and spools until
   the database is back. Set `strict_startup=True` to fail instead.
 
@@ -214,7 +230,10 @@ pulse.close()  # at shutdown: writes (or spools) what is still queued
 outcome is in the other counters), `write_errors`, `write_timeouts`, `last_error`, `queued_rows`, `writer_lag_s` (age
 of the oldest queued batch), `last_write_ms` / `max_write_ms` (request latency), `spool_files`, `spool_bytes`,
 `spool_evicted_rows`, `memory_only_rows` (`durability="wal"` batches kept in memory only because the spool was
-full) and `storage_available`. Once everything is flushed, `written_rows + spooled_rows + dropped_rows +
+full), `storage_available`, `in_flight_rows` (taken for a request, not resolved yet), `max_held_rows` (peak of the
+rows queued and in flight), `batch_limit_rows` and `batch_shrinks` (current adaptive batch size of the destination, and
+how often a timeout lowered it) and `overflow_spooled_rows` (part of `spooled_rows`: batches beyond `max_queue_rows`
+saved to the spool). Once everything is flushed, `written_rows + spooled_rows + dropped_rows +
 rejected_rows + uncertain_rows = captured_rows`, and spooled rows end up in `replayed_rows` (or `rejected_rows`); any
 `dropped_rows` (which includes `spool_evicted_rows`) is a measured gap in the monitoring data. Errors and drops are also
 logged (logger `pulsar_data_collection`).
@@ -247,8 +266,10 @@ writer = SharedWriter(max_batch_rows=5_000, flush_interval_s=1.0, concurrency=4)
 pulse = Pulse(params, CaptureOptions(), writer=writer)
 ```
 
-Each Pulse keeps its own queue bound, spool and counters; `max_batch_rows`, `flush_interval_s`, `max_retry_delay_s`
-and `write_concurrency` of its options are replaced by those of the writer. `pulse.close()` detaches the Pulse;
+Each Pulse keeps its own queue bound, spool and counters; `max_batch_rows`, `flush_interval_s`, `max_retry_delay_s`,
+`write_concurrency`, `adaptive_batch` and `min_batch_rows` of its options are replaced by those of the writer
+(`SharedWriter(adaptive_batch=True, min_batch_rows=10)`; the adaptive batch size is kept per destination: one InfluxDB
+client and bucket). `pulse.close()` detaches the Pulse;
 `writer.close()` stops the thread.
 
 Failures are handled as for a private writer (see [Non-blocking capture and resilience](#non-blocking-capture-and-resilience)):
@@ -351,6 +372,11 @@ text columns). Beyond either, run several processes (e.g. several workers of the
 | `spool_compression` | `None` | `"gzip"` (level 1), **recommended** with a spool: spooled batches 2.2 times smaller on random floats, more on repetitive values (lab, 30 min outage at 200k rows/min: 819 MB instead of 1,734 MB, 143 bytes per row instead of 303, capture p99 after the outage 1.2 ms), for a replay 9 to 21 % longer |
 | `replay_max_rows_per_s` | `None` | Throttle of the spool replay, per Pulse (see below) |
 | `row_spacing_ns` | 1,000 | Spacing of the timestamps of the rows of one capture (1 µs) |
+| `retry_uncertain` | `True` | Without `spool_dir`, write once more the rows of a write that timed out or was cut (see above) |
+| `adaptive_batch` | `True` | A timed-out write divides the rows per request by 8 (down to `min_batch_rows`), fast writes double them again (up to `max_batch_rows`); `False`: always `max_batch_rows`, as before |
+| `min_batch_rows` | 10 | Floor of the adaptive batch size |
+| `spool_overflow` | `True` | With `spool_dir`, spool the batches beyond `max_queue_rows` instead of dropping them; `False`: dropped and counted, as before |
+| `bound_in_flight` | `False` | Count the rows in flight against `max_queue_rows` too (see above) |
 
 **Replay throttle.** After an outage, the replay of the spool competes with the capture for the GIL: in the lab, with
 10 private writers, the capture p99 rose to about 30 ms during the replay of a 10 or 30 min outage (1.2 ms with one
@@ -407,19 +433,41 @@ latencies are higher than on the lab machines):
   duplicate, exact counters, no blocked capture, queues and RSS within their bounds. With `spool_dir` these rows are
   spooled and replayed: 0 row lost, 0 duplicate. **Set `spool_dir` on any link that can drop connections**: the
   single in-memory retry does not cover a second cut, a long outage or a restart.
-- **Bandwidth cap** (1 Mbit/s): a 5,000-row request (about 560 bytes per row, 2.8 MB) needs about 22 s, so with
-  `write_timeout_s=5` every request times out, the `/ping` probe answers, the writer tries again, and almost nothing is
-  written while the cap lasts (rows uncertain, or spooled and replayed afterwards). Keep
-  `max_batch_rows × bytes per row` under `bandwidth × write_timeout_s` (here 1,000 rows, or `write_timeout_s=30`).
-  Even then a link slower than the traffic fills the queues, and the oldest batches are dropped and counted, **with
-  or without `spool_dir`**: the storage keeps answering, so it is never considered unavailable and the spool does not
-  take the overflow.
+- **Bandwidth cap** (1 Mbit/s, about 225 rows/s at 560 bytes per row, for 2,000 offered): a 5,000-row request
+  (2.8 MB) needs about 22 s. Up to 0.13.1, with `write_timeout_s=5`, every request timed out, the `/ping` probe
+  answered, the writer tried again with the same size, and almost nothing was written while the cap lasted (0 to 21
+  rows/s; rows uncertain, or spooled and replayed afterwards). Since the adaptive batch size (see above), the first
+  timeouts make the requests 8 then 64 times smaller, and the writers carry what the link can: **162 to 178 rows/s**
+  written during the cap with both write profiles, with or without spool. The rest of the traffic does not fit the
+  link: without spool, the queues fill up and the oldest batches are dropped and counted (29,000 to 33,000 rows in
+  45 s); with `spool_dir`, they are spooled and replayed once the cap is over (33,000 to 34,000 rows, 0 lost, 0
+  duplicate). Before, the timed-out requests were still delivered by Toxiproxy, which buffers what it accepted: the
+  rows counted uncertain were stored, but a real link closed after a timeout does not deliver them. With
+  `write_timeout_s=30` the first timeout takes 30 s, and 5,000 / 8 rows still need about 28 s at the rate per
+  connection of the test: the first writes succeed about a minute after the cap starts, so this 45 s cap still writes
+  only 33 to 69 rows/s. **With `spool_dir`, a link slower than the traffic no longer drops rows** (up to 0.13.1:
+  12,850 / 3,700 rows dropped in this case; now 0, the overflow is spooled: 81,400 / 38,650 rows, all replayed).
+  Without spool it drops the oldest batches, as before (15,200 / 26,250 rows, counted). Toxiproxy limits each
+  connection, so the rate per request is the cap divided by the connections of the profile.
 
 **Memory bound.** The queues hold at most *number of Pulse × `max_queue_rows`* rows, plus the requests in flight:
 up to `max_batch_rows` × concurrency per writer (private writers: one per Pulse), each row in flight also holding
 its line protocol and the request body (roughly 1.2 KB per row at 20 features, against about 200 bytes for a queued
-row). In SC-04 the RSS grew by at most 126 MB (10 private writers, 50,000 rows queued and 50,000 in flight) and 55 MB
-(`SharedWriter`) for bounds of 178 and 99 MB. The spool is on disk and bounded by `spool_max_bytes`.
+row). In SC-04 (0.13.0) the RSS grew by at most 126 MB (10 private writers, 50,000 rows queued and 50,000 in flight)
+and 55 MB (`SharedWriter`) for bounds of 178 and 99 MB. On a slow link the adaptive batch size also shrinks the
+requests in flight: rerun, the RSS grew by at most 65 MB (private writers) and 35 MB (`SharedWriter`) in the bandwidth
+cases, for 135 and 64 MB before. With `bound_in_flight=True` the rows in flight count against `max_queue_rows`:
+queued and in-flight rows together peaked at exactly 50,000 for 10 Pulse (71,500 to 72,050 without it, with
+`write_timeout_s=30`), at the cost of more rows dropped without spool (33,800 instead of 15,200 in that case: the
+rows in flight take their room in the queue). The batches waiting for the spooler (`spool_overflow`) are bounded by
+`max_queue_rows` too, and are normally saved within milliseconds. The spool is on disk and bounded by
+`spool_max_bytes`.
+
+What remains on a degraded network: without `spool_dir`, rows beyond the queue bound on a link slower than the
+traffic (counted in `dropped_rows`; size `max_queue_rows` for the longest slow period, or set `spool_dir`) and rows
+whose second write is cut too on a very lossy link (0 to about 4 % of the traffic at 20 % of connections cut, counted
+in `uncertain_rows`); the time to learn the batch size, one `write_timeout_s` per factor of 8; and the rows in flight
+on top of `max_queue_rows` unless `bound_in_flight=True`.
 
 ## How data is stored
 

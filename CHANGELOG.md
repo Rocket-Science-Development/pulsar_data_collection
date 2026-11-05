@@ -23,6 +23,37 @@ All notable changes to pulsar-data-collection. The format follows
   `model_digest_mismatch` to the agent_run and llm_call records; `CanaryProbe.run(..., fingerprint=...)` observes the
   digest before and after the canary (`CanaryProbe.fingerprint`: mismatch, changed) and `CanaryProbe.save(...,
   fingerprint=...)` keeps it in the metadata. Without these arguments nothing changes.
+- **Rows in flight and the memory bound (SC-04 R4).** `CaptureOptions(bound_in_flight=True)` (default `False`)
+  counts the rows in flight (taken for a request, not resolved yet) against `max_queue_rows`, so that queued and
+  in-flight rows together stay within it (plus the newest batch). New stats: `in_flight_rows`, `max_held_rows` (peak of
+  queued + in-flight rows). Rows put back in the queue after a failed write are no longer counted in flight at the same
+  time (`in_flight_rows` was too high until the request was cleaned up). The adaptive batch size also shrinks the
+  rows in flight on a slow link.
+- `SharedWriter(adaptive_batch=True, min_batch_rows=10)`, `CaptureOptions(adaptive_batch, min_batch_rows,
+  spool_overflow, bound_in_flight)`.
+
+### Fixed
+
+- **Slow link: requests that time out forever (SC-04 R2).** A request needing more than bandwidth × `write_timeout_s`
+  (at 1 Mbit/s, 5,000 rows of 560 bytes need about 22 s) timed out at every attempt: the `/ping` probe answered, the
+  writer tried again with the same size, and almost nothing was written while the link stayed slow (SC-04, 1 Mbit/s,
+  `write_timeout_s=5`: 0 to 21 rows/s written during the fault, for 2,000 offered). A request that timed out now
+  divides the rows per request of its destination by 8 (`adaptive_batch=True`, default; floor `min_batch_rows`, 10),
+  and a write whose doubled size is expected to take less than half the observed timeout doubles it again, up to
+  `max_batch_rows`. A queued batch larger than the request is split; the rows of a request that timed out because it
+  was too large are written again in the smaller requests, even after their second write (bounded: the size goes down
+  each time); the spool replay uses the same size, and spooled batches larger than it are replayed in pieces.
+  SC-04 rerun, same case: 162 to 178 rows/s written during the fault with both write profiles, about the capacity of
+  the link. Learning the size costs one `write_timeout_s` per factor of 8: with `write_timeout_s=30` and a link 16
+  times too slow, the first writes succeed about a minute after the link slowed down. `adaptive_batch=False` restores
+  the fixed size. Stats: `batch_limit_rows`, `batch_shrinks`.
+- **Spool and a link slower than the traffic (SC-04 R3).** With `spool_dir`, the spool only took the rows of an
+  unavailable storage: a link that answered, but slower than the traffic, overflowed the queue and its oldest batches
+  were dropped (SC-04, 1 Mbit/s, `write_timeout_s=30`, with spool: 12,850 / 3,700 rows dropped). These batches are now
+  saved to the spool (`spool_overflow=True`, default with `spool_dir`; counted in `spooled_rows` and the new
+  `overflow_spooled_rows`) by a spooler thread, never in `capture_data()`, and replayed once the queue has drained
+  (the replay waits while a full request of live rows is queued). Same case rerun: 0 row dropped, 0 lost. The batches
+  waiting for the spooler are bounded by `max_queue_rows` too. `spool_overflow=False` drops them, as before.
 
 ## [0.13.1] - 2026-11-05
 

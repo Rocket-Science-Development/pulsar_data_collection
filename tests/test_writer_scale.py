@@ -327,7 +327,9 @@ def test_dropped_count_is_read_from_the_422_body():
 # ---------------------------------------------------------------------------------------------------------- M32
 def test_timeouts_are_uncertain_not_lost(store):
     store.timeout_after_store = True  # InfluxDB stored the rows but the answer came too late, every time
-    with Pulse(params(), options(probe_interval_s=None)) as pulse:
+    # adaptive_batch off: one request per write (with it, the second write is split in smaller requests, see
+    # test_slow_link.py)
+    with Pulse(params(), options(probe_interval_s=None, adaptive_batch=False)) as pulse:
         capture(pulse, batch(0))
         assert pulse.flush(5)
         stats = pulse.stats()

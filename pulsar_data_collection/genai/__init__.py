@@ -1,6 +1,16 @@
 """Collection for LLM applications and agents, from OpenTelemetry GenAI spans (requires the `genai` extra)."""
 
 from .canary import CanaryProbe
+from .consistency import (
+    ConsistencyProbe,
+    ConsistencyQuestion,
+    ConsistencyResult,
+    EmbeddingSimilarity,
+    EntailmentSimilarity,
+    LexicalSimilarity,
+    normalize_answer,
+    openai_chat_target,
+)
 from .detectors import (
     ContentSafetyDetector,
     FaithfulnessScorer,
@@ -21,6 +31,12 @@ from .trajectory import TrajectoryAssembler
 
 __all__ = [
     "CanaryProbe",
+    "ConsistencyProbe",
+    "ConsistencyQuestion",
+    "ConsistencyResult",
+    "EmbeddingSimilarity",
+    "EntailmentSimilarity",
+    "LexicalSimilarity",
     "ContentSafetyDetector",
     "FaithfulnessScorer",
     "InjectionDetector",
@@ -41,6 +57,8 @@ __all__ = [
     "french_benign_calibration_set",
     "guess_language",
     "llm_span",
+    "normalize_answer",
+    "openai_chat_target",
     "record_event",
     "record_llm_response",
     "record_score",

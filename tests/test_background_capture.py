@@ -153,15 +153,18 @@ def test_unavailable_storage_with_spool_then_replay(fake, tmp_path):
     assert all(params["tags"]["environment"] == "test" for _, params in fake.frames)
 
 
-def test_unavailable_storage_without_spool_counts_dropped_rows(fake, caplog):
+def test_unavailable_storage_without_spool_keeps_rows_then_counts_them_dropped_at_close(fake, caplog):
+    """Without spool the rows wait in the queue during the outage (0.12.1; they were dropped at once before), and the
+    ones still there at close() are dropped and counted"""
     fake.down = True
     with Pulse(PARAMS, fast_options()) as pulse:
         for k in range(3):
             pulse.capture_data(capture(k))
-        assert pulse.flush(5)
-        stats = pulse.stats()
-    assert stats["dropped_rows"] == 30 and stats["written_rows"] == 0
-    assert "storage down" in stats["last_error"]
+        assert not pulse.flush(0.5)
+        waiting = pulse.stats()
+    stats = pulse.stats()
+    assert waiting["captured_rows"] == 30 and waiting["dropped_rows"] == 0 and "storage down" in waiting["last_error"]
+    assert stats["dropped_rows"] == 30 and stats["written_rows"] == 0 and stats["queued_rows"] == 0
     assert "rows dropped" in caplog.text
 
 

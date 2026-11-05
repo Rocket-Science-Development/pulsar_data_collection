@@ -161,12 +161,15 @@ Writing to the database must not slow down predictions. By default (`mode="backg
   delay was dropped, even with room in the queue). During the delay InfluxDB is probed (`/ping`) every
   `probe_interval_s` (1 s): writing resumes about a second after the end of an outage, not up to 60 s later.
   `flush()` waits for the database during the delay (and returns `False` at its timeout); `close()` does not wait:
-  during the delay it drops (or spools) and counts what is still queued.
+  during the delay it drops (or spools) and counts what is still queued. Requests in flight at once
+  (`write_concurrency`, `SharedWriter(concurrency=...)`) can reach InfluxDB out of order after a retry, as before;
+  the points keep their own timestamps.
 - A write that **timed out**, or whose **connection was cut** (reset, closed) once the request was sent and before
   the answer, may have been stored by InfluxDB: with `spool_dir` it is spooled and written again (writes are
   idempotent: same measurement, tags and timestamp overwrite the same point, no duplicate); without it the rows are
-  counted in `uncertain_rows`, not in `dropped_rows`. A refused connection never reached InfluxDB: the rows of the
-  failed request are dropped (or spooled); the batches that follow wait in the queue, as above.
+  counted in `uncertain_rows`, not in `dropped_rows`, and never written again. A failure that certainly stored
+  nothing (a refused connection, an error answer other than 400 / 422) puts the rows of the failed request back in the
+  queue with the batches that follow (or spools them).
 - A batch InfluxDB **refuses** (HTTP 400 / 422, e.g. a field type conflict) is never retried nor spooled. Frames are
   written together only when they share their columns *and* dtypes, object columns mixing numbers and strings are split
   by kind, and the counters are exact: on a partial write (422 `dropped=N`) the accepted rows are counted in
@@ -209,6 +212,9 @@ rejected_rows + uncertain_rows = captured_rows`, and spooled rows end up in `rep
 logged (logger `pulsar_data_collection`).
 
 `pulse.flush(timeout_s)` waits until the queue is empty, for instance in a notebook before reading the data back.
+During an outage without `spool_dir` it waits for the database, so it returns `False` after `timeout_s`: give it a
+short timeout in a request path. The GenAI exporter's `force_flush(timeout_millis)` gives all its record types one
+deadline together.
 
 Measured with InfluxDB 2.6.1 stopped for 15 s in the middle of the service: capture latency stayed at 0.8 ms (1.3 ms
 maximum), the rows went to the spool and were replayed when InfluxDB restarted, with **no row lost** (3,000 / 3,000).
@@ -241,10 +247,16 @@ Failures are handled as for a private writer (see [Non-blocking capture and resi
 the Pulses writing to the same InfluxDB client and bucket share one back-off. While it lasts, each Pulse's batches go
 to its spool or, without `spool_dir`, wait in its own queue up to its `max_queue_rows`, including batches already
 taken for a request when another request in flight failed (0.11 dropped those: 10,000 rows at 300 models and 5,000 at
-500 in the lab, with InfluxDB timing out under load and room left in the queues). Only the rows of the failed
-requests themselves are counted (`uncertain_rows` after a timeout, `dropped_rows` after a refused connection). For a
-multi-model server, set `spool_dir` all the same: memory only holds `max_queue_rows` per Pulse, and nothing survives
-a crash.
+500 in the lab, with InfluxDB timing out under load and room left in the queues). Only the rows of requests that
+timed out or were cut are counted (`uncertain_rows`). Rows waiting for one destination neither hold back the requests
+of the others nor the replay of their spools.
+
+**Memory during an outage.** Without `spool_dir`, each Pulse can hold its full `max_queue_rows` until the end of the
+outage, so the bound of the process is *number of Pulse × `max_queue_rows`*: with the default 100,000 rows, 300
+models can hold 30 million rows, about 3 GB at the roughly 100 bytes per queued row seen in the lab (SC-01, 500 Pulse:
+973 MB of RSS with 6.2 million rows queued). There is no writer-wide cap: size `max_queue_rows` to the memory budget
+(e.g. 10,000 rows for 300 models, about 300 MB), and for a multi-model server set `spool_dir`, which keeps the rows on
+disk instead (bounded by `spool_max_bytes`) and survives a crash.
 
 **Private writers or shared writer?** The shared writer now drains as fast as private writers (the line protocol
 encoding used to limit it to 13,000 to 19,000 rows/s in the lab, see [Throughput](#throughput-measured)), so the
@@ -998,7 +1010,7 @@ example `other_labels` instead of `additional_tags`). The same applies to `DataW
 |---|---|
 | `Pulse(data: PulseParameters, options: CaptureOptions = None)` | Checks the configuration and opens the connection. Raises `StorageConfigurationError` for an unknown bucket or organization, or a rejected token; `StorageUnavailableError` if InfluxDB is unreachable, only in sync mode or with `strict_startup=True` (both in `pulsar_data_collection.exceptions`) |
 | `capture_data(data: DataWithPrediction)` | Background mode: queues the rows and returns; sync mode: writes and raises on failure. The caller's DataFrames are not modified |
-| `flush(timeout_s=30)` | Waits until the queued rows are written, spooled or dropped; `True` if done in time |
+| `flush(timeout_s=30)` | Waits until the queued rows are written, spooled or dropped; `True` if done in time (during an outage without `spool_dir`, the rows wait for the database: `False` at the timeout) |
 | `stats()` | Completeness counters (see above); still available after `close()` |
 | `close(timeout_s=30)` | Writes or spools the queued rows, then closes the connection |
 | `with Pulse(...) as pulse:` | Calls `close()` when leaving the block |

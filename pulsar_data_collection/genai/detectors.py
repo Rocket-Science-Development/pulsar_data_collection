@@ -117,6 +117,20 @@ def _token_windows(spans: List[tuple], size: int, step: int) -> List[tuple]:
     return windows
 
 
+class _Locked:
+    """A per-instance lock (`_lock`) around the tokenizer and model calls; pickling and deep copies (multiprocessing)
+    leave it out and give the copy a new one"""
+
+    def __getstate__(self):
+        state = self.__dict__.copy()
+        state.pop("_lock", None)
+        return state
+
+    def __setstate__(self, state):
+        self.__dict__.update(state)
+        self._lock = threading.RLock()
+
+
 # --------------------------------------------------------------------------------------------------------------------
 # Thresholds and calibration (the scores are ranks, not probabilities)
 
@@ -384,7 +398,7 @@ class ClassifierScore:
     window_scores: List[float] = field(default_factory=list)  # raw score of each window
 
 
-class TextClassifierDetector:
+class TextClassifierDetector(_Locked):
     """A Hugging Face text classifier as a detector: score = probability mass of the `positive_labels`
 
     The model reads at most `max_length` tokens, special tokens included (510 text tokens at 512): its **horizon**.
@@ -671,7 +685,7 @@ class PiiScan(list):
         self.windows, self.truncated_windows = windows, truncated_windows
 
 
-class ModelPiiDetector:
+class ModelPiiDetector(_Locked):
     """Rule-based findings (validated identifiers) plus a named-entity model for names and addresses
 
     Parameters
@@ -948,7 +962,7 @@ class FaithfulnessResult:
         return self.sentences_scored / self.sentences_total if self.sentences_total else None
 
 
-class FaithfulnessScorer:
+class FaithfulnessScorer(_Locked):
     """Share of the answer supported by the context: mean, over the answer's sentences, of the probability that the
     retrieved passages entail the sentence (1 = every sentence is supported). A ranking signal, not a calibrated
     probability: alert on a threshold fitted on an A/A reference (`calibrate_threshold(..., direction="low")`).

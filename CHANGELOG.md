@@ -11,11 +11,13 @@ All notable changes to pulsar-data-collection. The format follows
   (uncertain outcome: InfluxDB may or may not have stored them) were counted in `uncertain_rows` and never written
   again, even with room in the queue. A backend that is down behind a port forwarder (Docker, Kubernetes) accepts the
   connection and then closes it, so an outage counts as cuts, not refusals. Lab test SC-04 (Toxiproxy, 10 models at
-  2,000 rows/s, no spool) lost 6,000 to 37,000 rows this way on a lossy link (5 % and 20 %) and on a flapping link
-  (down 5 s every 10 s), with both write profiles. These rows now go back to their queue, in their place, and are
-  written once more when the back-off ends and the storage answers its ping (`/ping`; right after a cut the
-  back-off often ends while the link is still down, and the single retry was then spent on a dead link): line-protocol points carry their timestamp, so a second write overwrites
-  the same points (no duplicate). They are counted in `uncertain_rows` only if that second write is uncertain too
+  2,000 rows/s, no spool) lost 6,050 to 41,450 rows per case this way (5 to 32 % of the traffic) on a lossy link
+  (5 % and 20 %) and on a flapping link (down 5 s every 10 s), with both write profiles. These rows now go back to
+  their queue, in their place, and are written once more when the back-off ends and the storage answers its ping
+  (`/ping`: right after a cut the back-off often ends while the link is still down, and the single retry was then
+  spent on a dead link). Line-protocol points carry their timestamp, so a second write overwrites the same points
+  (no duplicate). SC-04 rerun with 0.13.1, rows lost (private writers / `SharedWriter`): lossy 5 %, 200 / 0; lossy
+  20 %, 600 / 5,000 (second write cut too); flapping, 0 / 0; still 0 duplicate and exact counters. They are counted in `uncertain_rows` only if that second write is uncertain too
   (never a third write), if the queue bound drops them (they are the oldest rows of the queue, dropped first; counted
   in `uncertain_rows` rather than `dropped_rows`, since they may be stored), or if `close()` finds them still
   waiting for the end of a back-off. The caller is never blocked and the queue bound (`max_queue_rows`) is unchanged.

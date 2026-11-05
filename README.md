@@ -401,7 +401,10 @@ latencies are higher than on the lab machines):
   never written again, even with room in the queue: 5 to 32 % of the traffic was lost this way (all counted in
   `uncertain_rows`; InfluxDB had stored 0 to 10 % of them). A backend that is down behind a port forwarder or a load
   balancer (Docker, Kubernetes) often accepts the connection and then closes it, which also counts as uncertain, not
-  refused. Since 0.13.1 these rows are written once more (see above): SC04_AFTER_FIX. With `spool_dir` these rows are
+  refused. Since 0.13.1 these rows are written once more, once InfluxDB answers `/ping` (see above). Rerun without
+  spool, rows lost (private writers / `SharedWriter`): lossy link 5 %, 200 / 0 (11,700 / 6,050 in 0.13.0); lossy link
+  20 %, 600 / 5,000 (37,100 / 35,650; second write cut too); flapping link, 0 / 0 (41,450 / 39,800). Still 0
+  duplicate, exact counters, no blocked capture, queues and RSS within their bounds. With `spool_dir` these rows are
   spooled and replayed: 0 row lost, 0 duplicate. **Set `spool_dir` on any link that can drop connections**: the
   single in-memory retry does not cover a second cut, a long outage or a restart.
 - **Bandwidth cap** (1 Mbit/s): a 5,000-row request (about 560 bytes per row, 2.8 MB) needs about 22 s, so with

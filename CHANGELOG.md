@@ -30,8 +30,9 @@ All notable changes to pulsar-data-collection. The format follows
   rows wait for the storage or a request is in flight.
 - `PulseSink.flush(timeout_s)` and `PulsarSpanExporter.force_flush(timeout_millis)` give all record types one
   deadline together; they flushed them one after another with 30 s each.
-- Test `test_endpoint_errors_are_retried_not_quarantined` of the evidence outbox read the counters before the outbox
-  had handled the 2xx on a loaded machine; it waits for them now.
+- Tests `test_endpoint_errors_are_retried_not_quarantined` and `test_transient_and_configuration_errors_are_retried`
+  of the evidence outbox read the counters before the outbox had handled the 2xx on a loaded machine; they wait for
+  the outbox now.
 
 ### Changed
 

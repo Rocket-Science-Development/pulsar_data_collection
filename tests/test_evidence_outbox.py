@@ -171,13 +171,29 @@ def test_lost_answer_resends_the_same_ids_only(tmp_path):
         receiver.stop()
 
 
+@pytest.fixture
+def slow_delivery(monkeypatch):
+    """A loaded machine: the outbox handles a 2xx well after the receiver stored the records"""
+    post = EvidenceOutbox._post
+
+    def slow_post(self, rows):
+        outcome = post(self, rows)
+        if outcome[0] == "sent":
+            time.sleep(0.3)
+        return outcome
+
+    monkeypatch.setattr(EvidenceOutbox, "_post", slow_post)
+
+
 @pytest.mark.parametrize("status", [429, 503, 408, 401])
-def test_transient_and_configuration_errors_are_retried(receiver, tmp_path, status):
+def test_transient_and_configuration_errors_are_retried(receiver, tmp_path, status, slow_delivery):
     receiver.script = [(status, {"Retry-After": "0"}), status]
-    with outbox(receiver.url, tmp_path) as box:
+    with outbox(receiver.url, tmp_path, timeout_s=30.0) as box:  # no request timeout on a slow machine
         box.put_many(records(3))
-        assert wait_for(lambda: len(receiver.ids()) == 3)
+        # the outbox handles the 2xx after the receiver stored the records: wait for the outbox, not the receiver
+        assert wait_for(lambda: box.stats()["sent"] == 3, timeout_s=30)
         stats = box.stats()
+    assert sorted(receiver.ids()) == ["ev-0000", "ev-0001", "ev-0002"]
     assert stats["retried"] == 6 and stats["sent"] == 3 and stats["failed"] == 0
 
 
@@ -378,17 +394,8 @@ def test_sending_thread_survives_unexpected_errors_and_logs_once(receiver, tmp_p
 
 
 @pytest.mark.parametrize("status", [404, 405, 410, 421])
-def test_endpoint_errors_are_retried_not_quarantined(receiver, tmp_path, status, monkeypatch):
+def test_endpoint_errors_are_retried_not_quarantined(receiver, tmp_path, status, slow_delivery):
     receiver.script = [status, status]
-    post = EvidenceOutbox._post
-
-    def slow_post(self, rows):  # a loaded machine: the 2xx is handled well after the receiver stored the records
-        outcome = post(self, rows)
-        if outcome[0] == "sent":
-            time.sleep(0.3)
-        return outcome
-
-    monkeypatch.setattr(EvidenceOutbox, "_post", slow_post)
     with outbox(receiver.url, tmp_path, timeout_s=30.0) as box:  # no request timeout on a slow machine either
         box.put_many(records(3))
         # wait for the outbox to have handled the 2xx, not only for the receiver to hold the records: the stats were

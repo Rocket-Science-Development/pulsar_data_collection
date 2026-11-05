@@ -28,6 +28,8 @@ Supported storage: **InfluxDB 2.x** (tested with 2.6.1). The storage layer is a 
 - [LLM applications and agents (OpenTelemetry GenAI)](#llm-applications-and-agents-opentelemetry-genai)
 - [Personal information](#personal-information)
 - [Analysis results for dashboards](#analysis-results-and-capture-statistics-for-dashboards)
+- [Sending evidence records to a central service](#sending-evidence-records-to-a-central-service)
+- [Data control: residence, retention, deletion, export](#data-control-residence-retention-deletion-export)
 - [API reference](#api-reference)
 - [Analyzing the collected data with pulsar-metrics](#analyzing-the-collected-data-with-pulsar-metrics)
 - [Development](#development)
@@ -974,6 +976,121 @@ with EvidenceOutbox(
 quarantine), `dropped`, `replaced`, `requests`, `pending`, `quarantined`, `oldest_pending_age_s`,
 `consecutive_failures`, `receiver_available`, `last_error`.
 
+## Data control: residence, retention, deletion, export
+
+The client controls where the governance data lives and how long it is kept, can take it or delete it at any time,
+and keeps an audit trail of who did what, from a policy file and a command line, without the vendor
+(`pulsar_data_collection.governance`).
+
+### Where the data lives
+
+| Data | Where | Kept until | Leaves the client? |
+|---|---|---|---|
+| Captured rows (features, predictions, tags) | client's InfluxDB, bucket of role `raw` | the bucket's retention | no |
+| Analysis results, capture statistics, process health | client's InfluxDB, bucket of role `results` (may be the same bucket) | the bucket's retention | no |
+| Rows waiting for InfluxDB (spool, write-ahead copies) | `CaptureOptions.spool_dir`, on the capture host | written to InfluxDB | no |
+| Evidence records not yet delivered (and quarantined ones) | `EvidenceOutbox` SQLite store (`evidence_outbox.sqlite3`), on the host running the outbox | delivered (2xx) | **yes, these only** |
+| Audit journal of retention changes, deletions and exports | policy `journal` file | never deleted by Pulsar | no |
+| Exports | policy `export_dir`, or the directory given | managed by the client | no |
+
+Only the evidence records (aggregated results, schema `pulsar.evidence/1`) leave, to the `central_service` of the
+policy; raw rows never do. Once delivered, a record is held by the central service, out of reach of the deletion
+below. `describe()` (or the `describe` command) returns these locations as configured, with the actual retention of
+each bucket and the size of each local store; never a token.
+
+### Policy and command line
+
+```yaml
+# governance.yaml (JSON works too; YAML needs PyYAML). Relative paths are relative to this file.
+influxdb:
+  url: http://influxdb.ministry.internal:8086
+  org: ministry
+  token_env: PULSAR_INFLUX_TOKEN   # the token stays in the environment: a token in the file is refused
+buckets:                           # role -> bucket; retention: 90d, 12h, 2w, 1y (365 days), seconds or infinite
+  raw: {name: captures, retention: 90d, content: raw captured rows}
+  results: {name: results, retention: 2y, content: analysis results and capture statistics}
+spool_dirs: [/var/lib/pulsar/spool]
+outbox_dirs: [/var/lib/pulsar/outbox]
+journal: /var/lib/pulsar/governance/journal.jsonl
+journal_key_env: PULSAR_JOURNAL_KEY   # optional: HMAC-SHA256 chain instead of SHA-256
+export_dir: /var/lib/pulsar/exports
+central_service: https://governance.example/api/evidence
+```
+
+```bash
+export PULSAR_INFLUX_TOKEN=...      # a token allowed to read, write (delete) and update the buckets
+G="python -m pulsar_data_collection.governance --policy governance.yaml --actor jdoe"
+$G describe                                       # where each kind of data lives (--offline: no connection)
+$G retention check                                # declared against actual; exit code 1 on drift
+$G retention apply --reason "CHG-1234"            # set the declared retention on the buckets in drift
+$G delete --system-id SYS-042 --dry-run           # what would be deleted: buckets, measurements, spool, outbox
+$G delete --system-id SYS-042 --reason "request 17"
+$G delete --model-id credit_model --start 2026-01-01 --stop 2026-03-31T23:59:59Z --role raw
+$G export --system-id SYS-042 --start 2026-01-01 --out ./sys-042   # CSV (or --format parquet) and manifest.json
+$G export-verify ./sys-042                        # checksums of the files against the manifest
+$G journal verify --expected-head <hash recorded elsewhere>
+```
+
+Output is JSON; the exit code is 1 when a check fails (retention drift, broken journal, incomplete deletion, altered
+export). The same from Python:
+
+```python
+from pulsar_data_collection.governance import DataController, DataSelector
+
+with DataController("governance.yaml", actor="jdoe") as control:
+    print(control.check_retention())
+    selector = DataSelector(system_id="SYS-042")              # and/or model_id, model_version, data_id, tags=...
+    print(control.delete(selector, dry_run=True)["buckets"])  # counts only
+    control.delete(selector, reason="request 17")
+    control.export(DataSelector(model_id="credit_model"), "./credit", start="2026-01-01")
+    print(control.journal.verify())
+```
+
+- **Retention.** `check_retention()` compares the declared retention of every bucket with its actual retention rule
+  (`ok`, `drift`, `missing`, or `unmanaged` when the policy declares none); `apply_retention()` sets it through the
+  buckets API, with the shard group duration InfluxDB would pick (1 h below 2 days, 1 day below 6 months, 7 days
+  beyond; `shard_group_duration` to choose another), reads it back and journals the old and new values. A missing
+  bucket is reported, never created. InfluxDB refuses retentions shorter than one hour.
+- **Selection.** Rows are selected by the tags Pulse writes (`model_id`, `model_version`, `data_id`, and the
+  `additional_tags`: by convention, give every Pulse of a system `additional_tags={"system_id": ...}`) and the tags
+  given to `ResultsSink` (e.g. `tags={"model_id": ..., "system_id": ...}`), optionally one `measurement`, and a period
+  inclusive at both ends (default: everything). Every criterion must match. A period without any tag criterion needs
+  `all_series=True` (`--all-series`). Values with quotes, backslashes or control characters are refused: they cannot
+  be expressed in a delete predicate.
+- **Deletion.** For each bucket: count, delete through the InfluxDB delete API with the predicate
+  `system_id="SYS-042" AND ...` over the period, count again (`remaining` must be 0, else `status: incomplete`). Then
+  the spool directories: selected batches are deleted, partly selected ones rewritten with the kept rows (same time
+  prefix and id, so the replay order is kept; the old file is deleted only once the new one is in place). Then the
+  outbox stores: pending and quarantined evidence records whose `system_id` / `model_id` / `model_version` match (and
+  whose window intersects the period). Selectors on `data_id`, `measurement` or other tags do not apply to evidence
+  records: the outbox is then left untouched and the report says so. `dry_run=True` counts everything and changes
+  nothing. Stop the capture of the system (close its Pulse) before deleting: a spool directory belongs to one running
+  Pulse, and rows still in its memory would be written afterwards. A running outbox copes with the deletion of its
+  records.
+- **Export.** One file per bucket role and measurement (e.g. `raw/credit_model_1.0_input_data.csv`): `_time` (UTC,
+  RFC 3339 with nanoseconds, exact), `_measurement`, the tags, then one column per field; `manifest.json` lists the
+  selector, the period and every file with its rows, columns and types, tags, size and SHA-256. Parquet needs
+  `pyarrow`. A measurement is held in memory while it is written: export long periods in parts (`start` / `stop`).
+- **Audit journal.** Every retention change, deletion (whatever its outcome, with the error if any) and export
+  appends one JSON line, fsynced: sequence number, UTC time, actor, action, details (bucket, predicate, period,
+  counts, reason); never data values, never tokens (details with secret-looking keys are refused). Each entry holds
+  the hash of the previous one and its own (SHA-256, or HMAC-SHA256 with `journal_key_env`). `verify()` finds the first
+  modified, inserted, removed or reordered entry. Removing the last entries, or rewriting the whole file without the
+  key, leaves a valid chain: record the head (`journal.head()`, also in `describe()`) elsewhere, e.g. in the change
+  ticket, and check it with `verify(expected_head=...)`. Dry runs are not journaled (nothing changes).
+
+Known limits (InfluxDB 2.6):
+
+- the delete predicate accepts only `key="value"` terms joined by `AND` (no `OR`, no regular expression, no field):
+  one system, model or tag combination per call;
+- a deletion applies at once to queries, but the disk space is reclaimed later, by compaction. A retention is
+  enforced by dropping whole shard groups, checked every 30 minutes: rows can stay up to the retention plus one shard
+  group duration;
+- deleting from a large bucket is expensive for InfluxDB (tombstones on every series hit): prefer narrow selectors
+  and periods on a busy server;
+- the token needs read and write permission on the buckets (deleting is a write) and, for `apply_retention`,
+  permission to update them.
+
 ## API reference
 
 ### `PulseParameters`
@@ -1050,6 +1167,8 @@ uv run bandit -c pyproject.toml -r pulsar_data_collection
 The integration tests need a running Docker engine. The tests of the shared writer against a real InfluxDB
 (`tests/test_writer_influxdb.py`) run only when `PULSAR_TEST_INFLUX_URL`, `PULSAR_TEST_INFLUX_TOKEN`,
 `PULSAR_TEST_INFLUX_ORG` and `PULSAR_TEST_INFLUX_BUCKET` point at an instance you own; they are skipped otherwise.
+The data control tests against a real InfluxDB (`tests/test_governance_influxdb.py`) need the first three of these
+variables and a token allowed to create buckets: each test creates its own two buckets and deletes them.
 Continuous integration runs lint, bandit and the tests on
 Python 3.12 to 3.15 with pandas 3, plus Python 3.12 with pandas 2, for every pull request; tests are required to pass. Pushing a tag builds and publishes the
 package.

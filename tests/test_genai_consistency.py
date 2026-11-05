@@ -226,3 +226,13 @@ def test_embedding_similarity_is_a_cached_cosine(endpoint):
     assert (
         row["agreement"] == pytest.approx(0.6) and not row["full_agreement"] and row["agreement_method"].startswith("embedding")
     )
+
+
+def test_score_reads_the_answers_again_with_its_own_questions():
+    short = ConsistencyQuestion("q", "Capital of Manitoba?", answer_type="short")
+    replies = cycle(["Winnipeg.", "The capital is Winnipeg"])
+    answers = ConsistencyProbe([short], repeats=2).run(lambda t: next(replies)).answers
+    assert ConsistencyProbe([short], repeats=2).score(answers).iloc[0]["agreement"] == 0.0
+    free = ConsistencyProbe([ConsistencyQuestion("q", "Capital of Manitoba?")], repeats=2, similarity=LexicalSimilarity())
+    row = free.score(answers).iloc[0]
+    assert row["agreement_method"] == "lexical" and 0 < row["agreement"] < 1  # not the stored exact comparison

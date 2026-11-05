@@ -438,18 +438,22 @@ class ConsistencyProbe:
             questions = self.pii_policy.model_copy(update={"columns": ["majority_answer"], "count_column": None}).apply(questions)
         return ConsistencyResult(answers=answers, questions=questions)
 
-    def _pair(self, a: dict, b: dict, question: ConsistencyQuestion) -> float:
+    def _pair(self, a: dict, b: dict, categorical: bool) -> float:
         statuses = (a["answer_status"], b["answer_status"])
         if ANSWER_UNPARSED in statuses:
             return 0.0
         if ANSWER_REFUSAL in statuses:
             return float(statuses == (ANSWER_REFUSAL, ANSWER_REFUSAL))
-        if a["normalized"] is not None or b["normalized"] is not None:
+        if categorical:
             return float(a["normalized"] == b["normalized"])
         return float(self.similarity(a["answer"], b["answer"]))
 
     def score(self, answers: pd.DataFrame) -> pd.DataFrame:
         """One row per question from the `answers` frame of `run` (it needs the `answer` column for free text)
+
+        Answers with their text are read again with this probe's questions (answer type, labels, `normalize`), so a
+        frame collected for short answers can be scored as free text by another probe; without the text, the stored
+        `answer_status` and `normalized` are used.
 
         Columns: question_id, answer_type, n_answers (calls that answered, refusals and unparsed included), n_errors,
         n_refusals, n_unparsed, n_pairs, agreement (mean pair score), agreement_repeats (pairs of the original
@@ -461,13 +465,17 @@ class ConsistencyProbe:
         for q in self.questions:
             rows = answers[answers["question_id"] == q.question_id].to_dict("records") if len(answers) else []
             usable = [r for r in rows if r["answer_status"] != ANSWER_ERROR]
+            for r in usable:
+                if isinstance(r.get("answer"), str):
+                    # read again with this probe's question: a frame can be scored under another answer type
+                    r["answer_status"], r["normalized"] = self._read(r["answer"], q)
             categorical = q.answer_type in CATEGORICAL_TYPES or self.normalize is not None
             pairs = []
             for a, b in combinations(usable, 2):
                 kind = "repeats" if a["variant"] == b["variant"] == ORIGINAL else "paraphrases"
                 if ORIGINAL not in (a["variant"], b["variant"]):
                     kind = "other"
-                pairs.append((kind, self._pair(a, b, q)))
+                pairs.append((kind, self._pair(a, b, categorical)))
             scores = [s for _, s in pairs]
             threshold = 1.0 if categorical else self.agreement_threshold
             values = [REFUSAL_VALUE if r["answer_status"] == ANSWER_REFUSAL else r["normalized"] for r in usable]

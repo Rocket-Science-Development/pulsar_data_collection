@@ -604,6 +604,12 @@ value)` writes it, and `TextClassifierDetector(model, name=..., positive_labels=
 classifier. The scores are **ranks, not calibrated probabilities**: alert on a threshold fitted on a benign reference
 of the deployment (A/A), not on 0.5.
 
+A detector can be shared by several threads (e.g. an agent served with `--workers 4`): each one serializes its
+tokenizer and model calls with a lock of its own, since the Hugging Face fast tokenizers are not thread-safe (before
+0.12.1, 37 of 40 concurrent `FaithfulnessScorer.score` calls from 4 threads raised `RuntimeError: Already borrowed`).
+The calls of one detector then run one at a time; to score in parallel, give each worker its own detector (one model
+in memory each).
+
 ```python
 from pulsar_data_collection.genai.detectors import (
     FaithfulnessScorer, InjectionDetector, ModelPiiDetector, ScoreCalibrator, calibrate_threshold,

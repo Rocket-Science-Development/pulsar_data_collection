@@ -595,3 +595,13 @@ def test_cli_refuses_an_empty_or_injected_selection(tmp_path, monkeypatch, capsy
     assert main(base + ["delete", "--system-id", 'A" OR system_id="B']) == 2
     assert "invalid selection" in capsys.readouterr().err
     assert not (tmp_path / "journal.jsonl").exists()
+
+
+@pytest.mark.parametrize("period", [["--start", "yesterday"], ["--stop", "2026-13-01"], ["--start", "2026-12-01", "--stop", "2026-11-01"]])
+def test_cli_refuses_an_invalid_period(tmp_path, monkeypatch, capsys, period):
+    (tmp_path / "policy.json").write_text(json.dumps(policy_dict(tmp_path)))
+    monkeypatch.setenv("PULSAR_INFLUX_TOKEN", TOKEN)  # never used: refused before any request
+    for command in ("count", "delete", "export"):
+        assert main(["--policy", str(tmp_path / "policy.json"), command, "--system-id", "A", *period]) == 2
+        assert "invalid period" in capsys.readouterr().err
+    assert not (tmp_path / "journal.jsonl").exists()

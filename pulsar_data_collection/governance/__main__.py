@@ -13,7 +13,7 @@ from typing import Optional
 from .controller import DataController, verify_export
 from .journal import AuditJournal
 from .policy import load_policy
-from .selection import DataSelector
+from .selection import DataSelector, Period
 
 
 def _selector(args) -> DataSelector:
@@ -111,6 +111,11 @@ def main(argv: Optional[list] = None) -> int:
             selector = _selector(args)
         except ValueError as error:  # pydantic ValidationError included: no criterion, refused value
             print(f"invalid selection: {error}", file=sys.stderr)
+            return 2
+        try:
+            Period(args.start, args.stop)
+        except (ValueError, TypeError, OverflowError) as error:  # unreadable time, start after stop
+            print(f"invalid period: {error}", file=sys.stderr)
             return 2
         if args.command == "count":
             return _print(controller.count(selector, args.start, args.stop, roles=args.role), True)

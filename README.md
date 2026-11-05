@@ -362,6 +362,53 @@ a storage answering in 2 ms):
 With tens of models, the shared writer does more for the p99 than the throttle, since one thread replays instead of
 one per Pulse.
 
+## Capacity and degraded networks
+
+**Capture ceiling (measured, 0.11 write path).** On the lab machines (load generator c7i.8xlarge, Intel Xeon
+Platinum 8488C, 32 vCPU; InfluxDB 2.6.1 on an r7i.2xlarge), 50-row captures of 20 float features:
+
+| | Ceiling per process |
+|---|---|
+| `SharedWriter(concurrency=4)`, 100 models | 33,000 to 34,000 rows/s written |
+| Private writer (one Pulse) | about 25,000 rows/s written |
+| Caller side, `SharedWriter` (300 to 500 models) | about 2,100 captures/s, one core at 99 % |
+| Caller side, capture cost alone (p50 0.34 ms) | about 2,900 captures/s per core |
+
+`capture_data()`, encoding and the HTTP client share the GIL, so one process uses one core whatever the number of
+writers. Above these numbers, run several processes (each with its own `SharedWriter`), and size or partition InfluxDB
+(the lab saw server-side timeouts at 35,000 to 38,000 rows/s per process). A slower core lowers every line (about
+3 times slower per core on a laptop).
+
+**Degraded network (lab test SC-04).** A Toxiproxy between Pulse and InfluxDB, 10 models at 2,000 rows/s,
+`max_queue_rows=5,000`, `write_timeout_s=5`, 45 s of fault, both write profiles (run locally on a shared laptop, so
+latencies are higher than on the lab machines):
+
+- In every case the caller was never blocked (0 captures of 200 ms or more, p99 2 to 17 ms while the laptop was also
+  running another test) and the counters were exact: `captured = written + dropped + uncertain + rejected + spooled`,
+  and the rows read back from InfluxDB matched them (0 unexplained, 0 duplicate).
+- **Latency** (+200 ms, +1 s per request): no effect on the data. Writes take longer, the queues hold a few
+  thousand rows more, nothing is dropped.
+- **Lossy link and flapping link** (stalls and connection resets; proxy down 5 s out of 10): a request whose
+  connection is cut after it was sent is counted in `uncertain_rows`. Without `spool_dir` those rows are never
+  written again, even with room in the queue: 5 to 32 % of the traffic was lost this way (all counted; InfluxDB had
+  stored 0 to 10 % of them). A backend that is down behind a port forwarder or a load balancer (Docker, Kubernetes)
+  often accepts the connection and then closes it, which also counts as uncertain, not refused. With `spool_dir`
+  these rows are spooled and replayed: 0 row lost, 0 duplicate. **Set `spool_dir` on any link that can drop
+  connections.**
+- **Bandwidth cap** (1 Mbit/s): a 5,000-row request (about 560 bytes per row, 2.8 MB) needs about 22 s, so with
+  `write_timeout_s=5` every request times out, the `/ping` probe answers, the writer tries again, and almost nothing is
+  written while the cap lasts (rows uncertain, or spooled and replayed afterwards). Keep
+  `max_batch_rows × bytes per row` under `bandwidth × write_timeout_s` (here 1,000 rows, or `write_timeout_s=30`).
+  Even then a link slower than the traffic fills the queues, and the oldest batches are dropped and counted, **with
+  or without `spool_dir`**: the storage keeps answering, so it is never considered unavailable and the spool does not
+  take the overflow.
+
+**Memory bound.** The queues hold at most *number of Pulse × `max_queue_rows`* rows, plus the requests in flight:
+up to `max_batch_rows` × concurrency per writer (private writers: one per Pulse), each row in flight also holding
+its line protocol and the request body (roughly 1.2 KB per row at 20 features, against about 200 bytes for a queued
+row). In SC-04 the RSS grew by at most 126 MB (10 private writers, 50,000 rows queued and 50,000 in flight) and 55 MB
+(`SharedWriter`) for bounds of 178 and 99 MB. The spool is on disk and bounded by `spool_max_bytes`.
+
 ## How data is stored
 
 | InfluxDB concept | Content |

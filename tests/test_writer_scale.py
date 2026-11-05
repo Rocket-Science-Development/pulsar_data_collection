@@ -397,7 +397,9 @@ class ResettingServer:
 def test_a_connection_reset_after_the_request_is_sent_is_uncertain_not_lost():
     server = ResettingServer()
     login = {"url": server.url, "token": "t", "org": "o", "bucket_name": "b"}
-    pulse = Pulse(params().model_copy(update={"login": login}), options(probe_interval_s=None))  # starts anyway
+    pulse = Pulse(
+        params().model_copy(update={"login": login}), options(probe_interval_s=None, retry_uncertain=False)
+    )  # starts anyway
     try:
         capture(pulse, batch(0))
         assert pulse.flush(10)
@@ -405,10 +407,9 @@ def test_a_connection_reset_after_the_request_is_sent_is_uncertain_not_lost():
     finally:
         pulse.close(timeout_s=1)
         server.close()
-    assert len(server.writes) == 2 and server.writes[0].count(b"\n") == N - 1  # the whole request reached the server
-    assert server.writes[1] == server.writes[0]  # written once more (0.13.1), the same points
+    assert len(server.writes) == 1 and server.writes[0].count(b"\n") == N - 1  # the whole request reached the server
     assert stats["uncertain_rows"] == 50 and stats["dropped_rows"] == 0  # was counted in dropped_rows
-    assert stats["write_errors"] == 2 and stats["write_timeouts"] == 0 and stats["retried_uncertain_rows"] == 50
+    assert stats["write_errors"] == 1 and stats["write_timeouts"] == 0  # retried: tests/test_uncertain_retry.py
 
 
 def test_connection_cuts_are_recognised_but_not_refusals():

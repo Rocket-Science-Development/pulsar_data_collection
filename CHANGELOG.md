@@ -13,7 +13,8 @@ All notable changes to pulsar-data-collection. The format follows
   connection and then closes it, so an outage counts as cuts, not refusals. Lab test SC-04 (Toxiproxy, 10 models at
   2,000 rows/s, no spool) lost 6,000 to 37,000 rows this way on a lossy link (5 % and 20 %) and on a flapping link
   (down 5 s every 10 s), with both write profiles. These rows now go back to their queue, in their place, and are
-  written once more when the back-off ends: line-protocol points carry their timestamp, so a second write overwrites
+  written once more when the back-off ends and the storage answers its ping (`/ping`; right after a cut the
+  back-off often ends while the link is still down, and the single retry was then spent on a dead link): line-protocol points carry their timestamp, so a second write overwrites
   the same points (no duplicate). They are counted in `uncertain_rows` only if that second write is uncertain too
   (never a third write), if the queue bound drops them (they are the oldest rows of the queue, dropped first; counted
   in `uncertain_rows` rather than `dropped_rows`, since they may be stored), or if `close()` finds them still

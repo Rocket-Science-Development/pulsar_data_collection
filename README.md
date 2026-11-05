@@ -169,7 +169,8 @@ Writing to the database must not slow down predictions. By default (`mode="backg
 - A write that **timed out**, or whose **connection was cut** (reset, closed) once the request was sent and before
   the answer, may have been stored by InfluxDB: with `spool_dir` it is spooled and written again (writes are
   idempotent: same measurement, tags and timestamp overwrite the same point, no duplicate); without it the rows go
-  back to the queue, in their place, and are written **once more** when the back-off ends (`retry_uncertain=True`, the
+  back to the queue, in their place, and are written **once more** when the back-off ends and InfluxDB answers its
+  `/ping` (`retry_uncertain=True`, the
   default since 0.13.1; counted in `retried_uncertain_rows`). They are counted in `uncertain_rows` (not in
   `dropped_rows`) only if that second write is uncertain too, if the queue bound drops them (they are the oldest
   rows, so they go first), or if `close()` finds them still waiting; never written a third time.

@@ -450,7 +450,8 @@ class SharedWriter:
     - A refused write (HTTP 400 / 422) is counted exactly: from the `dropped=N` of a partial write when the request
       held one batch, otherwise by writing again batch by batch, then in halves down to single rows.
     - A write that timed out, or whose connection was cut before the answer, may have been stored: spooled (replaying is
-      idempotent) or, without spool, put back in the queue for one second write (`retry_uncertain`, default; counted in
+      idempotent) or, without spool, put back in the queue for one second write, sent once the destination answers its
+      ping (`retry_uncertain`, default; idempotent targets only; counted in
       `retried_uncertain_rows`), then counted in `uncertain_rows` if that one is uncertain too or cannot be made. A
       write that failed otherwise stored nothing: its rows go back to the queue (or to the spool) like those of the
       back-off.
@@ -836,6 +837,13 @@ class SharedWriter:
         units = self._encodable(units)
         if not units:
             return
+        if endpoint.ping is not None and any(u.retried for u in units) and not self._answers(endpoint):
+            # the single second write of uncertain rows is only spent on a storage that answers: right after a cut,
+            # the back-off often ends while the link is still down (flapping link, backend behind a port forwarder)
+            self._back_off(endpoint)
+            for unit in units:
+                self._fallback(unit, "storage not answering", unsent=True)
+            return
         with self._condition:
             generation = endpoint.generation
         started = time.perf_counter()
@@ -946,14 +954,30 @@ class SharedWriter:
                 current = channel._stats["max_write_ms"]
                 channel._stats["max_write_ms"] = round(max(current or 0.0, elapsed_ms), 3)
 
+    @staticmethod
+    def _answers(endpoint: _Endpoint) -> bool:
+        try:
+            return bool(endpoint.ping())
+        except Exception:  # noqa: BLE001
+            return False
+
+    def _back_off(self, endpoint: _Endpoint) -> float:
+        """Start (or lengthen) the back-off of a destination; returns its delay. Called without the condition held"""
+        with self._condition:
+            return self._back_off_locked(endpoint)
+
+    def _back_off_locked(self, endpoint: _Endpoint) -> float:
+        endpoint.failures += 1
+        endpoint.generation += 1
+        delay = min(2 ** (endpoint.failures - 1), self.max_retry_delay_s)
+        endpoint.retry_at = time.monotonic() + delay
+        endpoint.next_probe = time.monotonic() + (self.probe_interval_s or delay)
+        return delay
+
     def _record_failure(self, units: list, error: Exception, uncertain: bool) -> None:
         endpoint = units[0].channel.endpoint
         with self._condition:
-            endpoint.failures += 1
-            endpoint.generation += 1
-            delay = min(2 ** (endpoint.failures - 1), self.max_retry_delay_s)
-            endpoint.retry_at = time.monotonic() + delay
-            endpoint.next_probe = time.monotonic() + (self.probe_interval_s or delay)
+            delay = self._back_off_locked(endpoint)
             for channel in {id(u.channel): u.channel for u in units}.values():
                 channel._stats["write_errors"] += 1
                 if uncertain and _timeout(error):

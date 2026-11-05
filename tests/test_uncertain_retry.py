@@ -428,3 +428,46 @@ def test_requeueing_thousands_of_batches_is_one_merge():
     assert order == list(range(10_000)) and flags
     assert stats["queued_rows"] == 10_000 and stats["retried_uncertain_rows"] == 5000
     assert elapsed < 1.0  # about 2 s before, a few tens of ms now (most of it slicing the frame, outside the lock)
+
+
+def test_the_second_write_waits_for_a_storage_that_answers():
+    """Right after a cut the back-off often ends while the link is still down (flapping link): the second write of the
+    uncertain rows is only sent once the storage answers its ping, so that it is not spent on a dead link"""
+    calls, pings = [], []
+    answers = iter([False, False, True])
+
+    def ping():
+        pings.append(1)
+        return next(answers, True)
+
+    def write(frame, meta):
+        calls.append(list(frame["seq"]))
+        if len(calls) == 1:
+            raise StorageConnectionResetError("cut")
+
+    writer = SharedWriter(flush_interval_s=0.02, max_retry_delay_s=0.1, concurrency=1, probe_interval_s=None)
+    channel = writer.register(Target(write_frame=write, ping=ping, idempotent=True), {})
+    channel.submit(seq(0))
+    assert channel.flush(10)
+    stats = channel.stats()
+    writer.close(timeout_s=1)
+    assert calls == [list(range(10)), list(range(10))]  # not sent while the storage did not answer
+    assert len(pings) == 3 and stats["write_errors"] == 1  # a ping that fails is not a write error
+    assert stats["written_rows"] == 10 and stats["uncertain_rows"] == 0 and stats["retried_uncertain_rows"] == 10
+
+
+def test_rows_waiting_for_a_storage_that_never_answers_are_counted_uncertain_at_close():
+    calls = []
+
+    def write(frame, meta):
+        calls.append(len(frame))
+        raise StorageConnectionResetError("cut")
+
+    writer = SharedWriter(flush_interval_s=0.02, max_retry_delay_s=0.05, concurrency=1, probe_interval_s=None)
+    channel = writer.register(Target(write_frame=write, ping=lambda: False, idempotent=True), {})
+    channel.submit(seq(0))
+    assert not channel.flush(0.5)  # the rows wait for the storage
+    writer.close(timeout_s=1)
+    stats = channel.stats()
+    assert calls == [10]
+    assert stats["uncertain_rows"] == 10 and stats["dropped_rows"] == 0 and accounted(stats) == stats["captured_rows"]

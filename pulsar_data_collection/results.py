@@ -4,7 +4,8 @@ The analyses of pulsar-metrics return `MetricResults` in memory (drift, fairness
 stores them in one measurement, `pulsar_results`, one point per result:
 
 - tags: `model_id`, `model_version`, `metric_type`, `metric_name`, `feature_name`, `group`, `reference_group`,
-  `test_type`, plus the tags given by the caller (e.g. `campaign`, `scenario`);
+  `test_type`, `model_digest` when the sink has a model fingerprint, plus the tags given by the caller (e.g.
+  `campaign`, `scenario`);
 - fields: `metric_value`, `ci_low`, `ci_high`, `threshold_low`, `threshold_high`, `n`, `e_value`, `status`,
   `suppressed`, `method`, `error`, plus the extra numeric fields of the caller (e.g. `p_adjusted`, `confirmed`).
 
@@ -23,6 +24,8 @@ from typing import Any, Iterable, Optional
 
 from influxdb_client import InfluxDBClient, Point, WritePrecision
 from influxdb_client.client.write_api import SYNCHRONOUS
+
+from .fingerprint import as_fingerprint
 
 logger = logging.getLogger("pulsar_data_collection")
 
@@ -173,6 +176,9 @@ class ResultsSink:
         Measurement of the results (default "pulsar_results")
     stats_measurement : str, optional
         Measurement of Pulse's counters (default "pulsar_capture_stats")
+    model_fingerprint : ModelFingerprint, dict or "sha256:<hex>", optional
+        Digest of the measured model (pulsar_data_collection.fingerprint): every result point is tagged
+        `model_digest` = "sha256:<hex>" (a `model_digest` tag given to write_results must agree)
     """
 
     def __init__(
@@ -184,8 +190,10 @@ class ResultsSink:
         measurement: str = "pulsar_results",
         stats_measurement: str = "pulsar_capture_stats",
         timeout_s: float = 10.0,
+        model_fingerprint=None,
     ):
         self.bucket = bucket
+        self.model_fingerprint = as_fingerprint(model_fingerprint)
         self.org = org
         self.measurement = measurement
         self.stats_measurement = stats_measurement
@@ -195,6 +203,11 @@ class ResultsSink:
     def write_results(self, results: Iterable[Any], timestamp: Optional[datetime] = None, tags: Optional[dict] = None) -> int:
         """Write results (MetricResults or dicts) at `timestamp` (default: now), with the given tags; returns the count"""
         timestamp = timestamp or datetime.now(timezone.utc)
+        if self.model_fingerprint is not None:
+            digest = str(self.model_fingerprint)
+            if (tags or {}).get("model_digest", digest) != digest:
+                raise ValueError(f"tag model_digest={tags['model_digest']!r} differs from the sink's model fingerprint {digest}")
+            tags = {**(tags or {}), "model_digest": digest}
         points = [result_point(r, timestamp, self.measurement, tags) for r in results]
         if points:
             self._write.write(bucket=self.bucket, org=self.org, record=points)

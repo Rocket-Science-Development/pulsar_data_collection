@@ -6,6 +6,7 @@ import pandas as pd
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from .config import factories
+from .fingerprint import ModelFingerprint, as_fingerprint
 from .privacy import PiiPolicy
 
 
@@ -35,6 +36,10 @@ class PulseParameters(BaseModel):
     Dictionary of additional labels used provide more metadata regarding the context surrounding the model
     timestamp_column_name: str = "timestamp"
     Name of the column containing the timestamp
+    model_fingerprint: Optional[ModelFingerprint] = None
+    Digest of the served model (`pulsar_data_collection.fingerprint`: fingerprint_path of the saved artifact,
+    ollama_fingerprint, or a declared "sha256:<hex>"). Every row is then tagged `model_digest` = "sha256:<hex>", so
+    that the captured data says which exact model produced it (a tag `model_digest` of additional_tags must agree)
 
     """
 
@@ -51,6 +56,23 @@ class PulseParameters(BaseModel):
     features_metadata: Optional[Dict[str, type]] = None  # key: feature_name, value : feature type
     additional_tags: Optional[Dict[str, Union[str, int, bool]]] = None
     timestamp_column_name: str = "timestamp"
+    model_fingerprint: Optional[ModelFingerprint] = None
+
+    @field_validator("model_fingerprint", mode="before")
+    @classmethod
+    def check_model_fingerprint(cls, value):
+        return as_fingerprint(value)
+
+    @model_validator(mode="after")
+    def tag_model_digest(self):
+        if self.model_fingerprint is not None:
+            digest = str(self.model_fingerprint)
+            tags = dict(self.additional_tags or {})
+            if tags.get("model_digest", digest) != digest:
+                raise ValueError(f"additional_tags model_digest={tags['model_digest']!r} differs from model_fingerprint {digest}")
+            tags["model_digest"] = digest
+            self.additional_tags = tags
+        return self
 
     @field_validator("storage_engine")
     @classmethod

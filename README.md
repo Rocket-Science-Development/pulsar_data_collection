@@ -780,6 +780,56 @@ Parameters:
   few, correlated batches (the lower 95 % bound of 5/5 is near 0.48), and 48 x 10 was never run against fp16: check
   on your own model.
 
+### Consistency of repeated answers
+
+`ConsistencyProbe` asks each question several times (`repeats`, default 3) and, optionally, in other words supplied
+by the user (`paraphrases`, asked `paraphrase_repeats` times, default 1), and scores how much the answers agree. The
+calls go to any `ask(text) -> answer`; `openai_chat_target` builds one for an OpenAI-compatible endpoint (Ollama,
+vLLM, a provider), with a cap on the answer length (`max_tokens`, default 128) and a client timeout (default 120 s).
+Requests are sent round after round, `workers` at a time (default 1). Prefer `127.0.0.1` to `localhost` for a local
+endpoint on Windows: there `localhost` is tried in IPv6 first, and each call waited about 20 s before the fallback.
+
+| `answer_type` | Normalized final answer | Two answers agree when |
+|---|---|---|
+| `yes_no` | `"yes"` / `"no"` (first oui / yes / non / no / vrai / true / faux / false) | the normalized answers are equal |
+| `number` | first number, `"6370"` for "6 370 $" or "6,370", `"3.5"` for "3,5 %" | idem |
+| `label` | the label of `labels` named first (accent- and case-insensitive) | idem |
+| `short` | folded text without punctuation nor leading article | idem |
+| `free` | none | `similarity(a, b)` reaches `agreement_threshold` |
+
+The text after a final "Answer:" or "Réponse :" marker is read when there is one. For free text, `similarity` is
+`EmbeddingSimilarity` (cosine of the embeddings of an OpenAI-compatible `/embeddings` endpoint, e.g. Ollama's
+`nomic-embed-text` or the multilingual `granite-embedding:278m`; threshold 0.9 by default, to fit on your answers),
+`EntailmentSimilarity(FaithfulnessScorer())` (bidirectional NLI entailment, the weaker direction by default; threshold
+0.5) or any callable; the default `LexicalSimilarity` (word overlap) is a weak proxy.
+
+```python
+from pulsar_data_collection.genai import ConsistencyProbe, ConsistencyQuestion, openai_chat_target
+
+ask = openai_chat_target("http://127.0.0.1:11434/v1", "llama3.2:3b", temperature=0.7, max_tokens=48, timeout=180)
+probe = ConsistencyProbe([
+    ConsistencyQuestion("capital-mb", "Quelle est la capitale du Manitoba ? Le nom de la ville seulement.",
+                        answer_type="label", labels=("Winnipeg", "Brandon", "Regina"), expected="Winnipeg"),
+    ConsistencyQuestion("pi-yn", "Le système implique-t-il des renseignements personnels ? Oui ou non.",
+                        paraphrases=("Des renseignements personnels sont-ils utilisés ? Oui ou non.",), answer_type="yes_no"),
+], repeats=3)
+result = probe.run(ask, workers=2)
+result.questions  # one row per question, for pulsar_metrics.genai.consistency / consistency_drift
+```
+
+`result.answers` has one row per call: `question_id`, `variant` (`"original"`, `"paraphrase-1"`...), `repeat`,
+`answer`, `normalized`, `answer_status` (`ok`, `refusal`, `unparsed`, `error`), `error`, `latency_s`; the question
+texts are not stored. `result.questions` has one row per question: `n_answers`, `n_errors`, `n_refusals`,
+`n_unparsed`, `n_pairs`, `agreement` (mean pair score), `agreement_repeats` (pairs of the original wording),
+`agreement_paraphrases` (original x paraphrase), `min_pair`, `full_agreement` (every pair agrees), `majority_answer`
+and `majority_share`, `correct_share` (when `expected` is given), `agreement_method` and `pair_scores`.
+
+- Two refusals of the same question agree, a refusal and an answer do not; an answer whose final answer cannot be
+  read agrees with nothing; failed calls are counted (`n_errors`) and left out.
+- `keep_answers=False` drops the answer texts (the normalized answers stay); `pii_policy=PiiPolicy()` masks (or only
+  counts) personal information in the answers, the normalized answers and the majority answer before they are
+  returned. The scores are computed on the texts as received, in memory.
+
 ## Personal information
 
 `pulsar_data_collection.privacy` detects personal information with **validated rules** (checksums, valid dates,

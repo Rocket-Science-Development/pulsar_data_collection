@@ -151,7 +151,7 @@ class CaptureOptions(BaseModel):
     are spooled and replayed, whatever this setting. Only for storage engines whose writes are idempotent
     (InfluxDB); while the rows wait for their second write, flush() waits for them.
     adaptive_batch: bool
-    A write that timed out divides the rows per request (max_batch_rows) by 4, down to min_batch_rows; a write fast
+    A write that timed out divides the rows per request (max_batch_rows) by 8, down to min_batch_rows; a write fast
     enough doubles them again, up to max_batch_rows (default True). On a link slower than max_batch_rows x bytes per
     row / write_timeout_s, requests otherwise time out forever. Current size: stats()["batch_limit_rows"]. Private
     writer only: a SharedWriter has its own adaptive_batch and min_batch_rows.

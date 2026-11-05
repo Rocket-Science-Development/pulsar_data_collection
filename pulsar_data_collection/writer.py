@@ -24,7 +24,8 @@ from .spool import Spool
 logger = logging.getLogger("pulsar_data_collection")
 
 GATE_PINGS = 3  # failed pings after which the second write of uncertain rows is sent anyway (ping may be unreliable)
-SHRINK_FACTOR = 4  # a request that timed out: the rows per request of its destination are divided by this much
+SHRINK_FACTOR = 8  # a request that timed out: the rows per request of its destination are divided by this much
+# (a timeout costs write_timeout_s without progress, a size too small only a few fast requests to double it back)
 
 WriteFunction = Callable[[pd.DataFrame, dict], None]
 
@@ -543,7 +544,7 @@ class SharedWriter:
       the other channels) nor delay the replay of the other spools. Without spool, the memory held during an outage is
       bounded per channel only: number of channels x `max_queue_rows`.
     - Adaptive batch size (`adaptive_batch`, default): a request that timed out divides the rows per request of its
-      destination by 4 (not below `min_batch_rows`), so that a slow link (bandwidth x write timeout smaller than a
+      destination by 8 (not below `min_batch_rows`), so that a slow link (bandwidth x write timeout smaller than a
       request) still carries rows instead of timing out forever; a write fast enough to be doubled within half the
       observed timeout doubles it again, up to `max_batch_rows`. Live requests and spool replays both follow it.
     - With a spool, the batches beyond `max_queue_rows` of a channel (storage answering, but slower than the traffic)
@@ -1122,7 +1123,7 @@ class SharedWriter:
         self._trigger_rows = min([self.max_batch_rows, *limits])
 
     def _shrink(self, endpoint: _Endpoint, rows: int, elapsed_s: float) -> bool:
-        """A request of `rows` rows timed out after `elapsed_s`: the next ones to this destination are 4 times smaller
+        """A request of `rows` rows timed out after `elapsed_s`: the next ones to this destination are 8 times smaller
         (a request needing more than bandwidth x timeout can never succeed, however often it is retried). True when
         the request was larger than the new size (its rows will go in smaller requests)"""
         if not self.adaptive_batch:

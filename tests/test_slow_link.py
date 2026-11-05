@@ -1,7 +1,7 @@
 """R2, R3 and R4 (lab test SC-04): capture on a slow link.
 
 - R2: a request needing more than bandwidth x write timeout timed out forever: with `max_batch_rows` = 5,000 rows of
-  about 560 bytes and a 5 s timeout, nothing was written at 1 Mbit/s. A timed-out request now makes the next ones 4
+  about 560 bytes and a 5 s timeout, nothing was written at 1 Mbit/s. A timed-out request now makes the next ones 8
   times smaller (adaptive batch size), and fast writes make them larger again.
 - R3: with a spool, a link that answers, but slower than the traffic, overflowed the queue: the oldest batches were
   dropped, since the spool only took the rows of an unavailable storage. They are now spooled (by a spooler thread, not
@@ -125,7 +125,7 @@ def test_the_adaptive_batch_size_stops_at_min_batch_rows():
     link = SlowLink(row_s=1.0, timeout_s=0.05)  # not even one row passes
     w = writer(min_batch_rows=30, max_batch_rows=10_000)
     channel = w.register(link.target(), {}, max_queue_rows=100_000, retry_uncertain=False)
-    for k in range(8):  # 2,000 rows, then requests of 500, 125, 31 and 30 rows
+    for k in range(8):  # 2,000 rows, then requests of 250, 31 and 30 rows
         channel.submit(frame(k * 250, 250))
         channel.flush(10)
     stats = channel.stats()

@@ -18,6 +18,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable, Optional, Sequence
 
+from ..fingerprint import EndpointFingerprint
+
 DEFAULT_PROMPTS = [
     "Explain in two sentences what a rent assistance program is.",
     "Expliquez en deux phrases ce qu'est une subvention à la rénovation.",
@@ -111,6 +113,7 @@ class CanaryProbe:
         self.prompts = list(prompts or DEFAULT_PROMPTS)
         self.samples = samples
         self.failures = 0
+        self.fingerprint: Optional[dict] = None  # set by run(..., fingerprint=...)
         if warn and self.planned_answers < required_answers("quantisation"):
             warnings.warn(
                 f"canary of {len(self.prompts)} prompts x {samples} answers = {self.planned_answers}: a quantisation change "
@@ -131,10 +134,24 @@ class CanaryProbe:
         """Answers asked by `run` (prompts x samples)"""
         return len(self.prompts) * self.samples
 
-    def run(self, ask: Callable[[str], str], progress: Optional[Callable[[int, int], None]] = None) -> dict:
-        """`ask(prompt) -> answer`; returns {prompt: [answers]}; failed calls are skipped and counted (`failures`)"""
+    def run(
+        self,
+        ask: Callable[[str], str],
+        progress: Optional[Callable[[int, int], None]] = None,
+        fingerprint: Optional[EndpointFingerprint] = None,
+    ) -> dict:
+        """`ask(prompt) -> answer`; returns {prompt: [answers]}; failed calls are skipped and counted (`failures`)
+
+        fingerprint : EndpointFingerprint, optional
+            Digest of the served model, observed before and after the canary: `self.fingerprint` then holds
+            `declared`, `before`, `after` ("sha256:<hex>" or None), `mismatch` (an observed digest differs from the
+            declared one) and `changed` (the digest changed during the canary: its answers mix two models). Pass it
+            to `save(..., fingerprint=probe.fingerprint)`
+        """
         answers, total, done = {p: [] for p in self.prompts}, len(self.prompts) * self.samples, 0
         self.failures = 0
+        self.fingerprint = None
+        before = fingerprint.observe(force=True) if fingerprint is not None else None
         for _ in range(self.samples):
             for prompt in self.prompts:
                 try:
@@ -144,10 +161,25 @@ class CanaryProbe:
                 done += 1
                 if progress:
                     progress(done, total)
+        if fingerprint is not None:
+            after = fingerprint.observe(force=True)
+            declared = fingerprint.declared
+            observed = [f for f in (before, after) if f is not None]
+            self.fingerprint = {
+                "declared": None if declared is None else str(declared),
+                "before": None if before is None else str(before),
+                "after": None if after is None else str(after),
+                "mismatch": None if declared is None or not observed else any(not f.matches(declared) for f in observed),
+                "changed": None if len(observed) < 2 else not before.matches(after),
+            }
         return answers
 
     @staticmethod
-    def save(answers: dict, path, **metadata) -> Path:
+    def save(answers: dict, path, fingerprint: Optional[dict] = None, **metadata) -> Path:
+        """Write the answers and `metadata` to a JSON file; `fingerprint` (CanaryProbe.fingerprint after run) is kept
+        as metadata["model_fingerprint"]"""
+        if fingerprint is not None:
+            metadata["model_fingerprint"] = fingerprint
         path = Path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
         payload = {"created": datetime.now(timezone.utc).isoformat(timespec="seconds"), "metadata": metadata, "answers": answers}

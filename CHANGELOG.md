@@ -3,6 +3,27 @@
 All notable changes to pulsar-data-collection. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.14.0] - 2026-11-05
+
+### Added
+
+- **Model fingerprint** (`pulsar_data_collection.fingerprint`), with the schema of the `model_fingerprint` field of
+  the pulsar-metrics 0.16 evidence records (`{"algorithm", "digest", "source": "artifact" | "endpoint" | "declared",
+  "ref"}`), without depending on pulsar-metrics. `fingerprint_path` hashes a saved model file or directory (the
+  digests of `pulsar_metrics.fingerprint.fingerprint_path`). `ollama_fingerprint` reads the digest Ollama reports per
+  model tag (`/api/tags`, sha256 of the manifest: weights, template, parameters); `openai_fingerprint` reads a
+  `digest` / `sha256` of an OpenAI-compatible `/models/{id}` when there is one (usually none: the fingerprint is then
+  declared only); `endpoint_fingerprint` tries both. `EndpointFingerprint` observes the served digest (cached
+  `refresh_s`), compares it with the declared one and counts observations, failures, mismatches and changes: a
+  mismatch is recorded as a governance signal, never raised.
+- Carried from the capture configuration: `PulseParameters(model_fingerprint=...)` tags every row `model_digest`;
+  `ResultsSink(model_fingerprint=...)` tags every result point; `EvidenceOutbox(expected_fingerprint=...)` counts the
+  records about another model (`fingerprint_mismatches`) or without fingerprint (`unfingerprinted`) and refuses a
+  malformed `model_fingerprint`; `PulsarSpanExporter(endpoint_fingerprint=...)` adds `endpoint_digest` and
+  `model_digest_mismatch` to the agent_run and llm_call records; `CanaryProbe.run(..., fingerprint=...)` observes the
+  digest before and after the canary (`CanaryProbe.fingerprint`: mismatch, changed) and `CanaryProbe.save(...,
+  fingerprint=...)` keeps it in the metadata. Without these arguments nothing changes.
+
 ## [0.13.1] - 2026-11-05
 
 ### Fixed

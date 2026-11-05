@@ -46,6 +46,8 @@ from pathlib import Path
 from typing import Callable, Iterable, Literal, Optional
 from urllib.parse import urlsplit, urlunsplit
 
+from .fingerprint import as_fingerprint
+
 logger = logging.getLogger("pulsar_data_collection")
 
 DATABASE_NAME = "evidence_outbox.sqlite3"
@@ -166,6 +168,12 @@ class EvidenceOutbox:
         Accept an http:// URL (default False)
     start : bool, optional
         Start the sending thread now (default True)
+    expected_fingerprint : ModelFingerprint, dict or "sha256:<hex>", optional
+        Fingerprint of the model the records should be about (pulsar_data_collection.fingerprint). A record whose
+        `model_fingerprint` differs is counted in `fingerprint_mismatches` and logged, one without fingerprint in
+        `unfingerprinted`; both are still sent unchanged (their evidence_id hashes the fingerprint, and a mismatch is
+        itself evidence for the receiver). Whatever this setting, a `model_fingerprint` that is not a valid
+        fingerprint makes put raise ValueError
     """
 
     def __init__(
@@ -189,6 +197,7 @@ class EvidenceOutbox:
         poll_interval_s: float = 0.5,
         allow_http: bool = False,
         start: bool = True,
+        expected_fingerprint=None,
     ):
         scheme = urlsplit(url).scheme.lower()
         if urlsplit(url).username is not None or urlsplit(url).password is not None:
@@ -204,6 +213,7 @@ class EvidenceOutbox:
         if not retry_initial_s > 0 or not retry_max_s >= retry_initial_s:
             raise ValueError("retry_initial_s must be > 0 and retry_max_s >= retry_initial_s")
         self._url = url
+        self.expected_fingerprint = as_fingerprint(expected_fingerprint)
         self.url = _safe_url(url)
         self.directory = Path(directory)
         self.directory.mkdir(parents=True, exist_ok=True)
@@ -238,6 +248,7 @@ class EvidenceOutbox:
         self._lock = threading.Lock()  # the SQLite connection and the counters
         self._wake = threading.Condition(self._lock)
         self._stats = {"queued": 0, "sent": 0, "retried": 0, "failed": 0, "dropped": 0, "replaced": 0, "requests": 0}
+        self._stats.update(fingerprint_mismatches=0, unfingerprinted=0)
         self._failures = 0  # consecutive failed requests
         self._retry_at = 0.0  # monotonic time before which no request is made
         self._last_error: Optional[str] = None
@@ -273,15 +284,31 @@ class EvidenceOutbox:
         """Store records durably (one transaction); returns how many were accepted
 
         Raises ValueError, before storing any, when a record is not a dict with non-empty string `schema_version` and
-        `evidence_id`, or is not valid JSON (NaN, infinities, objects that do not serialize).
+        `evidence_id`, is not valid JSON (NaN, infinities, objects that do not serialize) or carries a
+        `model_fingerprint` that is not a valid fingerprint.
         """
-        rows = []
+        rows, mismatches, unfingerprinted = [], 0, 0
         for record in records:
             if not isinstance(record, dict):
                 raise ValueError(f"an evidence record must be a dict, got {type(record).__name__}")
             for key in ("schema_version", "evidence_id"):
                 if not isinstance(record.get(key), str) or not record[key]:
                     raise ValueError(f"evidence record without {key}")
+            try:
+                fingerprint = as_fingerprint(record.get("model_fingerprint"))
+            except ValueError as error:
+                raise ValueError(f"evidence record {record['evidence_id']}: invalid model_fingerprint: {error}") from None
+            if self.expected_fingerprint is not None:
+                if fingerprint is None:
+                    unfingerprinted += 1
+                elif not fingerprint.matches(self.expected_fingerprint):
+                    mismatches += 1
+                    logger.warning(
+                        "Evidence record %s is about model %s, expected %s",
+                        record["evidence_id"][:12],
+                        fingerprint,
+                        self.expected_fingerprint,
+                    )
             try:
                 body = json.dumps(record, allow_nan=False, separators=(",", ":"), ensure_ascii=False)
             except (TypeError, ValueError) as error:
@@ -294,6 +321,8 @@ class EvidenceOutbox:
                 for evidence_id, body in rows:
                     accepted += self._insert(evidence_id, body)
                 self._db.execute("COMMIT")
+                self._stats["fingerprint_mismatches"] += mismatches
+                self._stats["unfingerprinted"] += unfingerprinted
             except BaseException:
                 self._db.execute("ROLLBACK")
                 raise
@@ -354,7 +383,9 @@ class EvidenceOutbox:
         queued: records accepted by put; sent: delivered (2xx); retried: record sends that failed and will be retried;
         failed: records moved to the quarantine (rejected by the receiver, or max_attempts reached); dropped: records
         lost to the overflow policy; replaced: records put again while pending (same evidence_id); pending and
-        quarantined: records in the store now; oldest_pending_age_s: age of the oldest pending record (0 when none).
+        quarantined: records in the store now; oldest_pending_age_s: age of the oldest pending record (0 when none);
+        fingerprint_mismatches and unfingerprinted: records put whose model_fingerprint differs from
+        expected_fingerprint, or is missing (0 without expected_fingerprint).
         """
         with self._lock:
             stats = dict(self._stats)

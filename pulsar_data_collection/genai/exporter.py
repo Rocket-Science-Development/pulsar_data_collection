@@ -13,6 +13,7 @@ from opentelemetry.sdk.trace import ReadableSpan, SpanProcessor
 from opentelemetry.sdk.trace.export import SpanExporter, SpanExportResult
 from opentelemetry.trace import StatusCode
 
+from ..fingerprint import EndpointFingerprint
 from ..models import CaptureOptions, DataWithPrediction, PulseParameters
 from ..pulse import Pulse
 from . import semconv as sc
@@ -22,6 +23,7 @@ from .trajectory import OpenRun, SpanView, TrajectoryAssembler
 log = logging.getLogger(__name__)
 
 RECORD_TYPES = ("agent_run", "tool_call", "llm_call")
+FINGERPRINTED_RECORDS = ("agent_run", "llm_call")  # records about the model: they get endpoint_digest
 
 
 class RecordSink(Protocol):
@@ -138,6 +140,11 @@ class PulsarSpanExporter(SpanExporter):
     loop_window, loop_min_repeats, compliance, rules_version, tool_fields, tool_fields_k : optional
         Agent run features, see TrajectoryAssembler. `tool_fields` (default "called") bounds the per-tool counters
         to the tools called in each run; "all" restores the former counters for every tool of the catalogue.
+    endpoint_fingerprint : EndpointFingerprint, optional
+        Digest of the model served by the LLM endpoint (pulsar_data_collection.fingerprint), observed at most every
+        `refresh_s`: the agent_run and llm_call records gain `endpoint_digest` ("sha256:<hex>") and, when a fingerprint
+        was declared, `model_digest_mismatch` (True when the endpoint serves another model than the declared one).
+        Unobserved (endpoint unreachable, no digest reported): the fields are left out
     """
 
     def __init__(
@@ -156,8 +163,10 @@ class PulsarSpanExporter(SpanExporter):
         rules_version: Optional[str] = None,
         tool_fields: str = "called",
         tool_fields_k: int = 10,
+        endpoint_fingerprint: Optional[EndpointFingerprint] = None,
     ):
         self.sink = sink
+        self.endpoint_fingerprint = endpoint_fingerprint
         self.assembler = TrajectoryAssembler(
             allowed_tools=allowed_tools,
             trace_timeout_s=trace_timeout_s,
@@ -185,10 +194,16 @@ class PulsarSpanExporter(SpanExporter):
             self._drain_started()
             for span in spans:
                 for record in self.assembler.add(span_view(span), now_ns=now):
-                    self.sink.write(*record)
+                    self._write(record)
             for record in self.assembler.flush_idle(now):
-                self.sink.write(*record)
+                self._write(record)
         return SpanExportResult.SUCCESS
+
+    def _write(self, record: tuple) -> None:
+        record_type, fields, end_ns = record
+        if self.endpoint_fingerprint is not None and record_type in FINGERPRINTED_RECORDS:
+            fields = {**fields, **self.endpoint_fingerprint.fields()}
+        self.sink.write(record_type, fields, end_ns)
 
     def check_open_runs(self, now_ns: Optional[int] = None) -> int:
         """Write the `incomplete` records of the runs open for longer than `max_run_s`; return how many were written
@@ -200,7 +215,7 @@ class PulsarSpanExporter(SpanExporter):
             self._drain_started()
             records = self.assembler.flush_idle(now)
             for record in records:
-                self.sink.write(*record)
+                self._write(record)
         return sum(1 for record in records if record[1].get("incomplete"))
 
     def run_tracker(self, check_interval_s: Optional[float] = 10.0) -> "OpenRunTracker":
@@ -228,7 +243,7 @@ class PulsarSpanExporter(SpanExporter):
         with self._lock:
             self._drain_started()
             for record in self.assembler.flush_all():
-                self.sink.write(*record)
+                self._write(record)
         self.sink.close()
 
 

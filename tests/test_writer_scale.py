@@ -1012,10 +1012,12 @@ def test_rows_held_in_back_off_do_not_wake_the_writer_for_every_capture():
     writer._condition.notify_all = counted
     for k in range(100):
         up.submit(seq(k, 1))
-    assert writer._ready_rows() == 100 and not wakes  # 100 wake-ups before
+    # 100 wake-ups before the fix. The writer thread may already be awake from its start and take some of the first
+    # rows in one batch (seen on fast CI machines), so the ready-row count is not asserted exactly
+    assert not wakes
     assert up.flush(5)
     writer.close(timeout_s=1)
-    assert sum(requests) == 100 and len(requests) <= 2
+    assert sum(requests) == 100 and len(requests) <= 3
 
 
 def test_spools_replay_while_another_channel_holds_rows_in_back_off(tmp_path):

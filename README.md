@@ -830,6 +830,46 @@ and `majority_share`, `correct_share` (when `expected` is given), `agreement_met
   counts) personal information in the answers, the normalized answers and the majority answer before they are
   returned. The scores are computed on the texts as received, in memory.
 
+### Abstentions and answers without support (RAG agents)
+
+`pulsar_data_collection.genai.abstention` judges each run of a retrieval agent on two points, without any model by
+default:
+
+- **abstention**: the answer says the information is not found, not in the sources, or that it cannot answer
+  (`AbstentionDetector`, French and English rules: `NOT_FOUND_PATTERNS`, `CANNOT_ANSWER_PATTERNS` and
+  `FILLER_PATTERNS`, documented in the module). An answer that says the sources lack the information and then answers
+  anyway is *hedged*: it counts as an answer. An optional fallback scores the answers the rules leave undecided, e.g.
+  `NliAbstentionFallback.from_scorer(FaithfulnessScorer())`;
+- **answer without support**: the agent answered although the retrieval was empty, its best score was under a
+  threshold, the application's own relevance check failed (`retrieval_relevant=False`, e.g. the entity named in the
+  question is absent from the passages), or the faithfulness was under a threshold. The thresholds are the lower
+  5 % of a reference of the deployment (`calibrate_support_thresholds`).
+
+`record_answer_support` writes both verdicts (1.0 / 0.0) on the agent span: the `agent_run` record gains
+`det_abstention` and `det_unsupported_answer`. Their rates per window are the hallucination proxy; test them in
+pulsar-metrics with `DriftTestMetric("rate_increase", "det_unsupported_answer")` (one-sided exact test against the
+reference). Only the verdicts reach the spans, never the text.
+
+```python
+from pulsar_data_collection.genai import calibrate_support_thresholds, record_answer_support
+
+# once, on a reference of the deployment: best retrieval scores, faithfulness of the answered runs
+thresholds = calibrate_support_thresholds(reference_top_scores, reference_faithfulness)
+
+with agent_span(tracer, "register-assistant") as run:
+    ...  # the agent searches and answers
+    support = record_answer_support(run, answer, retrieval_empty=not passages, retrieval_top=best_score,
+                                    faithfulness=faithfulness_score, thresholds=thresholds)
+print(support.abstained, support.unsupported, support.reasons)  # e.g. False True ('low_retrieval_score',)
+```
+
+Measured offline on recorded runs (pulsar_demo `lab/replay/signal_abstention.py`, report
+`lab/rapports/rapport_signal_abstention.md`): on 102 hand-labelled answers (33 abstentions) of the LR-03 lab test and
+of the GC AI Register trial, the rules had a precision of 0.97 [0.85-0.99] and a recall of 1.00 [0.90-1.00]
+(Wilson 95 %); the one error is a guess justified by the missing information ("..., car le passage n'a pas fourni
+d'informations"). The patterns were written on the other answers of the same two runs, both from llama3.2:3b and
+granite3.3:2b: other models and other languages need their own check.
+
 ## Personal information
 
 `pulsar_data_collection.privacy` detects personal information with **validated rules** (checksums, valid dates,

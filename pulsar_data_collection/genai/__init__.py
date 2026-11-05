@@ -1,5 +1,14 @@
 """Collection for LLM applications and agents, from OpenTelemetry GenAI spans (requires the `genai` extra)."""
 
+from .abstention import (
+    AbstentionDetector,
+    AnswerSupport,
+    NliAbstentionFallback,
+    SupportThresholds,
+    answer_support,
+    calibrate_support_thresholds,
+    record_answer_support,
+)
 from .canary import CanaryProbe
 from .consistency import (
     ConsistencyProbe,
@@ -30,6 +39,13 @@ from .semconv import SCHEMA_VERSION
 from .trajectory import TrajectoryAssembler
 
 __all__ = [
+    "AbstentionDetector",
+    "AnswerSupport",
+    "NliAbstentionFallback",
+    "SupportThresholds",
+    "answer_support",
+    "calibrate_support_thresholds",
+    "record_answer_support",
     "CanaryProbe",
     "ConsistencyProbe",
     "ConsistencyQuestion",

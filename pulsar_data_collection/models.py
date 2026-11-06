@@ -183,10 +183,18 @@ class CaptureOptions(BaseModel):
     With spool_dir, the batches beyond max_queue_rows (storage answering, but slower than the traffic) are saved to the
     spool by a background thread and replayed later, instead of being dropped (default True; counted in spooled_rows
     and overflow_spooled_rows). False: dropped and counted in dropped_rows, as before. No effect without spool_dir.
-    bound_in_flight: bool
+    write_compression: Optional["gzip"]
+    gzip the bodies of the write requests to InfluxDB (level 1, `Content-Encoding: gzip`): line protocol of random
+    floats about 2.3 times smaller, for about 10 ms of CPU per 1,000 rows in the writer thread. Default None
+    (uncompressed). Not the spool: see spool_compression. Pulse with different settings get different clients, so
+    a SharedWriter does not put their rows in the same requests.
+    bound_in_flight: Optional[bool]
     Count the rows in flight (taken from the queue and being written, or waiting for their answer) against
-    max_queue_rows too, so that queued + in-flight rows stay within it (default False: in-flight rows come on top,
-    up to max_batch_rows x concurrency per writer). Size max_queue_rows to at least twice max_batch_rows with it.
+    max_queue_rows too, so that queued + in-flight rows stay within it. False: in-flight rows come on top, up to
+    max_batch_rows x concurrency per writer. None (default since 0.15): True with spool_dir, False without
+    (`effective_bound_in_flight`). With a spool the rows beyond the bound are spooled, not lost, so the bound is
+    exact at no cost in rows; without a spool it drops more rows (SC-04: up to 23 times more on a slow link) for no
+    measurable gain in RSS, so it stays off. Size max_queue_rows to at least twice max_batch_rows with it.
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -213,7 +221,13 @@ class CaptureOptions(BaseModel):
     adaptive_batch: bool = True
     min_batch_rows: int = Field(10, gt=0)
     spool_overflow: bool = True
-    bound_in_flight: bool = False
+    bound_in_flight: Optional[bool] = None
+    write_compression: Optional[Literal["gzip"]] = None
+
+    @property
+    def effective_bound_in_flight(self) -> bool:
+        """bound_in_flight as applied: the given value, or (None) True with spool_dir and False without"""
+        return self.spool_dir is not None if self.bound_in_flight is None else self.bound_in_flight
 
     @model_validator(mode="after")
     def check_durability(self):

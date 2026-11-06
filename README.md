@@ -197,9 +197,11 @@ Writing to the database must not slow down predictions. By default (`mode="backg
   longer loses rows when there is a spool. The batches waiting for that thread are bounded by `max_queue_rows` too
   (beyond, the oldest are dropped and counted; it only happens if the disk is slower than the traffic).
 - The rows **in flight** (taken from the queue for a request, up to `max_batch_rows` × concurrency per writer) come on
-  top of `max_queue_rows` by default. `bound_in_flight=True` counts them in it, so that rows queued and in flight
-  together stay within `max_queue_rows` (plus the newest batch, always kept); size `max_queue_rows` to at least twice
-  `max_batch_rows` then, or new batches are dropped while a large request is in flight.
+  top of `max_queue_rows` without a spool. With `spool_dir` (since 0.15; `bound_in_flight=None`, the default) or
+  with `bound_in_flight=True`, they count in it, so that rows queued and in flight together stay within
+  `max_queue_rows` (plus the newest batch, always kept); size `max_queue_rows` to at least twice `max_batch_rows`
+  then, or new batches are spooled (dropped without spool) while a large request is in flight.
+  `bound_in_flight=False` keeps the in-flight rows on top even with a spool, as up to 0.14.
 - If InfluxDB is unreachable when `Pulse` is created, the service starts anyway (warning in the logs) and spools until
   the database is back. Set `strict_startup=True` to fail instead.
 
@@ -376,7 +378,8 @@ text columns). Beyond either, run several processes (e.g. several workers of the
 | `adaptive_batch` | `True` | A timed-out write divides the rows per request by 8 (down to `min_batch_rows`), fast writes double them again (up to `max_batch_rows`); `False`: always `max_batch_rows`, as before |
 | `min_batch_rows` | 10 | Floor of the adaptive batch size |
 | `spool_overflow` | `True` | With `spool_dir`, spool the batches beyond `max_queue_rows` instead of dropping them; `False`: dropped and counted, as before |
-| `bound_in_flight` | `False` | Count the rows in flight against `max_queue_rows` too (see above) |
+| `bound_in_flight` | `None` | Count the rows in flight against `max_queue_rows` too (see above); `None`: `True` with `spool_dir`, `False` without (`False` for every Pulse up to 0.14) |
+| `write_compression` | `None` | `"gzip"`: gzip the bodies of the write requests to InfluxDB (level 1, `Content-Encoding: gzip`), see "Compression of the write requests" below. Not the spool (`spool_compression`) |
 
 **Replay throttle.** After an outage, the replay of the spool competes with the capture for the GIL: in the lab, with
 10 private writers, the capture p99 rose to about 30 ms during the replay of a 10 or 30 min outage (1.2 ms with one
@@ -456,18 +459,55 @@ its line protocol and the request body (roughly 1.2 KB per row at 20 features, a
 row). In SC-04 (0.13.0) the RSS grew by at most 126 MB (10 private writers, 50,000 rows queued and 50,000 in flight)
 and 55 MB (`SharedWriter`) for bounds of 178 and 99 MB. On a slow link the adaptive batch size also shrinks the
 requests in flight: rerun, the RSS grew by at most 65 MB (private writers) and 35 MB (`SharedWriter`) in the bandwidth
-cases, for 135 and 64 MB before. With `bound_in_flight=True` the rows in flight count against `max_queue_rows`:
-queued and in-flight rows together peaked at exactly 50,000 for 10 Pulse (71,500 to 72,050 without it, with
-`write_timeout_s=30`), at the cost of more rows dropped without spool (33,800 instead of 15,200 in that case: the
-rows in flight take their room in the queue). The batches waiting for the spooler (`spool_overflow`) are bounded by
+cases, for 135 and 64 MB before. With `bound_in_flight` on (the default with `spool_dir` since 0.15) the rows in
+flight count against `max_queue_rows`: queued and in-flight rows together peak at exactly 50,000 for 10 Pulse
+(71,800 to 79,700 without it, 1 Mbit/s, `write_timeout_s=30`). **Why on with a spool only** (SC-04 rerun with real
+packet loss, 0.15): with a spool nothing is lost either way, the rows beyond the bound are spooled instead (83,750
+instead of 67,450 in that case), and the bound is exact; without a spool the rows in flight take their room in the
+queue and more rows are dropped (32,200 instead of 15,750; 28,900 instead of 1,250 with gzip requests), while the
+RSS did not go down measurably (+57 MB with and without, for a bound of 178 MB). With one `SharedWriter`, same
+direction: with spool, 58,650 and 70,000 rows held become 50,000, 0 lost, more rows spooled (42,000 instead of
+37,300; 55,650 instead of 14,400 with gzip) and a longer replay (up to 9 s instead of 0.6 s); without spool, 33,000
+rows dropped instead of 11,550 (gzip). Measured on a shared laptop, one run per case. The batches waiting for the spooler (`spool_overflow`) are bounded by
 `max_queue_rows` too, and are normally saved within milliseconds. The spool is on disk and bounded by
 `spool_max_bytes`.
 
 What remains on a degraded network: without `spool_dir`, rows beyond the queue bound on a link slower than the
 traffic (counted in `dropped_rows`; size `max_queue_rows` for the longest slow period, or set `spool_dir`) and rows
 whose second write is cut too on a very lossy link (0 to about 4 % of the traffic at 20 % of connections cut, counted
-in `uncertain_rows`); the time to learn the batch size, one `write_timeout_s` per factor of 8; and the rows in flight
-on top of `max_queue_rows` unless `bound_in_flight=True`.
+in `uncertain_rows`); the time to learn the batch size, one `write_timeout_s` per factor of 8; and, without
+`spool_dir`, the rows in flight on top of `max_queue_rows` unless `bound_in_flight=True`.
+
+**Real packet loss (`tc netem`, 0.15 rerun).** Toxiproxy cannot drop packets; the rerun put a Linux `netem` qdisc on
+the interface of the proxy (Docker Desktop kernel 6.6), so that request bodies and answers cross one lossy hop, with
+the RTT of a local link (well under 1 ms). 5 % loss: no effect (2,028 rows/s written, nothing dropped, retried or
+spooled). 20 % loss: TCP keeps the data but the throughput falls, 1,281 rows/s written (private writers, no spool;
+0 lost, 13,550 rows written a second time after a timeout), 890 rows/s with spool (42,131 rows spooled, 0 lost).
+100 ms ± 50 ms of delay on every packet (with reordering): 487 to 589 rows/s; without spool 14,150 rows dropped beyond
+the bound (counted), with spool 0. With one `SharedWriter(concurrency=4)` the requests carry the rows of several
+models (up to 5,000 rows, 2.8 MB) over 4 connections, and 20 % loss hurts more: 337 rows/s written, 150 timeouts,
+17,250 rows dropped without spool (0 lost with spool); with gzip requests, 1,631 rows/s and nothing dropped. In every
+case: 0 duplicate, exact counters, no capture blocked by the network (one capture of 246 ms, after the fault, on the
+loaded laptop).
+
+**Compression of the write requests.** `write_compression="gzip"` (`CaptureOptions`, `ResultsSink`) sends the line
+protocol gzipped at level 1 (`Content-Encoding: gzip`, accepted by InfluxDB 2): 245 bytes per row instead of 557 on
+20 random float features (2.3 times less; repetitive values compress more). In SC-04 (private writers, 2,000
+rows/s offered, 45 s of fault):
+
+| Link | Without gzip | With gzip |
+|---|---|---|
+| clean | 1,994 rows/s, 8.9 Mbit/s sent | 2,006 rows/s, 3.9 Mbit/s sent |
+| 20 % packet loss, no spool | 1,281 rows/s, 13,550 rows written twice | 1,966 rows/s, 850 written twice |
+| 20 % packet loss, spool | 890 rows/s, 42,131 rows spooled | 1,928 rows/s, 0 spooled |
+| 1 Mbit/s, `write_timeout_s=5`, no spool | 192 rows/s, 32,398 dropped | 396 rows/s, 21,150 dropped |
+| 1 Mbit/s, `write_timeout_s=30`, no spool | 47 rows/s, 15,750 dropped | 291 rows/s, 1,250 dropped |
+| 1 Mbit/s, `write_timeout_s=30`, spool | 74 rows/s, 67,450 spooled | 300 rows/s, 0 spooled |
+
+The CPU cost (about 10 ms per 1,000 rows in the writer thread, measured offline) did not show at 2,000 rows/s (process
+CPU per 1,000 rows captured within the noise of the shared laptop); at the capture ceiling (25,000 to 34,000 rows/s
+per process) it would take a quarter to a third of a core, on the core the GIL already limits. It stays off by default:
+turn it on for links slower than the traffic (WAN, VPN, metered links), not for a local InfluxDB.
 
 ## How data is stored
 
@@ -1103,6 +1143,23 @@ with ResultsSink(url, token, org, bucket) as sink:
     with StatsReporter(pulse, sink, interval_s=10):  # a failed report never disturbs the capture
         ...  # serve predictions
 ```
+
+`write_results` sends one request per call, at one timestamp. A job that writes many timestamps (one batch per model
+and per window, like the demo's `analysis_job.py`) should give them all to `write_results_many`: the same points, in
+requests of at most `max_points_per_request` points (default 5,000; a larger batch is split). In the lab (SC-07),
+5,066,400 points were written in 36,000 requests, one per model and per window; in batches of 5,000 points that is
+1,014 requests. Every batch is checked against the sink's `model_fingerprint` (a different `model_digest` tag raises)
+before the first request, so a refused batch writes nothing.
+
+```python
+items = [(window_results[model, w], window_end[w], {"model_id": model, "window": str(w)})
+         for model in models for w in windows]
+with ResultsSink(url, token, org, bucket, write_compression="gzip") as sink:
+    sink.write_results_many(items)  # (results, timestamp) or (results, timestamp, tags) per batch
+```
+
+`write_compression="gzip"` compresses the bodies of the write requests (as `CaptureOptions(write_compression=...)`
+does for the capture, see below).
 
 One reporter can serve the whole process (one thread, one request per interval for every Pulse), with the optional
 process health in its own measurement, `pulsar_process_health` (tags `host`, `pid`): `threads`, and with

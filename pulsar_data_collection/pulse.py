@@ -55,6 +55,8 @@ class Pulse:
         factory = factories.get(data.storage_engine)
         self.storage_engine = factory.get_database_actions()
         login = {**data.login, "timeout_s": self.options.write_timeout_s}
+        if self.options.write_compression is not None:  # only when set: other storage engines never see the key
+            login["write_compression"] = self.options.write_compression
         if writer is None and self.options.shared_writer and self.options.mode == "background":
             writer = SharedWriter.default()
         self._shared = (
@@ -102,7 +104,7 @@ class Pulse:
                     replay_max_rows_per_s=options.replay_max_rows_per_s,
                     retry_uncertain=options.retry_uncertain,
                     spool_overflow=options.spool_overflow,
-                    bound_in_flight=options.bound_in_flight,
+                    bound_in_flight=options.effective_bound_in_flight,
                 )
             else:
                 self._writer = BackgroundWriter(
@@ -122,7 +124,7 @@ class Pulse:
                     adaptive_batch=options.adaptive_batch,
                     min_batch_rows=options.min_batch_rows,
                     spool_overflow=options.spool_overflow,
-                    bound_in_flight=options.bound_in_flight,
+                    bound_in_flight=options.effective_bound_in_flight,
                 )
 
     def _target(self) -> Target:

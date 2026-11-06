@@ -3,6 +3,48 @@
 All notable changes to pulsar-data-collection. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.15.0] - 2026-11-06
+
+### Added
+
+- **`ResultsSink.write_results_many(items)`**: several batches `(results, timestamp)` or `(results, timestamp, tags)`
+  in as few requests as possible, at most `max_points_per_request` points each (default 5,000, also a
+  `ResultsSink(max_points_per_request=...)` argument; a larger batch is split). Same points as one `write_results`
+  per batch, with the same `model_digest` check against the sink's `model_fingerprint`, done on every batch before
+  the first request (a refused tag writes nothing). Points are built one request at a time. An analysis job writing
+  one batch per model and per window (SC-07: 5,066,400 points in 36,000 requests) needs about 1,014 requests.
+- **gzip of the write requests**: `CaptureOptions(write_compression="gzip")` and `ResultsSink(write_compression=
+  "gzip")` (default `None`, uncompressed as before) send the line protocol with `Content-Encoding: gzip`, compressed
+  at level 1 (`enable_write_gzip` in the InfluxDB connector: influxdb-client's own `enable_gzip` compresses at
+  level 9, about 7 times the CPU for bodies 10 % smaller). Until now only the spool could be compressed
+  (`spool_compression`), not the HTTP requests. Lab (SC-04, 10 models at 2,000 rows/s, private writers): 245 bytes
+  per row sent instead of 557 (2.3 times less); no measurable CPU cost at 2,000 rows/s; on a 1 Mbit/s link 396
+  instead of 192 rows/s written (`write_timeout_s=5`) and 291 instead of 47 (`write_timeout_s=30`, 1,250 rows
+  dropped instead of 15,750 without spool); with 20 % packet loss (`tc netem`) 1,966 instead of 1,281 rows/s.
+  Pulse with different settings get different shared clients (the client key includes the compression).
+
+### Changed
+
+- **`CaptureOptions.bound_in_flight` defaults to `None`: True with `spool_dir`, False without**
+  (`CaptureOptions.effective_bound_in_flight` gives the applied value). Measured in SC-04 (with `tc netem` packet
+  loss and jitter, Toxiproxy bandwidth caps, both write profiles): with a spool, the rows held in memory (queued and in
+  flight) peak at exactly `max_queue_rows` per Pulse (50,000 for 10 Pulse, instead of 71,800 to 79,700), with 0 row
+  lost either way, the rows beyond the bound being spooled (83,750 instead of 67,450 on a 1 Mbit/s link with
+  `write_timeout_s=30`). Without a spool, the bound drops rows that would otherwise have been written (32,200 instead
+  of 15,750 in that case; 28,900 instead of 1,250 with gzip) for no measurable gain in RSS (+57 MB both ways), so it
+  stays off. Same direction with one `SharedWriter(concurrency=4)`. Cost with a spool: more rows spooled (up to
+  55,650 instead of 14,400) and a longer replay after the fault (up to 9 s instead of 0.6 s).
+
+### Compatibility
+
+- `CaptureOptions().bound_in_flight` is now `None` instead of `False`. A Pulse **with `spool_dir`** and no explicit
+  `bound_in_flight` now counts its rows in flight against `max_queue_rows`: more batches go to the spool on a link
+  slower than the traffic (none is lost), and the memory bound is exact. `bound_in_flight=False` restores the 0.14
+  behaviour. Without `spool_dir` nothing changes. `SharedWriter.register(..., bound_in_flight=False)` and
+  `BackgroundWriter(bound_in_flight=False)` keep their default.
+- Size `max_queue_rows` to at least twice `max_batch_rows` with a spool, as documented for `bound_in_flight=True`:
+  otherwise new batches are spooled while a large request is in flight.
+
 ## [0.14.0] - 2026-11-05
 
 ### Added

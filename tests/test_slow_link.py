@@ -187,9 +187,17 @@ def test_capture_options_reach_the_private_writer():
         True,
     )
     defaults = CaptureOptions()
-    assert defaults.adaptive_batch and defaults.spool_overflow and not defaults.bound_in_flight
+    assert defaults.adaptive_batch and defaults.spool_overflow and defaults.bound_in_flight is None
+    assert not defaults.effective_bound_in_flight  # no spool: in-flight rows on top of max_queue_rows
     with pytest.raises(ValueError):
         CaptureOptions(min_batch_rows=0)
+
+
+def test_bound_in_flight_default_follows_the_spool(tmp_path):
+    assert CaptureOptions(spool_dir=tmp_path).effective_bound_in_flight
+    assert not CaptureOptions(spool_dir=tmp_path, bound_in_flight=False).effective_bound_in_flight
+    assert CaptureOptions(bound_in_flight=True).effective_bound_in_flight
+    assert not CaptureOptions().effective_bound_in_flight
 
 
 # ---------------------------------------------------------------------------------------------------------- R3

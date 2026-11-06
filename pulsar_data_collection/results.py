@@ -25,6 +25,7 @@ from typing import Any, Iterable, Optional
 from influxdb_client import InfluxDBClient, Point, WritePrecision
 from influxdb_client.client.write_api import SYNCHRONOUS
 
+from .database_connectors.influxdb import enable_write_gzip
 from .fingerprint import as_fingerprint
 
 logger = logging.getLogger("pulsar_data_collection")
@@ -179,6 +180,11 @@ class ResultsSink:
     model_fingerprint : ModelFingerprint, dict or "sha256:<hex>", optional
         Digest of the measured model (pulsar_data_collection.fingerprint): every result point is tagged
         `model_digest` = "sha256:<hex>" (a `model_digest` tag given to write_results must agree)
+    write_compression : "gzip" or None, optional
+        gzip the bodies of the write requests (level 1, `Content-Encoding: gzip`), about 2.3 times smaller line
+        protocol on random floats; default None (uncompressed, as before)
+    max_points_per_request : int, optional
+        Upper bound of the points of one request of `write_results_many` (default 5,000)
     """
 
     def __init__(
@@ -191,27 +197,75 @@ class ResultsSink:
         stats_measurement: str = "pulsar_capture_stats",
         timeout_s: float = 10.0,
         model_fingerprint=None,
+        write_compression: Optional[str] = None,
+        max_points_per_request: int = 5_000,
     ):
+        if write_compression not in (None, "gzip"):
+            raise ValueError(f'write_compression must be None or "gzip", not {write_compression!r}')
+        if max_points_per_request < 1:
+            raise ValueError("max_points_per_request must be at least 1")
         self.bucket = bucket
         self.model_fingerprint = as_fingerprint(model_fingerprint)
         self.org = org
         self.measurement = measurement
         self.stats_measurement = stats_measurement
+        self.write_compression = write_compression
+        self.max_points_per_request = int(max_points_per_request)
         self._client = InfluxDBClient(url=url, token=token, org=org, timeout=int(timeout_s * 1000))
+        if write_compression == "gzip":
+            enable_write_gzip(self._client)
         self._write = self._client.write_api(write_options=SYNCHRONOUS)
+
+    def _result_tags(self, tags: Optional[dict]) -> Optional[dict]:
+        """The tags of result points: `model_digest` added from the sink's fingerprint, which a given one must match"""
+        if self.model_fingerprint is None:
+            return tags
+        digest = str(self.model_fingerprint)
+        if (tags or {}).get("model_digest", digest) != digest:
+            raise ValueError(f"tag model_digest={tags['model_digest']!r} differs from the sink's model fingerprint {digest}")
+        return {**(tags or {}), "model_digest": digest}
 
     def write_results(self, results: Iterable[Any], timestamp: Optional[datetime] = None, tags: Optional[dict] = None) -> int:
         """Write results (MetricResults or dicts) at `timestamp` (default: now), with the given tags; returns the count"""
         timestamp = timestamp or datetime.now(timezone.utc)
-        if self.model_fingerprint is not None:
-            digest = str(self.model_fingerprint)
-            if (tags or {}).get("model_digest", digest) != digest:
-                raise ValueError(f"tag model_digest={tags['model_digest']!r} differs from the sink's model fingerprint {digest}")
-            tags = {**(tags or {}), "model_digest": digest}
+        tags = self._result_tags(tags)
         points = [result_point(r, timestamp, self.measurement, tags) for r in results]
         if points:
             self._write.write(bucket=self.bucket, org=self.org, record=points)
         return len(points)
+
+    def write_results_many(self, items: Iterable[tuple], max_points_per_request: Optional[int] = None) -> int:
+        """Write several batches of results, each `(results, timestamp)` or `(results, timestamp, tags)` (timestamp
+        None: now), in as few requests as possible: at most `max_points_per_request` points per request (default: the
+        sink's, 5,000), a batch larger than that being split; returns the count of points
+
+        Same points as one `write_results(results, timestamp, tags)` per batch, e.g. one batch per model and per window
+        of an analysis job, but one request per few thousand points instead of one per batch. The tags of every batch
+        are checked (`model_digest` against the sink's fingerprint) before the first request: a refused tag writes
+        nothing. Points are built one request at a time (memory bounded by `max_points_per_request`). A failed request
+        raises; the requests before it are written (writing them again overwrites the same points, no duplicate).
+        """
+        limit = self.max_points_per_request if max_points_per_request is None else int(max_points_per_request)
+        if limit < 1:
+            raise ValueError("max_points_per_request must be at least 1")
+        now = datetime.now(timezone.utc)
+        batches = []
+        for item in items:
+            if not isinstance(item, (tuple, list)) or len(item) not in (2, 3):
+                raise ValueError("write_results_many takes (results, timestamp) or (results, timestamp, tags) items")
+            results, timestamp, tags = (*item, None) if len(item) == 2 else item
+            batches.append((results, timestamp or now, self._result_tags(tags)))
+        count, points = 0, []
+        for results, timestamp, tags in batches:
+            for result in results:
+                points.append(result_point(result, timestamp, self.measurement, tags))
+                if len(points) >= limit:
+                    self._write.write(bucket=self.bucket, org=self.org, record=points)
+                    count, points = count + len(points), []
+        if points:
+            self._write.write(bucket=self.bucket, org=self.org, record=points)
+            count += len(points)
+        return count
 
     def write_stats(self, stats: dict, timestamp: Optional[datetime] = None, tags: Optional[dict] = None) -> None:
         """Write Pulse.stats() counters (numbers and booleans) at `timestamp`"""

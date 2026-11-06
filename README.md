@@ -465,8 +465,10 @@ flight count against `max_queue_rows`: queued and in-flight rows together peak a
 packet loss, 0.15): with a spool nothing is lost either way, the rows beyond the bound are spooled instead (83,750
 instead of 67,450 in that case), and the bound is exact; without a spool the rows in flight take their room in the
 queue and more rows are dropped (32,200 instead of 15,750; 28,900 instead of 1,250 with gzip requests), while the
-RSS did not go down measurably (+57 MB with and without, for a bound of 178 MB). Measured on a shared laptop, one
-run per case. The batches waiting for the spooler (`spool_overflow`) are bounded by
+RSS did not go down measurably (+57 MB with and without, for a bound of 178 MB). With one `SharedWriter`, same
+direction: with spool, 58,650 and 70,000 rows held become 50,000, 0 lost, more rows spooled (42,000 instead of
+37,300; 55,650 instead of 14,400 with gzip) and a longer replay (up to 9 s instead of 0.6 s); without spool, 33,000
+rows dropped instead of 11,550 (gzip). Measured on a shared laptop, one run per case. The batches waiting for the spooler (`spool_overflow`) are bounded by
 `max_queue_rows` too, and are normally saved within milliseconds. The spool is on disk and bounded by
 `spool_max_bytes`.
 
@@ -482,7 +484,11 @@ the RTT of a local link (well under 1 ms). 5 % loss: no effect (2,028 rows/s wri
 spooled). 20 % loss: TCP keeps the data but the throughput falls, 1,281 rows/s written (private writers, no spool;
 0 lost, 13,550 rows written a second time after a timeout), 890 rows/s with spool (42,131 rows spooled, 0 lost).
 100 ms ± 50 ms of delay on every packet (with reordering): 487 to 589 rows/s; without spool 14,150 rows dropped beyond
-the bound (counted), with spool 0. In every case: 0 duplicate, exact counters, no capture blocked by the network.
+the bound (counted), with spool 0. With one `SharedWriter(concurrency=4)` the requests carry the rows of several
+models (up to 5,000 rows, 2.8 MB) over 4 connections, and 20 % loss hurts more: 337 rows/s written, 150 timeouts,
+17,250 rows dropped without spool (0 lost with spool); with gzip requests, 1,631 rows/s and nothing dropped. In every
+case: 0 duplicate, exact counters, no capture blocked by the network (one capture of 246 ms, after the fault, on the
+loaded laptop).
 
 **Compression of the write requests.** `write_compression="gzip"` (`CaptureOptions`, `ResultsSink`) sends the line
 protocol gzipped at level 1 (`Content-Encoding: gzip`, accepted by InfluxDB 2): 245 bytes per row instead of 557 on

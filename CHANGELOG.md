@@ -32,7 +32,8 @@ All notable changes to pulsar-data-collection. The format follows
   lost either way, the rows beyond the bound being spooled (83,750 instead of 67,450 on a 1 Mbit/s link with
   `write_timeout_s=30`). Without a spool, the bound drops rows that would otherwise have been written (32,200 instead
   of 15,750 in that case; 28,900 instead of 1,250 with gzip) for no measurable gain in RSS (+57 MB both ways), so it
-  stays off.
+  stays off. Same direction with one `SharedWriter(concurrency=4)`. Cost with a spool: more rows spooled (up to
+  55,650 instead of 14,400) and a longer replay after the fault (up to 9 s instead of 0.6 s).
 
 ### Compatibility
 
